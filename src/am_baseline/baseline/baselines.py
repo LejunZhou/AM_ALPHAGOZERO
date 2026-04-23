@@ -165,10 +165,11 @@ class WarmupBaseline(Baseline):
         return self.alpha * v + (1 - self.alpha) * vw, self.alpha * l + (1 - self.alpha) * lw
 
     def epoch_callback(self, model, epoch):
-        self.baseline.epoch_callback(model, epoch)
+        updated = self.baseline.epoch_callback(model, epoch)
         if epoch < self.n_epochs:
             self.alpha = (epoch + 1) / float(self.n_epochs)
             print("Set warmup alpha = {}".format(self.alpha))
+        return updated
 
     def state_dict(self):
         return self.baseline.state_dict()

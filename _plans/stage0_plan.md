@@ -1,7 +1,7 @@
 # Stage 0 Plan: Reproduce AM Baseline on TSP
 
 **Created:** 2026-04-22  
-**Status:** Not started
+**Status:** Completed 2026-04-23 — see `_progress/stage0_progress.md` for results
 
 ## Context
 
@@ -44,7 +44,10 @@ src/
   scripts/
     train.py                   # CLI: python -m scripts.train --graph_size 20
     evaluate.py                # CLI: python -m scripts.evaluate --model ...
-    generate_data.py           # Generate fixed test datasets
+    eval_baselines.py          # Unified baseline comparison (LKH / Gurobi / insertion)
+    modal_run_train.py         # Modal cloud GPU entry point (A10G)
+    smoke_test.py              # Fast end-to-end sanity check
+    test_pretrained.py         # Verify pretrained ref-weight loading
 ```
 
 ---
@@ -80,13 +83,13 @@ src/
 
 ## Training Strategy
 
-**Hardware:** NVIDIA RTX 4060 Laptop GPU (8 GB VRAM). Auto-detect device (prefer CUDA, fallback CPU).
+**Hardware (actual):** Modal cloud A10G for the TSP-20 100-epoch run. Local RTX 4060 Laptop GPU (8 GB VRAM) used for dev/eval. Auto-detect device (prefer CUDA, fallback CPU).
 
 **We only train TSP-20 from scratch.** TSP-50 and TSP-100 are NOT retrained — we use the pretrained reference checkpoints (`ref/.../pretrained/tsp_{50,100}/epoch-99.pt`) for evaluation only. This saves significant compute while still validating that our code loads and evaluates all sizes correctly.
 
 | Task | batch | epoch_size | epochs | Estimated time |
 |------|-------|------------|--------|----------------|
-| TSP-20 training | 512 | 1,280,000 | 100 | ~2-3 hours |
+| TSP-20 training | 512 | 1,280,000 | 100 | 4.52 h (actual, A10G) |
 | TSP-50 eval only | — | — | — | pretrained checkpoint |
 | TSP-100 eval only | — | — | — | pretrained checkpoint |
 
@@ -98,13 +101,13 @@ Code must still run on CPU (for quick debugging and future portability), but GPU
 
 ## Implementation Sequence
 
-### Phase A: Foundation (utilities, problem, config)
+### Phase A: Foundation (utilities, problem, config) [done]
 1. `config.py` — dataclass with all hyperparameters + CPU presets
 2. `utils/tensor_ops.py`, `utils/misc.py` — port utility functions
 3. `problem/state.py` — StateTSP with `torch.bool` masks
 4. `problem/tsp.py` — TSP class, dataset, costs
 
-### Phase B: Model (forward pass works)
+### Phase B: Model (forward pass works) [done]
 5. `model/encoder.py` — GraphAttentionEncoder (port near-verbatim from `ref/nets/graph_encoder.py`)
 6. `model/decoder.py` — decoder with `decode_step()` exposed (refactored from `ref/nets/attention_model.py` `_inner`, `_get_log_p`, `_one_to_many_logits`)
 7. `model/attention_model.py` — compose encoder + decoder, expose `encode()` (thin shell over encoder + decoder)
@@ -115,17 +118,17 @@ Code must still run on CPU (for quick debugging and future portability), but GPU
    ```
 9. **Milestone**: load pretrained ref weights into our model, verify same outputs on same input
 
-### Phase C: Training infrastructure
+### Phase C: Training infrastructure [done]
 10. `training/logging.py` — CSV metrics writer
 11. `baseline/baselines.py` — all baselines in one file (resolve circular import by passing `rollout` fn as argument)
 12. `training/trainer.py` — REINFORCE training loop (ported from `ref/train.py`)
 
-### Phase D: Entry points
+### Phase D: Entry points [done]
 13. `scripts/train.py` — CLI training (replaces `ref/run.py`)
 14. `scripts/evaluate.py` — CLI evaluation (simplified from `ref/eval.py`)
 15. `scripts/generate_data.py` — test data generation
 
-### Phase E: Validation
+### Phase E: Validation [done]
 16. Smoke test — verify no crashes, loss decreases (CPU or GPU, small settings)
 17. Load pretrained ref models (TSP-20/50/100), evaluate — verify matches published numbers
 18. Train TSP-20 from scratch on GPU — verify convergence matches published ~3.85 greedy
@@ -166,14 +169,23 @@ Pretrained model hyperparameters (from `ref/.../pretrained/tsp_20/args.json`):
 - lr_model=1e-4, lr_decay=1.0, max_grad_norm=1.0
 - bl_alpha=0.05, bl_warmup_epochs=1, tanh_clipping=10.0, normalization=batch
 
+### Achieved (TSP-20, run `wpqp1dpp`)
+
+| Problem | n  | Our final val | Our best val | Published greedy | Gap to published |
+|---------|----|---------------|--------------|------------------|------------------|
+| TSP     | 20 | 3.8426        | 3.8418 (ep 94) | 3.85           | −0.21% (better)  |
+
+Run: Modal A10G, 100 epochs, 4.52 h wall-clock, seed=1234 (AM paper pretrained uses seed=1235).
+W&B: https://wandb.ai/lejun/am-alphagozero/runs/wpqp1dpp
+
 ---
 
 ## Verification Criteria (Stage 0 done when)
 
-- [ ] Forward pass matches reference (same weights -> same outputs)
-- [ ] Pretrained TSP-20 model evaluates to ~3.85 (greedy) and ~3.84 (sampling-1280)
-- [ ] TSP-20 trained from scratch converges to ~3.85 greedy (only size we train)
-- [ ] Metrics CSV generated with training curves
-- [ ] `encode()`, `decode_step()`, `precompute_decoder()` exposed for Stage 1/2
-- [ ] Code runs on both GPU (primary) and CPU (fallback)
-- [ ] `_progress/stage0_progress.md` updated with results
+- [x] Forward pass matches reference (same weights -> same outputs) — *tested via `scripts/test_pretrained.py`*
+- [x] Pretrained TSP-20 model evaluates to ~3.85 (greedy) and ~3.84 (sampling-1280) — *3.8416 greedy*
+- [x] TSP-20 trained from scratch converges to ~3.85 greedy (only size we train) — *3.8426 final / 3.8418 best*
+- [x] Metrics CSV generated with training curves — *CSV + W&B run `wpqp1dpp`*
+- [x] `encode()`, `decode_step()`, `precompute_decoder()` exposed for Stage 1/2
+- [x] Code runs on both GPU (primary) and CPU (fallback)
+- [x] `_progress/stage0_progress.md` updated with results

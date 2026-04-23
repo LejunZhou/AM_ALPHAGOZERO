@@ -18,7 +18,7 @@ APP_NAME = "am-alphagozero"
 NETRC_PATH = Path("~/.netrc").expanduser()
 PROJECT_DIR = "/root/project"
 VOLUME_PATH = "/root/vol"
-DEFAULT_GPU = "T4"
+DEFAULT_GPU = "A10"
 volume = modal.Volume.from_name("am-alphagozero-volume", create_if_missing=True)
 
 # Directories to exclude from upload (ref/ is 180MB of reference code)

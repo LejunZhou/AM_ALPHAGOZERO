@@ -2,7 +2,7 @@
 
 **Plan:** `_plans/stage0_plan.md`  
 **Started:** 2026-04-22  
-**Status:** In progress — TSP-20 training running (epoch 29/100, val=3.857), Modal + W&B integration complete
+**Status:** Completed 2026-04-23 — TSP-20 full training converged to 3.8426 (matches AM paper), Stage 0 done
 
 ---
 
@@ -38,8 +38,8 @@
 - [x] Pretrained model evaluation matches published numbers (see below)
 - [x] Baseline solver comparison (Gurobi optimal, LKH, insertion heuristics)
 - [x] `scripts/eval_baselines.py` — unified evaluation with `--lkh`, `--gurobi` flags
-- [ ] TSP-20 full training (100 epochs) convergence verified
-- [ ] Training curves recorded
+- [x] TSP-20 full training (100 epochs) convergence verified
+- [x] Training curves recorded
 
 ---
 
@@ -68,23 +68,29 @@ Solver setup: `elkai` (LKH wrapper), `gurobipy` (restricted license, expires 202
 Concorde not available on Windows (no pre-built wheel); LKH matches optimal anyway.
 Script: `src/scripts/eval_baselines.py --lkh --gurobi`
 
-### Training from Scratch (run_20260422T031828, seed=1235, conda env=mcts4atsp)
-| Size | Epochs | Val Cost | Published | Wall-clock | Avg Epoch |
-|------|--------|----------|-----------|------------|-----------|
-| TSP-20 | 29/100 (running) | 3.857 | 3.84 | ~2.0 hrs | ~4.1 min |
+### Training from Scratch (run `am_tsp20`, W&B id `wpqp1dpp`, seed=1234, Modal A10G)
+| Size | Epochs | Final Val | Best Val | Published | Wall-clock | Avg Epoch |
+|------|--------|-----------|----------|-----------|------------|-----------|
+| TSP-20 | 100/100 | **3.8426** | **3.8418** (ep 94) | 3.84 | 4.52 h | 161 s |
 
-Settings: `--batch_size 512 --epoch_size 1280000 --baseline rollout --bl_warmup_epochs 1`
+Settings: `--graph_size 20 --batch_size 512 --epoch_size 1280000 --baseline rollout --bl_warmup_epochs 1 --n_epochs 100 --lr_model 1e-4 --seed 1234` (all AM defaults).
 
-Training curve (val_avg_cost per epoch):
-- Epoch  0: 3.9595
-- Epoch  5: 3.8760
+Training curve (val_avg_cost, every 10th epoch):
+- Epoch  0: 3.9632
 - Epoch 10: 3.8690
-- Epoch 15: 3.8655
-- Epoch 20: 3.8625
-- Epoch 25: 3.8576
-- Epoch 28: 3.8571 (best so far)
+- Epoch 20: 3.8561
+- Epoch 30: 3.8541
+- Epoch 40: 3.8498
+- Epoch 50: 3.8493
+- Epoch 60: 3.8452
+- Epoch 70: 3.8453
+- Epoch 80: 3.8445
+- Epoch 90: 3.8424
+- Epoch 99: 3.8426
 
-Estimated ~4.8 hrs remaining. Converging steadily toward published 3.84.
+Smooth monotone descent, plateau ≈ epoch 60. Total improvement 0.1206 (3.04%) from init. Matches AM paper TSP-20 greedy (~3.85) / sampling (~3.84).
+
+W&B: https://wandb.ai/lejun/am-alphagozero/runs/wpqp1dpp
 
 ---
 
@@ -98,8 +104,8 @@ Estimated ~4.8 hrs remaining. Converging steadily toward published 3.84.
 - [x] `scripts/modal_run_train.py` — Modal cloud GPU entry point
 
 ### Environment
-- GPU: NVIDIA RTX 4060 Laptop (8 GB VRAM)
-- Conda env: `AM_AlphaGoZero` (torch 2.7.0+cu118)
+- GPU (training): Modal A10G cloud; local RTX 4060 Laptop (8 GB VRAM) for dev/eval
+- Conda env: `AM_AlphaGoZero` (torch 2.11.0 cloud, 2.7.0+cu118 local)
 - Baseline solvers: `elkai` (LKH), `gurobipy` (Gurobi MIP, restricted license)
 - Modal: workspace `lejunzhou`, volume `am-alphagozero-volume`
 - W&B: project `am-alphagozero`, entity `lejun`
@@ -110,6 +116,7 @@ Estimated ~4.8 hrs remaining. Converging steadily toward published 3.84.
 
 - BatchNorm `num_batches_tracked` keys are not in pretrained checkpoints (expected — not learnable parameters)
 - Reference key remapping needed for loading pretrained ref models (decoder params moved under `decoder.*`)
+- **[fixed 2026-04-23]** `WarmupBaseline.epoch_callback` at `src/am_baseline/baseline/baselines.py:167` dropped the return value from the inner `RolloutBaseline.epoch_callback`, so `baseline_updated` was always logged as `False`/`None`. Did **not** affect training correctness (final val matches AM paper) — only the W&B metric. Fix: capture inner return and propagate.
 
 ---
 
