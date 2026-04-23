@@ -4,6 +4,7 @@ from torch.utils.checkpoint import checkpoint
 
 from am_baseline.model.encoder import GraphAttentionEncoder
 from am_baseline.model.decoder import Decoder
+from am_baseline.model.value_head import ValueHead
 from am_baseline.problem.tsp import TSP
 from am_baseline.utils.tensor_ops import sample_many
 
@@ -42,22 +43,52 @@ class AttentionModel(nn.Module):
             tanh_clipping=config.tanh_clipping,
         )
 
+        # Value head (Stage 1: auxiliary, does not enter the policy gradient)
+        self.value_enabled = getattr(config, 'value_enabled', True)
+        if self.value_enabled:
+            self.value_head = ValueHead(
+                embedding_dim=config.embedding_dim,
+                hidden_dim=getattr(config, 'value_hidden_dim', config.embedding_dim),
+            )
+        else:
+            self.value_head = None
+
         self.problem = TSP
 
     def set_decode_type(self, decode_type, temp=None):
         self.decoder.set_decode_type(decode_type, temp)
 
-    def forward(self, input, return_pi=False):
+    def forward(self, input, return_pi=False, compute_values=False):
         """
         :param input: (batch_size, graph_size, 2) node coordinates
-        :return: (cost, log_likelihood) or (cost, log_likelihood, pi) if return_pi
+        :param return_pi: if True, also return the sampled/greedy tour tensor pi
+        :param compute_values: if True, also return per-step value predictions
+                               (requires value_enabled=True). Values shape: (batch, N).
+        Returns one of:
+            (cost, ll)                      [default]
+            (cost, ll, pi)                  [return_pi=True]
+            (cost, ll, values)              [compute_values=True]
+            (cost, ll, pi, values)          [both flags True]
         """
         embeddings = self.encode(input)
-        _log_p, pi = self.decoder.decode(input, embeddings, self.problem)
+
+        if compute_values:
+            assert self.value_head is not None, \
+                "compute_values=True but value head is disabled (value_enabled=False)"
+            _log_p, pi, glimpses = self.decoder.decode(
+                input, embeddings, self.problem, compute_values=True
+            )
+            values = self.value_head(glimpses)  # (batch, N)
+        else:
+            _log_p, pi = self.decoder.decode(input, embeddings, self.problem)
 
         cost, mask = self.problem.get_costs(input, pi)
         ll = self._calc_log_likelihood(_log_p, pi, mask)
 
+        if compute_values and return_pi:
+            return cost, ll, pi, values
+        if compute_values:
+            return cost, ll, values
         if return_pi:
             return cost, ll, pi
         return cost, ll

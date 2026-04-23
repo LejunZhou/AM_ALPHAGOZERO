@@ -40,6 +40,44 @@ def do_batch_rep(v, n):
     return v[None, ...].expand(n, *v.size()).contiguous().view(-1, *v.size()[1:])
 
 
+def cost_to_go(edge_costs):
+    """
+    Reverse cumulative sum along dim 1.
+
+    Given per-edge costs of shape (batch, N) where entry [b, t] is the cost
+    incurred at decoding step t+1, returns (batch, N) where entry [b, t] is
+    the total remaining cost from step t+1 onward (inclusive).
+
+    entry[:, 0]  == edge_costs.sum(dim=1)
+    entry[:, -1] == edge_costs[:, -1]
+    """
+    return torch.flip(torch.cumsum(torch.flip(edge_costs, [1]), dim=1), [1])
+
+
+def value_targets_from_edges(edge_costs):
+    """
+    Per-state V_CURRENT targets aligned to the decoder's glimpse indexing.
+
+    glimpse[i] represents state s_i = partial tour with i nodes visited and
+    max(0, i-1) edges traversed. The value of s_i (realized) is the cost of
+    every edge still to be traversed, INCLUDING the edge selected at step i.
+
+    Concretely, with edge_costs[k] = edge traversed at decoder step k+1
+    (with edge_costs[N-1] = closing):
+        target[0]         = total cost
+        target[1]         = total cost     (s_1 has no traversed edges yet)
+        target[i], i >= 2 = sum edge_costs[i-1:]
+
+    Implementation: prepend a 0 (step 0 has no edge) to edge_costs, then take
+    the reverse cumsum over the (N+1)-length tensor and drop the trailing
+    entry (which would correspond to after-closing = 0).
+
+    edge_costs: (B, N)  ->  targets: (B, N)
+    """
+    pad_edges = torch.nn.functional.pad(edge_costs, (1, 0))      # (B, N+1)
+    return cost_to_go(pad_edges)[:, :-1]                         # (B, N)
+
+
 def sample_many(inner_func, get_cost_func, input, batch_rep=1, iter_rep=1):
     input = do_batch_rep(input, batch_rep)
 

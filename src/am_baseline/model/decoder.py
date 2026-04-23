@@ -74,21 +74,35 @@ class Decoder(nn.Module):
         )
         return AttentionModelFixed(embeddings, fixed_context, *fixed_attention_node_data)
 
-    def decode(self, input, embeddings, problem):
-        """Full autoregressive decoding loop. Returns (log_p, sequences)."""
+    def decode(self, input, embeddings, problem, compute_values=False):
+        """
+        Full autoregressive decoding loop.
+        Returns (log_p, sequences), or (log_p, sequences, glimpses) when compute_values=True.
+        Glimpses have shape (batch, N, embed_dim) — one per decoding step, used by the
+        Stage 1 value head.
+        """
         outputs = []
         sequences = []
+        glimpses = [] if compute_values else None
 
         state = problem.make_state(input)
         fixed = self.precompute(embeddings)
 
         while not state.all_finished():
-            log_p, mask = self.decode_step(fixed, state)
+            if compute_values:
+                log_p, mask, glimpse = self.decode_step(fixed, state, return_glimpse=True)
+                glimpses.append(glimpse)
+            else:
+                log_p, mask = self.decode_step(fixed, state)
             selected = self._select_node(log_p.exp()[:, 0, :], mask[:, 0, :])
             state = state.update(selected)
             outputs.append(log_p[:, 0, :])
             sequences.append(selected)
 
+        if compute_values:
+            # Each glimpse is (batch, embed_dim) — decode_step squeezed the num_steps dim.
+            # Stack along a new dim 1 to get (batch, N, embed_dim).
+            return torch.stack(outputs, 1), torch.stack(sequences, 1), torch.stack(glimpses, 1)
         return torch.stack(outputs, 1), torch.stack(sequences, 1)
 
     def decode_step(self, fixed, state, return_glimpse=False):

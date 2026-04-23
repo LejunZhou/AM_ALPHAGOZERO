@@ -34,6 +34,12 @@ class Config:
     bl_warmup_epochs: int = 1
     exp_beta: float = 0.8
 
+    # Value head (Stage 1)
+    value_enabled: bool = True
+    value_hidden_dim: int = 128
+    lambda_v: float = 1.0
+    value_target_norm: str = 'bl'  # 'bl' (per-instance by greedy rollout cost) or 'sqrt_n'
+
     # Evaluation
     eval_batch_size: int = 1024
     val_size: int = 10000
@@ -102,6 +108,14 @@ class Config:
         parser.add_argument('--bl_alpha', type=float, default=0.05)
         parser.add_argument('--bl_warmup_epochs', type=int, default=None)
         parser.add_argument('--exp_beta', type=float, default=0.8)
+        parser.add_argument('--no_value', action='store_false', dest='value_enabled',
+                            help='Disable the Stage 1 auxiliary value head')
+        parser.add_argument('--value_hidden_dim', type=int, default=128)
+        parser.add_argument('--lambda_v', type=float, default=1.0,
+                            help='Weight on the value MSE loss (0 disables the value head loss)')
+        parser.add_argument('--value_target_norm', choices=['bl', 'sqrt_n'], default='bl',
+                            help="Normalize cost-to-go targets by per-instance greedy rollout "
+                                 "cost ('bl') or by sqrt(graph_size) ('sqrt_n')")
         parser.add_argument('--eval_batch_size', type=int, default=1024)
         parser.add_argument('--val_size', type=int, default=10000)
         parser.add_argument('--val_dataset', type=str, default=None)

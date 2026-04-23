@@ -46,6 +46,7 @@ def run(opts):
         wandb_name=opts.run_name,
         wandb_mode=opts.wandb_mode,
         wandb_config=wandb_config,
+        track_gpu_memory=opts.use_cuda,
     )
 
     problem = TSP

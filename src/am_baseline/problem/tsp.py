@@ -23,6 +23,23 @@ class TSP(object):
         return (d[:, 1:] - d[:, :-1]).norm(p=2, dim=2).sum(1) + (d[:, 0] - d[:, -1]).norm(p=2, dim=1), None
 
     @staticmethod
+    def get_edge_costs(dataset, pi):
+        """
+        Per-edge costs along the tour, for Stage 1 value-head targets.
+
+        Returns a (batch, N) tensor where entry [b, t] is the cost of the edge
+        traversed at decoding step t+1:
+            edges[:, 0 .. N-2] = consecutive distances between visited nodes
+            edges[:, N-1]      = closing edge from last visited node back to first
+
+        Sanity: get_edge_costs(...).sum(dim=1) == get_costs(...)[0] within fp.
+        """
+        d = dataset.gather(1, pi.unsqueeze(-1).expand_as(dataset))
+        forward_edges = (d[:, 1:] - d[:, :-1]).norm(p=2, dim=2)          # (B, N-1)
+        closing_edge = (d[:, 0] - d[:, -1]).norm(p=2, dim=1).unsqueeze(-1)  # (B, 1)
+        return torch.cat([forward_edges, closing_edge], dim=1)           # (B, N)
+
+    @staticmethod
     def make_dataset(*args, **kwargs):
         return TSPDataset(*args, **kwargs)
 
