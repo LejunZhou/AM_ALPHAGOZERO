@@ -118,3 +118,44 @@ The core training loop that makes AlphaGo Zero relevant to our project:
 The ~2,100 Elo gap between raw network (3,055) and full MCTS player (5,185) quantifies the search amplification effect.
 
 ---
+
+## Paper 3 — BQ-NCO (Bisimulation Quotienting for Neural CO)
+
+| Field | Value |
+|-------|-------|
+| **Title** | BQ-NCO: Bisimulation Quotienting for Efficient Neural Combinatorial Optimization |
+| **Venue** | NeurIPS 2023 |
+| **Authors** | Darko Drakulic, Sofia Michel, Florian Mai, Arnaud Sors, Jean-Marc Andreoli (Naver Labs Europe) |
+| **Repo** | (released per paper, URL placeholder in paper) |
+| **Local** | `ref/BQ-NCO.pdf` |
+| **Task** | Constructive heuristic for COPs: Euclidean TSP, ATSP, CVRP, OP, Knapsack. Generic MDP formulation framework. |
+| **Architecture** | Transformer (9 layers, 12 heads, d=192, FF=512) with ReZero normalization, no positional encoding. Learnable origin/destination encodings added to node embeddings. **No encoder/decoder split** — entire model runs at every construction step. For ATSP: adds graph-conv layer using normalized cost matrix as edge weights and uses random node IDs. PerceiverIO variant gives linear attention. |
+| **Training** | **Imitation learning** with cross-entropy loss on expert trajectories. Experts: Concorde (TSP), LKH (ATSP/CVRP), EA4OP (OP), DP (KP). 1M solutions, instances of size 100, 500 epochs, Adam lr=7.5e-4, batch=1024. Crucial trick: sample **sub-paths of random length n ∈ [4, N]** from each optimal solution — every sub-path is itself an optimal solution of a smaller sub-instance, yielding free data augmentation across sizes/distributions. |
+| **Key Innovation — Partial Solution = New Sub-Problem (the core idea)** | **Bisimulation Quotienting (BQ).** Instead of representing the MDP state as `(instance, partial_solution)` (the "direct MDP" used by AM/POMO/etc.), BQ-NCO maps each partial solution `y` to the **tail sub-problem** `(f*y, X*y)` it induces, where `(f*y)(x)=f(y∘x)` and `X*y={x : y∘x ∈ X}`. The reduced MDP state **is itself a COP instance of the same type** — the original problem with already-chosen elements removed and parameters updated. This is a true bisimulation (proved in the paper): trajectories, rewards, and optimal policies are preserved. Many distinct `(instance, partial_solution)` pairs collapse to the same reduced state (e.g. any TSP partial tour ending at node e with unvisited set I gives the same sub-problem), exposing the problem's symmetry for free rather than forcing the network to learn it. |
+| **How the sub-problem view works per COP** | • **TSP → path-TSP:** partial tour `x₁…xₖ` becomes a new path-TSP instance with origin=xₖ, same destination, unvisited nodes as customers. TSP is path-TSP with origin=destination. • **CVRP → path-CVRP:** partial solution becomes a path-CVRP instance with new origin=last node, **reduced remaining capacity** (full C minus cumulated demand served since last depot visit), unvisited customers. • **OP → path-OP:** new origin=last node, **remaining distance budget** decreased by traveled distance. • **KP:** picked items removed, **capacity updated** to C − Σ weights of picked items, remaining items form new KP instance. This "tail-recursion property" generalizes the Optimality Principle of Dynamic Programming — any DP-amenable COP satisfies it. |
+| **Architectural consequence** | Because the state IS an instance, there is no encoder/decoder dichotomy. The same network runs on the current sub-instance at every step. Cost: O(N³) total (N steps × O(N²) attention) vs O(N²) for AM. Benefit: the network is *re-embedding the remaining sub-problem every step* — far stronger than AM-style frozen encoding, and explains why a single greedy rollout beats beam-search/sampling from AM/POMO on large instances. |
+| **Tricks & Details** | • **ReZero** normalization over LayerNorm. • **k-NN pruning at inference** (k=250 nearest to origin) — slight quality change, big speedup. • **Expert trajectory ordering matters for CVRP**: sorting subtours by remaining capacity (last subtour has largest leftover) ~2× improvement over arbitrary order. • **Random node IDs** as input feature for ATSP (no coordinates available) — optionally added as extra feature for other problems to improve performance. • **Sub-path sampling** acts as implicit size/distribution augmentation during training. • **Ablation:** approximating by freezing lower layers and recomputing only the top layer (MDAM-style) degrades TSP100 gap from 0.35% → 8.18% — confirms full re-embedding of sub-problem is the critical factor. |
+| **Benchmarks** | Trained on N=100, tested on N=100/200/500/1000 synthetic + TSPLib (up to 4461 nodes) + CVRPLib. Greedy rollout on TSP1000 gets 2.29% gap vs POMO's 40.60%, Sym-NCO's 37.51%. CVRP1000: 5.88% greedy vs POMO's 141%. |
+| **Hyperparameters** | 9 layers, 12 heads, d_model=192, FF=512, ReZero; Adam lr=7.5e-4, decay 0.98/50 ep; batch=1024; 500 epochs; 1M training solutions of size 100; k-NN=250 at inference. |
+| **Relevance to AM_ALPHAGOZERO** | **Reuse:** (1) The **sub-problem-as-state formulation** is directly applicable to MIP / SCIP — after a branching decision, the remaining MIP is a smaller MIP of the same type (tail-recursion via LP relaxation + bound tightening). This matches how SCIP itself works and suggests re-embedding the sub-MIP each node rather than freezing an initial encoder. (2) **Imitation from sub-trajectories**: sub-sequences of an optimal branch-and-bound trace are themselves training samples for smaller sub-MIPs — free augmentation. (3) **No encoder/decoder split** simplifies architecture; aligns with AlphaGo Zero's single dual-head network evaluating the current state. **Contrast with AlphaGo Zero path:** BQ-NCO shows IL on small instances + re-embedding ≫ RL with frozen encoder. Our project should consider whether a BQ-style state (current sub-MIP) + MCTS over branching actions is more sample-efficient than direct-MDP + RL. (4) The **bisimulation soundness proofs** (Prop. 1, 2) provide the formal justification for why treating the remaining sub-problem as the state loses no information. |
+| **Cites** | Kool et al. 2019 (AM), Kwon et al. 2020 (POMO), Bresson & Laurent 2021 (TransformerTSP), Kim et al. 2022 (Sym-NCO), Bellman 1954 / Bertsekas 2012 (DP Optimality Principle), Vaswani et al. 2017 (Transformer), Jaegle et al. 2022 (PerceiverIO), Bachlechner et al. 2021 (ReZero). |
+| **Cited By** | — |
+| **Reproduction** | `not started` |
+| **Our Implementation** | — |
+| **Known Gaps** | — |
+
+### Direct MDP vs BQ-MDP (schematic)
+
+```
+Direct MDP (AM, POMO, ...)          BQ-MDP (BQ-NCO)
+---------------------------         -----------------------------
+state  = (instance, partial x)      state  = sub-instance (f*x, X*x)
+action = next construction step     action = next construction step
+policy = π(a | instance, x)         policy = π(a | sub-instance)
+encoder run ONCE per instance       model run EVERY step on sub-instance
+must LEARN symmetry                  symmetry BUILT IN (many x → same sub-instance)
+```
+
+The central insight: **"partial solution" and "remaining sub-problem" are dual views**. BQ-NCO commits to the sub-problem view, which (i) collapses symmetric states, (ii) makes the state a first-class instance of the same COP, and (iii) forces the model to continuously re-evaluate the shrinking problem — closer in spirit to how AlphaGo Zero evaluates the current board position rather than the sequence of moves that led there.
+
+---
