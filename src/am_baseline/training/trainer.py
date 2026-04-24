@@ -127,7 +127,13 @@ def train_epoch(model, optimizer, baseline, lr_scheduler, epoch, val_dataset,
     # Generate new training data for each epoch
     training_dataset = baseline.wrap_dataset(
         problem.make_dataset(size=opts.graph_size, num_samples=opts.epoch_size))
-    training_dataloader = DataLoader(training_dataset, batch_size=opts.batch_size, num_workers=0)
+    training_dataloader = DataLoader(
+        training_dataset,
+        batch_size=opts.batch_size,
+        num_workers=opts.num_workers,
+        pin_memory=opts.use_cuda,
+        persistent_workers=(opts.num_workers > 0),
+    )
 
     # Train mode
     model.train()

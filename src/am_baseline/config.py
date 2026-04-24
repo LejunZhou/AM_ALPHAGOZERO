@@ -47,6 +47,7 @@ class Config:
 
     # Logging & checkpointing
     log_step: int = 50
+    num_workers: int = 4  # DataLoader workers; set 0 on CPU / Windows-dev
     output_dir: str = 'outputs'
     run_name: str = 'run'
     checkpoint_epochs: int = 1
@@ -120,6 +121,8 @@ class Config:
         parser.add_argument('--val_size', type=int, default=10000)
         parser.add_argument('--val_dataset', type=str, default=None)
         parser.add_argument('--log_step', type=int, default=50)
+        parser.add_argument('--num_workers', type=int, default=4,
+                            help='DataLoader worker processes (0 = synchronous main-thread loading)')
         parser.add_argument('--output_dir', default='outputs')
         parser.add_argument('--run_name', default='run')
         parser.add_argument('--checkpoint_epochs', type=int, default=1)
