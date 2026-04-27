@@ -94,6 +94,18 @@ class MCTSSolver:
         self.model.eval()
         self.rng = np.random.default_rng(cfg.seed)
 
+        # Stage 3 forward-pass instrumentation (search-efficiency metric).
+        # Reset at the start of every `solve_instance` call; readable by the
+        # caller after the call returns. Counts only MCTS-internal work —
+        # the greedy bl_val pass is excluded (it's the baseline normalizer,
+        # not part of the search budget).
+        #   fwd_count_decode  : total decode_step calls (priors + expansions + rollout steps)
+        #   fwd_count_value   : total value_head MLP calls (only when leaf_eval='value_head')
+        #   fwd_count_rollout : decode_step calls inside rollouts (subset of fwd_count_decode)
+        self.fwd_count_decode = 0
+        self.fwd_count_value = 0
+        self.fwd_count_rollout = 0
+
     @classmethod
     def _validate_config(cls, cfg: MCTSConfig, model: AttentionModel) -> None:
         """Reject invalid or scale-incompatible configs at construction time.
@@ -165,6 +177,11 @@ class MCTSSolver:
 
         if bl_val is None:
             bl_val = float(self._compute_bl_val_batch(input_1).item())
+
+        # Reset forward-pass counters for this instance.
+        self.fwd_count_decode = 0
+        self.fwd_count_value = 0
+        self.fwd_count_rollout = 0
 
         embeddings = self.model.encode(input_1)
         fixed = self.model.precompute_decoder(embeddings)
@@ -291,10 +308,12 @@ class MCTSSolver:
         log_p, mask, glimpse = self.model.decoder.decode_step(
             fixed, node.state, return_glimpse=True
         )
+        self.fwd_count_decode += 1
         self._fill_priors_from_logp(node, log_p, mask)
 
         if self.cfg.leaf_eval == 'value_head':
             node.v_estimate = float(self.model.value_head(glimpse).view(-1)[0].item())
+            self.fwd_count_value += 1
         elif self.cfg.leaf_eval == 'rollout':
             remaining_real = self._rollout_remaining_real(node.state, fixed)
             node.v_estimate = remaining_real / bl_val
@@ -311,10 +330,13 @@ class MCTSSolver:
         log_p, mask, glimpse = self.model.decoder.decode_step(
             fixed, node.state, return_glimpse=True
         )
+        self.fwd_count_decode += 1
         self._fill_priors_from_logp(node, log_p, mask)
 
         if self.cfg.leaf_eval == 'value_head':
-            return float(self.model.value_head(glimpse).view(-1)[0].item())
+            v = float(self.model.value_head(glimpse).view(-1)[0].item())
+            self.fwd_count_value += 1
+            return v
         if self.cfg.leaf_eval == 'rollout':
             remaining_real = self._rollout_remaining_real(node.state, fixed)
             return remaining_real / bl_val
@@ -361,6 +383,8 @@ class MCTSSolver:
         cur = state
         while not cur.all_finished():
             log_p, mask = self.model.decoder.decode_step(fixed, cur, return_glimpse=False)
+            self.fwd_count_decode += 1
+            self.fwd_count_rollout += 1
             a = int(log_p.view(-1).argmax().item())
             cur = cur.update(torch.tensor([a], dtype=torch.long, device=self.device))
         total_real = float(cur.get_final_cost().view(-1)[0].item())

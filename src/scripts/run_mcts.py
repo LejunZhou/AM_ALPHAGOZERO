@@ -22,7 +22,7 @@ import torch
 from tqdm import tqdm
 
 from am_baseline.problem.tsp import TSP
-from am_baseline.search import MCTSConfig, MCTSSolver
+from am_baseline.search import CppMCTSSolver, HAVE_CPP_MCTS, MCTSConfig, MCTSSolver
 from am_baseline.utils.misc import load_model
 
 
@@ -69,6 +69,9 @@ def main() -> int:
     parser.add_argument('--root_select', choices=['visits', 'q'], default='visits',
                         help="Final action at root: 'visits' (AlphaGo default) or 'q' "
                              "(diagnostic — argmax Q among visited actions).")
+    parser.add_argument('--backend', choices=['python', 'cpp'], default='python',
+                        help="MCTS implementation backend. 'cpp' uses the optional pybind11 "
+                             "tree-walk extension and keeps model forwards in PyTorch.")
     tree_reuse_group = parser.add_mutually_exclusive_group()
     tree_reuse_group.add_argument('--tree_reuse', dest='tree_reuse', action='store_true',
                                   help='Retain the subtree below the chosen action as the next root '
@@ -132,8 +135,20 @@ def main() -> int:
         tree_reuse=args.tree_reuse,
         seed=args.seed,
     )
-    solver = MCTSSolver(model, cfg, device=device)
+    if args.backend == 'cpp':
+        if not HAVE_CPP_MCTS:
+            print(
+                "ERROR: --backend cpp requested, but the C++ extension is not built. "
+                "Run `pip install -e .` in the AM_AlphaGoZero environment first.",
+                file=sys.stderr,
+            )
+            return 2
+        solver_cls = CppMCTSSolver
+    else:
+        solver_cls = MCTSSolver
+    solver = solver_cls(model, cfg, device=device)
     print(f"MCTSConfig: {cfg}")
+    print(f"MCTS backend: {args.backend}")
 
     # Per-instance loop (sequential). We drive it from here so we can show a
     # progress bar and not hide it inside solve_batch. bl_val is still computed
@@ -143,6 +158,11 @@ def main() -> int:
 
     costs = torch.empty(B)
     tours = torch.empty(B, graph_size, dtype=torch.long)
+    decode_steps = torch.empty(B, dtype=torch.long)
+    rollout_steps = torch.empty(B, dtype=torch.long)
+    value_calls = torch.empty(B, dtype=torch.long)
+    eval_cache_hits = torch.empty(B, dtype=torch.long)
+    eval_cache_misses = torch.empty(B, dtype=torch.long)
     t0 = time.time()
     iterator = range(B)
     if not args.no_progress_bar:
@@ -154,6 +174,11 @@ def main() -> int:
         )
         costs[i] = c_i.detach().cpu()
         tours[i] = t_i.detach().cpu()
+        decode_steps[i] = solver.fwd_count_decode
+        rollout_steps[i] = solver.fwd_count_rollout
+        value_calls[i] = solver.fwd_count_value
+        eval_cache_hits[i] = getattr(solver, 'eval_cache_hits', 0)
+        eval_cache_misses[i] = getattr(solver, 'eval_cache_misses', 0)
     elapsed = time.time() - t0
 
     # --- Report ---
@@ -171,6 +196,16 @@ def main() -> int:
     print(f"  win rate   : MCTS better on {(gap_vs_greedy < 0).sum().item()}/{B} instances; "
           f"tied on {(gap_vs_greedy == 0).sum().item()}")
     print(f"  wall-clock : {elapsed:.1f}s  ({elapsed/B*1000:.1f} ms/inst)")
+    print(f"  fwd passes : decode_steps mean={decode_steps.float().mean().item():.1f} "
+          f"(rollout subset mean={rollout_steps.float().mean().item():.1f}, "
+          f"value_head calls mean={value_calls.float().mean().item():.1f})")
+    total_cache_hits = int(eval_cache_hits.sum().item())
+    total_cache_misses = int(eval_cache_misses.sum().item())
+    if total_cache_hits or total_cache_misses:
+        total_cache = total_cache_hits + total_cache_misses
+        hit_pct = 100.0 * total_cache_hits / max(total_cache, 1)
+        print(f"  eval cache : hits={total_cache_hits} misses={total_cache_misses} "
+              f"hit_rate={hit_pct:.1f}%")
 
     # --- Correctness check: every tour is a valid permutation ---
     expected = torch.arange(graph_size, dtype=torch.long)
@@ -186,7 +221,10 @@ def main() -> int:
         os.makedirs(os.path.dirname(os.path.abspath(args.output_csv)) or ".", exist_ok=True)
         with open(args.output_csv, "w", newline="") as f:
             w = csv.writer(f)
-            w.writerow(["idx", "greedy_cost", "mcts_cost", "delta", "gap_pct"])
+            w.writerow([
+                "idx", "greedy_cost", "mcts_cost", "delta", "gap_pct",
+                "decode_steps", "rollout_steps", "value_calls",
+            ])
             for i in range(B):
                 w.writerow([
                     i,
@@ -194,6 +232,9 @@ def main() -> int:
                     f"{costs[i].item():.6f}",
                     f"{gap_vs_greedy[i].item():+.6f}",
                     f"{gap_pct[i].item():+.4f}",
+                    int(decode_steps[i].item()),
+                    int(rollout_steps[i].item()),
+                    int(value_calls[i].item()),
                 ])
         print(f"Wrote {args.output_csv}")
 

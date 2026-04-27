@@ -75,6 +75,16 @@ def load_model(path, epoch=None):
     if not ref_keys.issubset(our_keys):
         ref_state = _remap_ref_keys(ref_state)
 
+    # If the loaded state has no value_head weights, the model carries a
+    # randomly-initialized value head from AttentionModel.__init__'s
+    # default `value_enabled=True`. That's a silent footgun: MCTS with
+    # leaf_eval='value_head' would produce garbage instead of raising.
+    # Detect and explicitly null out the value head when the loaded state
+    # has no value_head keys (e.g., AM-paper released checkpoints).
+    has_value_head_weights = any(k.startswith('value_head.') for k in ref_state.keys())
+    if not has_value_head_weights and model.value_head is not None:
+        model.value_head = None
+
     model.load_state_dict({**model.state_dict(), **ref_state})
 
     model.eval()

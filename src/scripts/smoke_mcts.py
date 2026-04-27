@@ -37,6 +37,7 @@ Tests (run in order; each aborts on first failure):
 Run:
     PYTHONPATH=src python -m scripts.smoke_mcts
 """
+import argparse
 import math
 import sys
 
@@ -59,7 +60,94 @@ def _check_valid_tour(tour: torch.Tensor, n: int) -> None:
     assert torch.equal(nodes, expected), f"tour is not a permutation of [0,{n}): {tour.tolist()}"
 
 
+def _run_cpp_smoke() -> int:
+    from am_baseline.search import CppMCTSSolver, HAVE_CPP_MCTS
+
+    if not HAVE_CPP_MCTS:
+        print(
+            "ERROR: --backend cpp requested, but the C++ extension is not built. "
+            "Run `pip install -e .` first.",
+            file=sys.stderr,
+        )
+        return 2
+
+    torch.manual_seed(1234)
+    N = 20
+    B = 4
+
+    cfg = Config(graph_size=N, batch_size=32, epoch_size=32)
+    model = AttentionModel(cfg).cpu().eval()
+
+    rng = torch.Generator().manual_seed(1234)
+    inputs = torch.rand(B, N, 2, generator=rng)
+
+    model.set_decode_type('greedy')
+    with torch.no_grad():
+        greedy_cost, _, greedy_pi = model(inputs, return_pi=True)
+
+    solver0 = CppMCTSSolver(
+        model,
+        MCTSConfig(n_simulations=0, c_puct=0.05, temperature=0.0,
+                   leaf_eval='value_head', fpu_mode='running_q',
+                   fpu_fallback=-1.0, seed=1234),
+        device=torch.device('cpu'),
+    )
+    mcts0_costs, mcts0_tours = solver0.solve_batch(inputs)
+    for i in range(B):
+        _check_valid_tour(mcts0_tours[i], N)
+        assert torch.equal(mcts0_tours[i], greedy_pi[i].long()), (
+            f"[CPP A2] instance {i}: MCTS(K=0) tour {mcts0_tours[i].tolist()} "
+            f"!= greedy {greedy_pi[i].tolist()}"
+        )
+        assert torch.isclose(mcts0_costs[i], greedy_cost[i], atol=1e-5), (
+            f"[CPP A2] instance {i}: MCTS(K=0) cost {mcts0_costs[i].item()} "
+            f"!= greedy {greedy_cost[i].item()}"
+        )
+    print("[CPP A1+A2 OK] K=0 matches greedy exactly")
+
+    checks = [
+        ("A3 value_head", MCTSConfig(n_simulations=20, c_puct=0.05, temperature=0.0,
+                                     leaf_eval='value_head', fpu_mode='running_q',
+                                     fpu_fallback=-1.0, seed=1234)),
+        ("A4 rollout", MCTSConfig(n_simulations=10, c_puct=0.05, temperature=0.0,
+                                  leaf_eval='rollout', fpu_mode='running_q',
+                                  fpu_fallback=-1.0, seed=1234)),
+        ("A7 no_reuse", MCTSConfig(n_simulations=10, c_puct=0.05, temperature=0.0,
+                                   leaf_eval='value_head', fpu_mode='running_q',
+                                   fpu_fallback=-1.0, tree_reuse=False, seed=1234)),
+        ("A7 reuse", MCTSConfig(n_simulations=10, c_puct=0.05, temperature=0.0,
+                                leaf_eval='value_head', fpu_mode='running_q',
+                                fpu_fallback=-1.0, tree_reuse=True, seed=1234)),
+        ("A8 root_q", MCTSConfig(n_simulations=10, c_puct=0.05, temperature=0.0,
+                                 leaf_eval='value_head', fpu_mode='running_q',
+                                 fpu_fallback=-1.0, root_select='q', seed=1234)),
+    ]
+    for label, check_cfg in checks:
+        costs, tours = CppMCTSSolver(model, check_cfg, torch.device('cpu')).solve_batch(inputs)
+        for i in range(B):
+            _check_valid_tour(tours[i], N)
+            assert torch.isfinite(costs[i]), f"[CPP {label}] non-finite cost on instance {i}"
+        print(f"[CPP {label} OK] mean cost {costs.mean().item():.4f}")
+
+    try:
+        CppMCTSSolver(model, MCTSConfig(value_norm='sqrt_n', leaf_eval='value_head'),
+                      device=torch.device('cpu'))
+        raise AssertionError("[CPP A9] sqrt_n + value_head should have raised ValueError")
+    except ValueError:
+        pass
+    print("[CPP A9 OK] config validation is shared with Python solver")
+
+    print("[OK] C++ MCTS smoke PASSED")
+    return 0
+
+
 def main() -> int:
+    parser = argparse.ArgumentParser(description="Smoke tests for Python or C++ MCTS backends")
+    parser.add_argument('--backend', choices=['python', 'cpp'], default='python')
+    args = parser.parse_args()
+    if args.backend == 'cpp':
+        return _run_cpp_smoke()
+
     torch.manual_seed(1234)
     N = 20
     B = 4
