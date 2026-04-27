@@ -2,7 +2,7 @@
 
 **Plan:** `_plans/stage2_plan.md`
 **Started:** 2026-04-24
-**Last updated:** 2026-04-26 — TSP-20 K=20 sweep added (rollout new efficiency champion). TSP-50 K-curves complete through K=400 canonical. Decode-step micro-benchmark finished: per-call cost is overhead-dominated and essentially flat in N (700→757 µs across N=20→200), revising the rollout-vs-value_head wall-clock-scaling story. **Outstanding: clean TSP-50 K=100 rollout wall-clock measurement (background task `bln0tv1pg` in flight to remove GPU contention from original).**
+**Last updated:** 2026-04-27 — Clean TSP-50 K=100 rollout wall-clock landed (`bln0tv1pg`): **8594.5 s**, end-to-end rollout/value_head ratio = **2.25×** (vs predicted 1.5-2× band — slightly over the upper bound, leaf-eval fraction back-solves to ~5.0% at TSP-50 vs ~1.6% at TSP-20). Cost data identical to contaminated original (seed-deterministic, confirmed CSV-equal across all 1000 rows). 2026-04-26 — TSP-20 K=20 sweep added (rollout new efficiency champion). TSP-50 K-curves complete through K=400 canonical. Decode-step micro-benchmark finished: per-call cost is overhead-dominated and essentially flat in N (700→757 µs across N=20→200), revising the rollout-vs-value_head wall-clock-scaling story.
 **Status:** **Stage 2 substantively complete.** Phases A–D all closed. Headline results: rollout uniformly dominates value_head by +12-22 pp gap reduction at every matched K (TSP-20 + TSP-50). Canonical config (`c_puct=0.05`, `tree_reuse=True`, `fpu_running_q`, `fpu_fallback=-1.0`, `root_select=visits`) locked. Three new diagnostics planned (off-policy R² probe, `value_norm='sqrt_n'` MCTS ablation, decode-step micro-benchmark) — last one done; first two queued.
 
 ---
@@ -44,7 +44,7 @@
 - [x] FPU diagnostic: TSP-20 K=200, 100 instances, `fpu_mode ∈ {fallback, running_q, node_value}` — `running_q` confirmed as default
 - [x] Tree-reuse diagnostic: TSP-20 K=200, 100 instances, `tree_reuse ∈ {False, True}` — `True` confirmed as canonical
 - [x] Gap-to-Gurobi analysis on TSP-20 K-curve (reuse Stage 0 optimal CSV)
-- [x] TSP-50 (contingent on `stage1_tsp50_with_value`): **K=50, K=100, K=200, K=400 canonical all landed**; **K=100 rollout landed** (cost-deterministic; clean wall-clock re-run in flight under `bln0tv1pg`)
+- [x] TSP-50 (contingent on `stage1_tsp50_with_value`): **K=50, K=100, K=200, K=400 canonical all landed**; **K=100 rollout landed**; clean wall-clock re-run completed under `bln0tv1pg` (2026-04-27): 8594.5 s, ratio 2.25× vs canonical 3815 s
 - [x] TSP-20 K=20 sweep (added 2026-04-26): both leaf-eval modes — rollout K=20 = 41.8% gap reduction at ~225s clean est., new efficiency champion of the K-curve
 - [x] Decode-step micro-benchmark `src/scripts/bench_decode_step.py` (added 2026-04-26): per-call cost is overhead-dominated (~700 µs flat) and essentially independent of N up to 200 — revises the rollout/value_head wall-clock prediction
 
@@ -223,7 +223,7 @@ Greedy baseline on the 1000 test instances (seed=1234): **5.8101** (std 0.2828).
 
 | K | mean | Δ vs greedy | W/T/L | gap reduction | wall-clock | notes |
 |:-:|:-:|:-:|:-:|:-:|:-:|:------|
-| 100 | **5.7392** | **−1.220%** | **847/103/50** | **59.0%** | (contaminated original; clean re-run under `bln0tv1pg` in flight) | **Rollout K=100 (59.0%) blows past value_head K=400 (48.5%) by +10.5pp on TSP-50** — same "rollout uniformly dominates" pattern as TSP-20. Cost is deterministic at fixed seed; only wall-clock awaiting clean measurement. |
+| 100 | **5.7392** | **−1.220%** | **847/103/50** | **59.0%** | **8594.5 s clean** (2026-04-27 `bln0tv1pg`) | **Rollout K=100 (59.0%) blows past value_head K=400 (48.5%) by +10.5pp on TSP-50** — same "rollout uniformly dominates" pattern as TSP-20. Cost is deterministic at fixed seed (clean run row-for-row CSV-identical to original). End-to-end rollout/value_head wall-clock ratio = **2.25×** (8594.5 / 3815). |
 
 **TSP-50 observations (canonical, K=50→K=400 + rollout K=100):**
 - Gap reduction grows roughly linearly at +3.5-3.8pp per K-doubling, slightly slower than TSP-20's +4.0-4.6pp. No plateau through K=400.
@@ -251,12 +251,12 @@ Hardware: local GPU (single-instance MCTS, no cross-tree batching). 1000-instanc
 | TSP-20 canonical (value_head, tree_reuse=True) | **20** / 50 / 100 / 200 / 400 / 800 | (~140) / 349 / 654 / 1268 / 2487 / 4901 s | **9799 s ≈ 2h43m** (K=20 contended; clean est.) |
 | TSP-20 rollout leaf-eval (tree_reuse=True) | **20** / 50 / 100 / 200 / 400 | (~225) / 561 / 877 / 1469 / 3046 s | **6178 s ≈ 1h43m** (K=20 contended; clean est.) |
 | TSP-50 canonical (value_head, tree_reuse=True) | 50 / 100 / 200 / 400 | 2300 / 3815 / ~7600 / (multi-day shared) s | landed; K=200 / K=400 wall-clocks contaminated by GPU sharing across multi-day window |
-| TSP-50 rollout (tree_reuse=True) | 100 | (clean re-run in flight) | Original run contaminated; clean wall-clock pending background task `bln0tv1pg`. |
+| TSP-50 rollout (tree_reuse=True) | 100 | **8594.5 s** (clean, `bln0tv1pg` 2026-04-27) | Ratio vs canonical value_head K=100 (3815 s) = **2.25×**. CSV row-for-row identical to contaminated original — only wall-clock changed. |
 
 **Scaling observations:**
 - Per-K wall-clock grows **linearly** with K at both graph sizes (tree reuse amortizes per-tour-step setup but does not change per-simulation cost).
 - Per-K wall-clock at matched K grows ~6.6× from N=20 → N=50 at value_head (e.g. K=100: 654 → 3815 s), tracking decoder forward-pass cost growth.
-- **Wall-clock prediction revised 2026-04-26 by `bench_decode_step.py`:** per single decode_step call cost is essentially flat across N=20 → 200 (700 → 757 µs on RTX 4060 Laptop) — overhead-dominated, not arithmetic-dominated. So per-leaf rollout/value_head ratio = call-count ratio = ~N/2. End-to-end MCTS ratio is much smaller because leaf eval is only ~1.6 % of total wall-clock at TSP-20 (~98 % is Python tree walk, state updates, terminal-only sims). **Predicted end-to-end ratios:** TSP-50 ~1.5-2×; TSP-100 ~5-6× (extrapolated). TSP-50 measurement landing under `bln0tv1pg`.
+- **Wall-clock prediction revised 2026-04-26 by `bench_decode_step.py`:** per single decode_step call cost is essentially flat across N=20 → 200 (700 → 757 µs on RTX 4060 Laptop) — overhead-dominated, not arithmetic-dominated. So per-leaf rollout/value_head ratio = call-count ratio = ~N/2. End-to-end MCTS ratio is much smaller because leaf eval is only ~1.6 % of total wall-clock at TSP-20 (~98 % is Python tree walk, state updates, terminal-only sims). **Predicted end-to-end ratios:** TSP-50 ~1.5-2×; TSP-100 ~5-6× (extrapolated). **TSP-50 measurement landed (2026-04-27, `bln0tv1pg`): 2.25× — slightly over the upper bound of the predicted band.** Back-solving `1 + (M-1)·f = ratio` with TSP-50 per-leaf ratio M ≈ 26: leaf-eval fraction `f ≈ 5.0%`, vs ~1.6% on TSP-20. So leaf-eval grows faster than I'd estimated when extrapolating from TSP-20; TSP-100 prediction probably runs hot too (true ratio likely closer to 7-8× than 5-6×).
 
 ---
 
@@ -305,9 +305,17 @@ End-to-end ratio = 1 + (per-leaf ratio − 1) · (leaf-eval fraction of total).
 - TSP-50: per-leaf ratio jumps to ~26. If the leaf-eval fraction stayed ~1.6 %, end-to-end ratio would be 1 + 25 · 0.016 ≈ 1.4×. But the leaf-eval fraction itself grows because rollout's extra calls are absolute time, not percentage of "everything else." Realistic estimate: leaf-eval ~3-5 % of TSP-50 value_head wall-clock → rollout end-to-end ratio = 1 + 25 · 0.04 ≈ **2×** (rough, to be verified by Part 1).
 - TSP-100 extrapolation: per-leaf ratio ~51, leaf-eval fraction maybe ~10 % → end-to-end ratio ≈ 1 + 50 · 0.10 = **6×**. By TSP-100 the rollout option likely costs ~4-7× value_head wall-clock at matched K.
 
-### Part 1 — Clean TSP-50 K=100 rollout (re-running to remove GPU contention; in flight)
+### Part 1 — Clean TSP-50 K=100 rollout (LANDED 2026-04-27 via `bln0tv1pg`)
 
-Original TSP-50 K=100 rollout shared the local GPU with TSP-50 K=200 canonical → unusable for ratio analysis. Re-running in isolation (background task `bln0tv1pg`, ETA ~1.5h). Will append the result here on completion. Acceptance criterion: clean wall-clock vs canonical 3815s.
+Original TSP-50 K=100 rollout shared the local GPU with TSP-50 K=200 canonical → unusable for ratio analysis. Re-ran in isolation under background task `bln0tv1pg`. Output: `outputs/stage2/tsp50_K100_rollout_clean.csv` (+ `.log`).
+
+**Result:** 8594.5 s end-to-end wall-clock; cost data row-for-row identical to the contaminated original (mean=5.7392, W/T/L=847/103/50, gap reduction 59.0%) as expected for a deterministic-seed re-run. **End-to-end rollout/value_head ratio at TSP-50 K=100 = 8594.5 / 3815 = 2.25×.**
+
+**Reconciling vs prediction:** the decode-step decomposition (1 + (M−1)·f) predicted 1.5–2× assuming leaf-eval fraction f ≈ 4 % at TSP-50 (extrapolated from f ≈ 1.6 % on TSP-20). Back-solving from the measured 2.25× with per-leaf ratio M ≈ 26 gives **f ≈ 5.0 %** — leaf-eval is a slightly bigger slice of the wall-clock at TSP-50 than the linear extrapolation suggested. The TSP-100 prediction (5-6×) probably under-shoots for the same reason; realistic estimate is closer to 7-8×, but that's an extrapolation from two data points and should be re-measured before any compute-budgeting decision.
+
+**Log display bugs noticed (worth fixing in `scripts/run_mcts.py`, doesn't affect any stored data):**
+- Win/tie/loss counts in the log printout use **strict equality** for ties; the CSV-derived 847/103/50 uses a 1e-9 tolerance. The log printed 870/54/76 for the same data. Tie definition mismatch only — same underlying tour costs.
+- Percentage formatter prints `−1.201%` when the actual value is `−1.2205%`. Looks like a print-formatting truncation bug. CSV-derived percentages are the authoritative numbers.
 
 ### Method caveat
 
@@ -346,7 +354,7 @@ The Phase D leaf-eval ablation showed +16 % wall-clock for rollout vs value_head
 - Per-call decode_step cost is essentially flat in N (700-757 µs across N=20 → 200) — kernel launch + Python overhead + the `.item()` CUDA sync dominate on consumer GPUs at every plausible N.
 - So per-leaf rollout/value_head ratio = call-count ratio = ~N/2.
 - But MCTS total wall-clock is dominated by NON-leaf-eval costs (Python tree walks, state updates, terminal-only sims). Leaf eval is only ~1.6 % of TSP-20 K=200 wall-clock — so even a 11× per-leaf ratio collapses to +16 % end-to-end.
-- **Predicted at larger N:** TSP-50 ratio ≈ 1.5-2× (clean measurement landing under `bln0tv1pg`); TSP-100 extrapolated ≈ 5-6×. Rollout becomes meaningfully expensive only by TSP-100.
+- **Predicted at larger N:** TSP-50 ratio ≈ 1.5-2× (predicted) → **2.25× measured** (2026-04-27, `bln0tv1pg`); TSP-100 extrapolated ≈ 5-6× (likely under-shoots — back-solved leaf-eval fraction at TSP-50 is ~5% vs 1.6% on TSP-20, so a TSP-100 fraction of ~10% may be too low). Rollout becomes meaningfully expensive by TSP-50 already (~2× cost of value_head); TSP-100 plausibly 7-8×.
 
 ### Recommended canonical configs for downstream stages
 
@@ -355,7 +363,7 @@ The Phase D leaf-eval ablation showed +16 % wall-clock for rollout vs value_head
 | **TSP-20 efficiency champion** | `rollout, K=20, tree_reuse, c_puct=0.05` | ~225 ms (clean est.) | 41.8 % |
 | **TSP-20 working default** | `rollout, K=50, tree_reuse, c_puct=0.05` | ~561 ms | 51.3 % |
 | **TSP-20 max-quality** | `rollout, K=400, tree_reuse, c_puct=0.05` | ~3.0 s | 71.3 % |
-| **TSP-50 working default** | `rollout, K=100, tree_reuse, c_puct=0.05` | (clean wc pending; ~5.8 s value_head + 1.5-2× est.) | 59.0 % |
+| **TSP-50 working default** | `rollout, K=100, tree_reuse, c_puct=0.05` | **8.59 s/inst** (measured 2026-04-27; 2.25× value_head's 3.82 s) | 59.0 % |
 | **value_head for any use** | — | — | strictly Pareto-dominated by rollout at TSP-20 / TSP-50 |
 
 Caveat for Stage 4: `rollout` is the right default for Stage 2/3 *test-time* MCTS, but Stage 4 *training* MCTS should use `value_head` as the leaf evaluator — that's the mechanism by which Stage 4's policy-iteration loop fixes the off-policy bias (training data exposes the head to MCTS-visited states it currently fails on).
@@ -377,7 +385,7 @@ Caveat for Stage 4: `rollout` is the right default for Stage 2/3 *test-time* MCT
 - ✅ Full TSP-20 K-curve completes in < 6h on local GPU (actual: 2h41m for value_head curve, 1h39m for rollout curve).
 - ✅ 30 % gap reduction stretch target — exceeded at every measured K from 20 onward (rollout) or K=50 onward (value_head).
 
-**Stage 2 is closed.** Two diagnostic items (off-policy R², `sqrt_n` ablation) remain queued as tactical follow-ups, and the clean TSP-50 K=100 rollout wall-clock under `bln0tv1pg` will replace the contaminated number in the table when it lands. Neither blocks Stage 3 / Stage 4 from starting.
+**Stage 2 is closed.** Two diagnostic items (off-policy R², `sqrt_n` ablation) remain queued as tactical follow-ups. Clean TSP-50 K=100 rollout wall-clock landed 2026-04-27 (`bln0tv1pg`): **8594.5 s, 2.25× ratio vs canonical 3815 s** — slightly over the predicted 1.5-2× band, leaf-eval fraction back-solves to ~5% at TSP-50. Neither blocks Stage 3 / Stage 4 from starting.
 
 ---
 
