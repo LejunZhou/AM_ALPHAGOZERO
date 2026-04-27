@@ -22,6 +22,17 @@ Tests (run in order; each aborts on first failure):
         so cost may differ slightly. The inline comment in the test body
         explains this in detail.
   A8. root_select='q' produces valid tours (diagnostic sanity).
+  A9. Config validation: invalid combos raise ValueError at construction:
+        - value_norm='sqrt_n' + leaf_eval='value_head' (scale mismatch)
+        - leaf_eval='garbage' (enum check)
+  A10. node_value FPU consistency:
+        - At a non-root node with known c_path and v_estimate, _fpu_value_for
+          returns -(c_path/bl_val + v_estimate) (matches backed-up Q scale).
+        - Root has finite v_estimate after _populate_priors (was NaN before
+          the fix; node_value FPU silently fell back to running_q).
+  A11. Default-config canary: MCTSConfig() returns the canonical
+        leaf_eval='rollout', tree_reuse=True (reproducibility footgun
+        regression detector).
 
 Run:
     PYTHONPATH=src python -m scripts.smoke_mcts
@@ -212,7 +223,70 @@ def main() -> int:
         assert torch.isfinite(c_q[i])
     print(f"[A8 OK] root_select='q' valid tours; mean cost {c_q.mean().item():.4f}")
 
-    print("[OK] Stage 2 Milestone A1+A2..A8 smoke PASSED")
+    # --- A9: config validation rejects invalid combos ---
+    # 1. sqrt_n + value_head must raise (closes Finding 1).
+    try:
+        MCTSSolver(model, MCTSConfig(value_norm='sqrt_n', leaf_eval='value_head'),
+                   device=torch.device('cpu'))
+        raise AssertionError("[A9] sqrt_n + value_head should have raised ValueError")
+    except ValueError as e:
+        msg = str(e)
+        assert 'sqrt_n' in msg and 'value_head' in msg, \
+            f"[A9] ValueError raised but message lacks expected hints: {msg!r}"
+    # 2. enum check: bogus leaf_eval must raise.
+    try:
+        MCTSSolver(model, MCTSConfig(leaf_eval='garbage'),
+                   device=torch.device('cpu'))
+        raise AssertionError("[A9] leaf_eval='garbage' should have raised ValueError")
+    except ValueError:
+        pass
+    print("[A9 OK] config validation rejects sqrt_n+value_head and bogus enums")
+
+    # --- A10: node_value FPU consistency + root v_estimate ---
+    # At a non-root node, fpu_value_for(node_value) must equal
+    # -(state.lengths/bl_val + v_estimate).
+    solverA10 = MCTSSolver(
+        model,
+        MCTSConfig(n_simulations=1, c_puct=0.05, leaf_eval='value_head',
+                   fpu_mode='node_value', fpu_fallback=-1.0, seed=1234),
+        device=torch.device('cpu'),
+    )
+    instA10 = inputs[0:1]
+    bl_val_A10 = 5.0
+    embeddings_A10 = solverA10.model.encode(instA10)
+    fixed_A10 = solverA10.model.precompute_decoder(embeddings_A10)
+    # Build a mid-tour node (3 cities visited).
+    mid_A10 = TSP.make_state(instA10)
+    for a in [0, 5, 11]:
+        mid_A10 = mid_A10.update(torch.tensor([a], dtype=torch.long))
+    mid_node_A10 = MCTSNode(state=mid_A10)
+    solverA10._populate_priors(mid_node_A10, fixed_A10, bl_val_A10)
+    v_est = mid_node_A10.v_estimate
+    assert math.isfinite(v_est), f"[A10] mid node v_estimate not finite: {v_est}"
+    c_path_real = float(mid_A10.lengths.view(-1).item())
+    expected_fpu = -(c_path_real / bl_val_A10 + v_est)
+    got_fpu = solverA10._fpu_value_for(mid_node_A10, bl_val_A10)
+    assert abs(got_fpu - expected_fpu) < 1e-6, (
+        f"[A10] node_value FPU mismatch: got {got_fpu:.6f}, expected {expected_fpu:.6f} "
+        f"(c_path_real={c_path_real}, bl_val={bl_val_A10}, v_est={v_est})"
+    )
+    # Root v_estimate finiteness (was NaN before the fix).
+    root_A10 = MCTSNode(state=TSP.make_state(instA10))
+    solverA10._populate_priors(root_A10, fixed_A10, bl_val_A10)
+    assert math.isfinite(root_A10.v_estimate), \
+        f"[A10] root v_estimate not finite after _populate_priors: {root_A10.v_estimate}"
+    print(f"[A10 OK] node_value FPU={got_fpu:.6f} matches -(c_path/bl_val + v_est); "
+          f"root v_estimate={root_A10.v_estimate:.4f} finite")
+
+    # --- A11: default-config canary (drift detector) ---
+    default_cfg = MCTSConfig()
+    assert default_cfg.leaf_eval == 'rollout', \
+        f"[A11] default leaf_eval drifted to {default_cfg.leaf_eval!r}, expected 'rollout'"
+    assert default_cfg.tree_reuse is True, \
+        f"[A11] default tree_reuse drifted to {default_cfg.tree_reuse!r}, expected True"
+    print("[A11 OK] MCTSConfig() defaults are canonical (rollout + tree_reuse)")
+
+    print("[OK] Stage 2 Milestone A1+A2..A11 smoke PASSED")
     return 0
 
 
