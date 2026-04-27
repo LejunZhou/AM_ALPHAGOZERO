@@ -205,3 +205,115 @@ python -m scripts.eval_value --model outputs/tsp_20/stage1_tsp20_canonical/epoch
 ```
 
 Expected first-read of results: `actor_loss` trace looks identical to Stage 0's `wpqp1dpp`; `val_avg_cost` lands ≈ 3.84; `val_value_r2_overall` rises from ≈ 0 to ≥ 0.7 over the first ~30 epochs; bucketed R² climbs from early to late.
+
+---
+
+## Stage 1 Addendum: TSP-50 Parallel Verification (AM-baseline vs AM+value)
+
+**Added:** 2026-04-23 (post TSP-20 completion, before launch)
+**Status:** Approved — ready to launch
+
+### Context
+
+TSP-20 closed both Stage 1 success criteria (policy not degraded vs Stage 0; R² = 0.9965 ≫ 0.7). This addendum covers the plan's optional §Phase D step 17 — **TSP-50 verification** — and simultaneously closes a Stage 0 gap: Stage 0 deliberately skipped from-scratch TSP-50/100 training (`_plans/stage0_plan.md:88`) and relied on the pretrained reference checkpoint (evaluated at 5.7955 greedy). We have no from-scratch TSP-50 AM run of our own.
+
+Running two parallel Modal A10 jobs with identical AM-canonical hyperparameters — differing only in the value-head flag — closes both gaps in one GPU-window and gives the cleanest possible A/B for the "value head generalizes to larger N" question.
+
+### Runs
+
+Two independent `modal run` invocations, parallel A10 containers, 100 epochs each.
+
+| Run | Variant | Value head | Delta from shared args | Run name |
+|:--|:--|:--|:--|:--|
+| **1** | AM baseline (original) | Off | `--no_value` | `stage1_tsp50_am_baseline` |
+| **2** | AM + value (Stage 1) | On, λ=1.0, `bl` target norm | `--lambda_v 1.0 --value_target_norm bl` | `stage1_tsp50_with_value` |
+
+### Shared hyperparameters (AM paper canonical)
+
+`graph_size=50`, `batch_size=512`, `epoch_size=1,280,000`, `n_epochs=100`, `baseline=rollout`, `bl_warmup_epochs=1`, `bl_alpha=0.05`, `lr_model=1e-4`, `lr_decay=1.0`, `max_grad_norm=1.0`, `embedding_dim=128`, `hidden_dim=128`, `n_encode_layers=3`, `n_heads=8`, `tanh_clipping=10.0`, `normalization=batch`, `seed=1234`, `num_workers=4`, `wandb_project=am-alphagozero`, `wandb_entity=lejun`.
+
+### Why `batch_size=512` (not 2048)
+
+1. **Headline comparability.** Progress §Throughput refactor: canonical/headline runs must keep bs=512. Changing batch changes gradient-noise scale (TSP-20 observed +0.024 val_cost regression at bs=2048 same-LR).
+2. **Reproduces AM paper at TSP-50 cleanly.** Run 1 is our first from-scratch TSP-50 AM training; staying at bs=512 makes "we reproduce AM TSP-50 greedy ≈ 5.80" a clean claim.
+3. **Avoid untested knobs.** Linear-scaling LR (2e-4 at bs=2048) to recover the gap is plausible but untested at TSP-50; would introduce a second variable in Run 1 ↔ Run 2 interpretation.
+
+Cost: ~11h/run on A10 vs ~4–5h/run at bs=2048. Accepted for headline.
+
+### Why `seed=1234`
+
+Matches Stage 0 `wpqp1dpp` and Stage 1 `xg7t2dlb`. AM paper uses 1235; our stage-internal parity is more important than paper-seed parity (the 0.21% Stage 0 delta was well inside run-to-run variance).
+
+### Code change (reversible)
+
+- `src/scripts/modal_run_train.py:100`: `timeout=60 * 60 * 8` → `timeout=60 * 60 * 16`. At bs=512 TSP-50 we project ~10–12h/run; 16h gives 45% headroom for first-epoch worker warmup, rollout-baseline eval, occasional slow batches. Revert after both runs finish (or leave if more TSP-50+ runs are planned).
+
+### Resource expectations
+
+| Quantity | Estimate |
+|:--|:--|
+| Wall-clock per run | 10–12h |
+| Parallel wall-clock (both) | 10–12h (independent containers) |
+| Total GPU-hours | ~22 A10-hours |
+| VRAM per run | ~5–6 GB (well inside 23 GB) |
+| Checkpoint disk | ~1 GB total |
+
+### Success Criteria
+
+- [ ] **Run 1 (AM baseline TSP-50)**: final `val_avg_cost` within ~1% of AM paper's TSP-50 greedy (~5.80) — target range 5.75–5.86. Validates from-scratch reproduction of AM at TSP-50.
+- [ ] **Run 2 (AM+value TSP-50)**: `val_avg_cost` statistically indistinguishable from Run 1 — absolute delta ≤ 0.04 (scaling TSP-20's ±0.04 criterion proportionally).
+- [ ] **Run 2**: `val_value_r2_overall ≥ 0.7` (proposal target, line 68). TSP-20 hit 0.9965; strong prior for TSP-50 if value head generalizes.
+- [ ] **Run 2**: bucketed R² shape intact — `late ≥ early` bucket (uncertainty collapses as tour completes).
+- [ ] Training completes all 100 epochs, no NaN, no divergence.
+- [ ] `_progress/stage1_progress.md` updated with W&B IDs, wall-clock, metrics, A/B verdict.
+
+### Commands (what will be executed)
+
+All from project root. `PYTHONIOENCODING=utf-8 PYTHONUTF8=1` prefix required on Windows git-bash (progress §Known Issues — Modal CLI Unicode choke).
+
+```bash
+# Run 1 — AM baseline (no value head)
+PYTHONIOENCODING=utf-8 PYTHONUTF8=1 \
+modal run --detach src/scripts/modal_run_train.py -- \
+  --graph_size 50 --n_epochs 100 \
+  --batch_size 512 --epoch_size 1280000 \
+  --baseline rollout --bl_warmup_epochs 1 \
+  --seed 1234 --num_workers 4 \
+  --no_value \
+  --run_name stage1_tsp50_am_baseline \
+  --wandb_project am-alphagozero --wandb_entity lejun
+
+# Run 2 — AM + value head (Stage 1 canonical settings)
+PYTHONIOENCODING=utf-8 PYTHONUTF8=1 \
+modal run --detach src/scripts/modal_run_train.py -- \
+  --graph_size 50 --n_epochs 100 \
+  --batch_size 512 --epoch_size 1280000 \
+  --baseline rollout --bl_warmup_epochs 1 \
+  --seed 1234 --num_workers 4 \
+  --lambda_v 1.0 --value_target_norm bl \
+  --run_name stage1_tsp50_with_value \
+  --wandb_project am-alphagozero --wandb_entity lejun
+```
+
+`--detach` returns control to the local shell immediately; training continues server-side and is immune to local-terminal disconnects (safer than `&` for ~11h runs). Monitor via W&B; inspect with `modal app list` / `modal app logs <id>` if needed.
+
+### Monitoring
+
+- **Authoritative source: W&B** (`lejun/am-alphagozero`). Local Modal log streaming is lossy per progress §Known Issues.
+- Early sanity (epoch 5–10): no NaN, `value_loss` decreasing (Run 2), `val_avg_cost` trending below 6.0 on both.
+- Bucketed R² expected to rise by epoch ~10; do not alarm on low R² in first ~5 epochs.
+
+### Known risks / mitigations
+
+1. **Run exceeds 16h timeout.** Checkpoints saved every epoch; resume via `--resume` supported. Generous 45% buffer over projection.
+2. **One run fails, the other doesn't.** No shared state; rerun the failed one only.
+3. **Rollout baseline eval at TSP-50 is expensive** (~6× TSP-20). Included in 11h projection.
+4. **λ_v=1.0 might be suboptimal at TSP-50.** TSP-20 sweep showed [0.1, 2.0] equivalent; no reason to expect TSP-50 differs. If Run 2 regresses > 0.04 vs Run 1, fall back to λ_v=0.1 — defer until data says so.
+5. **`bl` normalization target drifts** over 100 epochs. TSP-20 30-epoch ablation was stable; extending to 100 at larger N is slightly more stress. Fallback `sqrt_n` available but do not pre-emptively switch (it lost early-bucket R² at TSP-20: 0.857 vs 0.895).
+6. **Modal preemption.** TSP-20 λ=1.0 sweep needed 3 submissions; resubmit if it recurs.
+
+### Post-run deliverables
+
+1. Append to `_progress/stage1_progress.md`: both W&B IDs + URLs, final `val_avg_cost` for both + delta, Run 2 R² (overall + buckets), wall-clock, and A/B verdict against each success criterion.
+2. Decide whether to revert `modal_run_train.py` timeout to 8h (or keep at 16h if Stage 2 will use TSP-50+).
+3. Mark TSP-50 verification checkbox in `_progress/stage1_progress.md` task list; confirm Stage 1 fully complete; flag the two TSP-50 checkpoints as available artifacts for Stage 2 MCTS scaffolding.

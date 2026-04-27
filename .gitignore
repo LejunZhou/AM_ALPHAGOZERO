@@ -22,3 +22,9 @@ Thumbs.db
 
 # W&B
 wandb/
+
+# Claude Code harness state (per-session locks, scheduled tasks)
+.claude/
+
+# Throwaway diagnostic scripts (not part of the project)
+scripts_tmp/

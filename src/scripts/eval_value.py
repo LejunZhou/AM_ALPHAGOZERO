@@ -60,6 +60,57 @@ def bucketed_r2(V, T):
     }
 
 
+def per_step_diagnostics(V, T, eps=1e-6):
+    """
+    Per-step residual analysis (decoupled from R^2's variance scaling).
+
+    Returns a dict of (N,) tensors:
+      mse[t]              = mean over batch of (V[:, t] - T[:, t])**2
+      rmse[t]             = sqrt(mse[t])
+      target_var[t]       = batch variance of T[:, t]
+      target_mean[t]      = batch mean of T[:, t]
+      pred_mean[t]        = batch mean of V[:, t]
+      bias[t]             = mean(V - T) at step t (negative => underprediction)
+      mean_abs_frac[t]    = mean(|V - T| / max(T, eps)) at step t (fractional error)
+      r2_step[t]          = 1 - mse[t] / target_var[t]   (per-step R^2 — NaN if var=0)
+
+    Why this complements R^2-by-bucket:
+      - Bucketed R^2 mixes per-step accuracy with per-step target spread; mid-tour
+        targets have moderate variance which inflates R^2 even when residuals are
+        worse than late-tour. Per-step MSE/RMSE shows what the loss actually pays.
+      - Fractional error answers "how wrong proportionally" — relevant for MCTS leaf
+        evaluation where v(s_0) is compared to other v(s_0) across instances.
+    """
+    residual = V - T
+    mse = (residual ** 2).mean(dim=0)
+    target_var = T.var(dim=0, unbiased=False)
+    target_mean = T.mean(dim=0)
+    pred_mean = V.mean(dim=0)
+    bias = residual.mean(dim=0)
+    mean_abs_frac = (residual.abs() / T.clamp(min=eps)).mean(dim=0)
+    r2_step = 1.0 - mse / target_var.clamp(min=eps)
+    return {
+        'mse': mse, 'rmse': mse.sqrt(),
+        'target_var': target_var, 'target_mean': target_mean,
+        'pred_mean': pred_mean, 'bias': bias,
+        'mean_abs_frac': mean_abs_frac, 'r2_step': r2_step,
+    }
+
+
+def print_per_step_table(diag, indices=None):
+    """Print per-step diagnostics for selected step indices (default: all)."""
+    N = diag['mse'].size(0)
+    if indices is None:
+        indices = list(range(N))
+    print(f"  {'step':>4} {'mse':>10} {'rmse':>10} {'tgt_mean':>10} {'tgt_std':>10} "
+          f"{'pred_mean':>10} {'bias':>10} {'frac_err':>10} {'r2_step':>10}")
+    for t in indices:
+        print(f"  {t:4d} {diag['mse'][t].item():10.5f} {diag['rmse'][t].item():10.5f} "
+              f"{diag['target_mean'][t].item():10.5f} {diag['target_var'][t].sqrt().item():10.5f} "
+              f"{diag['pred_mean'][t].item():10.5f} {diag['bias'][t].item():+10.5f} "
+              f"{diag['mean_abs_frac'][t].item():10.5f} {diag['r2_step'][t].item():+10.4f}")
+
+
 def calibration_table(V, T, n_bins=10):
     v_flat = V.flatten()
     t_flat = T.flatten()
@@ -127,6 +178,35 @@ def main():
         for r in rows:
             print(f"  {r['bin_lo']:8.4f} {r['bin_hi']:8.4f} {r['count']:8d} "
                   f"{r['mean_pred']:10.4f} {r['mean_target']:12.4f}")
+
+    diag = per_step_diagnostics(V, T)
+    N = V.size(1)
+
+    print("\nStep-0 / Step-1 callouts (MCTS leaf-evaluator case):")
+    for t in (0, 1):
+        print(f"  step {t}: rmse={diag['rmse'][t].item():.5f}  "
+              f"target_mean={diag['target_mean'][t].item():.5f}  "
+              f"target_std={diag['target_var'][t].sqrt().item():.5f}  "
+              f"frac_err={diag['mean_abs_frac'][t].item():.5f}  "
+              f"r2_step={diag['r2_step'][t].item():+.4f}")
+    print(f"  step {N-1} (end): rmse={diag['rmse'][N-1].item():.5f}  "
+          f"target_mean={diag['target_mean'][N-1].item():.5f}  "
+          f"target_std={diag['target_var'][N-1].sqrt().item():.5f}  "
+          f"frac_err={diag['mean_abs_frac'][N-1].item():.5f}  "
+          f"r2_step={diag['r2_step'][N-1].item():+.4f}")
+
+    print("\nPer-step diagnostics (full):")
+    print_per_step_table(diag)
+
+    # Bucket aggregates from per-step (verifies the bucketed R^2 numbers above)
+    q = max(1, N // 4)
+    print("\nBucket aggregates (mean over steps in bucket):")
+    for name, sl in (('early', slice(0, q)),
+                     ('mid', slice(q, N - q) if N - q > q else slice(q, N)),
+                     ('late', slice(N - q, N))):
+        print(f"  {name:6s}: mean_rmse={diag['rmse'][sl].mean().item():.5f}  "
+              f"mean_tgt_var={diag['target_var'][sl].mean().item():.6f}  "
+              f"mean_frac_err={diag['mean_abs_frac'][sl].mean().item():.5f}")
 
 
 if __name__ == '__main__':
