@@ -107,9 +107,11 @@ Greedy baseline on these 100: 3.8665 (gap 1.01% vs Gurobi 3.8279).
 |:------|:---------:|:-----------:|:-----:|:----------:|
 | canonical (fpu=running_q, visits, no reuse) | 3.8612 | −0.132% | 41/38/21 | 151s |
 | fpu=**fallback** (−1.0 everywhere) | 4.1136 | **+6.406% ✗** | 34/19/47 | 260s |
-| fpu=node_value | 3.8601 | −0.158% | 42/37/21 | 213s |
+| fpu=node_value [†] | 3.8601 | −0.158% | 42/37/21 | 213s |
 | root_select=q (running_q FPU) | 3.8648 | −0.042% | 41/26/33 | 150s |
 | **tree_reuse=True + canonical** | **3.8605** | **−0.149%** | **47/32/21** | **125s ⚡** |
+
+[†] **`fpu=node_value` row INVALIDATED 2026-04-27** by the FPU scale fix in `mcts.py`. When this number was measured: (a) `_populate_priors` did not set `v_estimate`, so the root had `v_estimate=NaN` and `node_value` silently fell back to `running_q`; (b) at non-root nodes `node_value` returned `-v_estimate` (remaining-only) instead of the correct `-(c_path_norm + v_estimate)` (total-from-root scale matching backed-up Q). The −0.158% number is therefore not a meaningful comparison against `running_q`. Re-run only needed if Stage 3/4 reopens FPU mode selection. Canonical config (`running_q`) is unaffected — neither bug fired in the rollout/`running_q` path.
 
 **Final canonical config decision** (2026-04-24 post-reviewer refactor):
 - `c_puct=0.05` — confirmed, unchanged from initial tuning.

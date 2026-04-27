@@ -47,14 +47,21 @@ def main() -> int:
     parser.add_argument('--dirichlet_alpha', type=float, default=0.3)
     parser.add_argument('--dirichlet_epsilon', type=float, default=0.0,
                         help='Dirichlet noise weight at root (0 = off)')
-    parser.add_argument('--leaf_eval', choices=['value_head', 'rollout'], default='value_head')
-    parser.add_argument('--value_norm', choices=['bl', 'sqrt_n'], default='bl')
+    parser.add_argument('--leaf_eval', choices=['value_head', 'rollout'], default='rollout',
+                        help="Default 'rollout' per Stage 2 leaf-eval ablation (uniformly +12-22pp "
+                             "gap reduction over 'value_head' at every matched K). Use 'value_head' "
+                             "for diagnostics or as required by Stage 4 training-loop semantics.")
+    parser.add_argument('--value_norm', choices=['bl', 'sqrt_n'], default='bl',
+                        help="Normalizer for cost-to-go. 'bl' = per-instance greedy cost (matches "
+                             "Stage 1 training convention). 'sqrt_n' is only valid with "
+                             "leaf_eval='rollout' (raises ValueError otherwise — the value head "
+                             "was trained in bl-normalized units).")
     parser.add_argument('--fpu_mode', choices=['fallback', 'running_q', 'node_value'],
                         default='running_q',
                         help="How to init Q for unvisited actions. 'fallback' = constant "
                              "`fpu_fallback` everywhere (useful for sweeping). 'running_q' = "
                              "sum(W)/sum(N) at the parent (AlphaZero standard). 'node_value' = "
-                             "-v_estimate of this node (leans on the value head's own signal).")
+                             "-(c_path_norm + v_estimate) — total-from-root scale matching backed-up Q.")
     parser.add_argument('--fpu_fallback', type=float, default=-1.0,
                         help='Q_init used at brand-new nodes (N=0) regardless of fpu_mode, and '
                              'everywhere when fpu_mode=fallback. Default -1.0 matches typical '
@@ -62,8 +69,14 @@ def main() -> int:
     parser.add_argument('--root_select', choices=['visits', 'q'], default='visits',
                         help="Final action at root: 'visits' (AlphaGo default) or 'q' "
                              "(diagnostic — argmax Q among visited actions).")
-    parser.add_argument('--tree_reuse', action='store_true',
-                        help='Retain the subtree below the chosen action as the next root.')
+    tree_reuse_group = parser.add_mutually_exclusive_group()
+    tree_reuse_group.add_argument('--tree_reuse', dest='tree_reuse', action='store_true',
+                                  help='Retain the subtree below the chosen action as the next root '
+                                       '(default — Stage 2 promoted to canonical: 47/100 wins, +0.149%% '
+                                       'quality, 17%% wall-clock saved on TSP-20).')
+    tree_reuse_group.add_argument('--no_tree_reuse', dest='tree_reuse', action='store_false',
+                                  help='Discard the tree between tour-steps (diagnostic only).')
+    parser.set_defaults(tree_reuse=True)
     parser.add_argument('--output_csv', type=str, default=None,
                         help='If set, write per-instance CSV with (idx, greedy_cost, mcts_cost, gap)')
     parser.add_argument('--no_cuda', action='store_true')

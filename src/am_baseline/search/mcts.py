@@ -41,13 +41,17 @@ class MCTSConfig:
     dirichlet_epsilon: float = 0.0            # 0 = noise off (Stage 2 default)
 
     # --- leaf evaluation ---
-    leaf_eval: str = 'value_head'             # 'value_head' | 'rollout'
+    # Default `rollout` per Stage 2 leaf-eval ablation (uniformly +12-22pp
+    # gap reduction over `value_head` at every matched K on TSP-20/TSP-50);
+    # `value_head` remains available for diagnostics and is required by
+    # Stage 4 training-loop semantics.
+    leaf_eval: str = 'rollout'                # 'value_head' | 'rollout'
     value_norm: str = 'bl'                    # 'bl' (per-instance greedy) | 'sqrt_n'
 
     # --- FPU (first-play urgency): Q_init for unvisited actions ---
     # 'fallback'   : constant `fpu_fallback` everywhere (useful for sweeping)
     # 'running_q'  : node's own running mean sum(W)/sum(N); falls back when N=0
-    # 'node_value' : -v_estimate of this node (needs expansion value cached)
+    # 'node_value' : -(c_path_norm + v_estimate) of this node — total-from-root scale
     fpu_mode: str = 'running_q'
     fpu_fallback: float = -1.0                # typical Q on TSP is ≈ -1 (normalized)
 
@@ -57,7 +61,9 @@ class MCTSConfig:
     root_select: str = 'visits'
 
     # --- tree reuse across tour-steps ---
-    tree_reuse: bool = False                  # Phase A.5 optimization
+    # Default True per Stage 2 tree-reuse diagnostic (47/100 wins, +0.149%
+    # quality, 17% wall-clock saved on TSP-20). Strictly Pareto-better.
+    tree_reuse: bool = True
 
     seed: Optional[int] = None
 
@@ -80,22 +86,47 @@ class MCTSSolver:
                  model: AttentionModel,
                  cfg: MCTSConfig,
                  device: Optional[torch.device] = None):
-        assert cfg.leaf_eval in self.VALID_LEAF_EVAL, cfg.leaf_eval
-        assert cfg.value_norm in self.VALID_VALUE_NORM, cfg.value_norm
-        assert cfg.fpu_mode in self.VALID_FPU_MODE, cfg.fpu_mode
-        assert cfg.root_select in self.VALID_ROOT_SELECT, cfg.root_select
+        self._validate_config(cfg, model)
 
         self.model = model
         self.cfg = cfg
         self.device = device if device is not None else next(model.parameters()).device
         self.model.eval()
+        self.rng = np.random.default_rng(cfg.seed)
+
+    @classmethod
+    def _validate_config(cls, cfg: MCTSConfig, model: AttentionModel) -> None:
+        """Reject invalid or scale-incompatible configs at construction time.
+
+        Raises ValueError (not assert) so misuse surfaces under `python -O` too.
+        """
+        if cfg.leaf_eval not in cls.VALID_LEAF_EVAL:
+            raise ValueError(f"cfg.leaf_eval={cfg.leaf_eval!r} not in {cls.VALID_LEAF_EVAL}")
+        if cfg.value_norm not in cls.VALID_VALUE_NORM:
+            raise ValueError(f"cfg.value_norm={cfg.value_norm!r} not in {cls.VALID_VALUE_NORM}")
+        if cfg.fpu_mode not in cls.VALID_FPU_MODE:
+            raise ValueError(f"cfg.fpu_mode={cfg.fpu_mode!r} not in {cls.VALID_FPU_MODE}")
+        if cfg.root_select not in cls.VALID_ROOT_SELECT:
+            raise ValueError(f"cfg.root_select={cfg.root_select!r} not in {cls.VALID_ROOT_SELECT}")
         if cfg.leaf_eval == 'value_head' and model.value_head is None:
             raise ValueError(
                 "cfg.leaf_eval='value_head' but model has no value_head. "
                 "Either pass a checkpoint trained with value_enabled=True, "
                 "or use cfg.leaf_eval='rollout'."
             )
-        self.rng = np.random.default_rng(cfg.seed)
+        # Scale-compatibility check: the value head was trained against
+        # `bl_val_training`-normalized targets (≈ realized cost / greedy cost
+        # ≈ 1.0). Combining its raw output with `bl_val = sqrt(N)` path
+        # normalization mixes incompatible scales inside `total_norm` in
+        # `_simulate`. Rollout returns `remaining_real / bl_val` and stays
+        # internally consistent under any value_norm.
+        if cfg.value_norm == 'sqrt_n' and cfg.leaf_eval == 'value_head':
+            raise ValueError(
+                "value_norm='sqrt_n' is incompatible with leaf_eval='value_head': "
+                "the value head was trained in bl-normalized units, so its raw output "
+                "would be combined with sqrt(N)-scaled path costs, mixing units in PUCT. "
+                "Use leaf_eval='rollout' with value_norm='sqrt_n'."
+            )
 
     @torch.no_grad()
     def solve_batch(self, inputs: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -153,7 +184,7 @@ class MCTSSolver:
                 root.action_into_me = None
 
             if not root.is_expanded() and not root.is_terminal():
-                self._populate_priors(root, fixed)
+                self._populate_priors(root, fixed, bl_val)
 
             if self.cfg.dirichlet_epsilon > 0 and not root.is_terminal():
                 self._apply_dirichlet(root)
@@ -186,7 +217,7 @@ class MCTSSolver:
 
         # --- Selection: descend through expanded non-terminal nodes. --- #
         while node.is_expanded() and not node.is_terminal():
-            fpu = self._fpu_value_for(node)
+            fpu = self._fpu_value_for(node, bl_val)
             a = select_action(node, self.cfg.c_puct, fpu)
             path.append((node, a))
             child = node.children.get(a)
@@ -221,8 +252,13 @@ class MCTSSolver:
             parent.W[a] = parent.W.get(a, 0.0) + value_for_backup
             parent.Q[a] = parent.W[a] / parent.N[a]
 
-    def _fpu_value_for(self, node: MCTSNode) -> float:
-        """Choose the Q_init for unvisited actions at `node` per cfg.fpu_mode."""
+    def _fpu_value_for(self, node: MCTSNode, bl_val: float) -> float:
+        """Choose the Q_init for unvisited actions at `node` per cfg.fpu_mode.
+
+        All three modes return values on the same "higher Q = better tour"
+        scale that backed-up Q uses (Q = -total_normalized_cost from root).
+        `bl_val` is needed by `node_value` to normalize the path-cost term.
+        """
         mode = self.cfg.fpu_mode
         if mode == 'fallback':
             return self.cfg.fpu_fallback
@@ -232,35 +268,38 @@ class MCTSSolver:
                 return sum(node.W.values()) / total_N
             return self.cfg.fpu_fallback
         if mode == 'node_value':
-            # FPU = -v(node): unvisited actions inherit the node's own cost-to-go
-            # estimate (negated because Q orientation is "higher=better = -cost").
+            # FPU = -(c_path_norm + v_estimate): unvisited actions inherit the
+            # estimated total-from-root cost through this node, on the same
+            # scale as Q values backed up via PUCT.
             if math.isfinite(node.v_estimate):
-                # Add current path cost (normalized) so unvisited Q is on the same
-                # scale as visited actions' backed-up values at this node.
-                c_path_real = float(node.state.lengths.view(-1)[0].item())
-                # bl_val is instance-constant; rely on caller to pass the same
-                # via self state. We read from the last call's bl_val via the
-                # path cost + v_estimate (already normalized).
-                # Actually v_estimate alone represents remaining norm; total norm
-                # from this node's subtree = c_path_norm + v_estimate. But we
-                # need bl_val for c_path. Callers use running_q or fallback for
-                # correctness; node_value mode is best-effort and uses
-                # running_q as a safe fallback when c_path normalization isn't
-                # trivially available at this call site.
-                total_N = node.total_visits()
-                if total_N > 0:
-                    return sum(node.W.values()) / total_N
-                # Unvisited node: use -v_estimate as optimistic estimate. This
-                # treats the node's intrinsic "remaining quality" as the FPU.
-                return -node.v_estimate
+                c_path_norm = float(node.state.lengths.view(-1)[0].item()) / bl_val
+                return -(c_path_norm + node.v_estimate)
             return self.cfg.fpu_fallback
         raise ValueError(f"unknown fpu_mode: {mode}")
 
-    def _populate_priors(self, node: MCTSNode, fixed) -> None:
-        """Populate `node.P` for all legal actions, renormalized safely."""
+    def _populate_priors(self, node: MCTSNode, fixed, bl_val: float) -> None:
+        """Populate `node.P` for all legal actions AND cache `node.v_estimate`.
+
+        `v_estimate` is computed in the same way `_expand` does (matching
+        `cfg.leaf_eval`) so the root's FPU values are on the same scale
+        regardless of leaf-eval mode. Without this caching the root would
+        carry `v_estimate=NaN` and `fpu_mode='node_value'` would silently
+        fall back to `running_q` / `fpu_fallback`. `bl_val` is needed only
+        by the rollout branch (value_head returns normalized space directly).
+        """
         assert not node.is_terminal(), "_populate_priors called on terminal node"
-        log_p, mask = self.model.decoder.decode_step(fixed, node.state, return_glimpse=False)
+        log_p, mask, glimpse = self.model.decoder.decode_step(
+            fixed, node.state, return_glimpse=True
+        )
         self._fill_priors_from_logp(node, log_p, mask)
+
+        if self.cfg.leaf_eval == 'value_head':
+            node.v_estimate = float(self.model.value_head(glimpse).view(-1)[0].item())
+        elif self.cfg.leaf_eval == 'rollout':
+            remaining_real = self._rollout_remaining_real(node.state, fixed)
+            node.v_estimate = remaining_real / bl_val
+        else:
+            raise ValueError(f"Unknown leaf_eval: {self.cfg.leaf_eval}")
 
     def _expand(self, node: MCTSNode, fixed, bl_val: float) -> float:
         """Populate `node.P` AND return estimated NORMALIZED cost-to-go from node.state.
