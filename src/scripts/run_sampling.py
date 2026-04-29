@@ -136,7 +136,8 @@ def main() -> int:
     model.set_decode_type('sampling')
     sample_costs = torch.empty(B)
     sample_pis = []  # collect best-of-K tours per instance (variable padding ok)
-    t0 = time.time()
+    wall_clock_ms = torch.empty(B, dtype=torch.float64)
+    t0 = time.perf_counter()
     iterator = range(0, B, eval_batch_size)
     if not args.no_progress_bar:
         iterator = tqdm(iterator, desc=f"Sampling K={args.width}")
@@ -144,12 +145,22 @@ def main() -> int:
         for start in iterator:
             end = min(start + eval_batch_size, B)
             batch = inputs[start:end].to(device)
+            t_chunk = time.perf_counter()
             best_pi, best_cost = model.sample_many(
                 batch, batch_rep=batch_rep, iter_rep=iter_rep
             )
+            # Sync GPU before stopping the chunk clock so wall-clock measurements
+            # capture actual GPU compute, not just kernel launch.
+            if device.type == 'cuda':
+                torch.cuda.synchronize()
+            chunk_ms = (time.perf_counter() - t_chunk) * 1000.0
+            # Sampling is batched over `eval_batch_size` instances per chunk; the
+            # observable per-instance wall-clock is the chunk mean (no per-instance
+            # separation possible without forfeiting GPU batching). Broadcast it.
+            wall_clock_ms[start:end] = chunk_ms / max(end - start, 1)
             sample_costs[start:end] = best_cost.detach().cpu()
             sample_pis.append(best_pi.detach().cpu())
-    elapsed = time.time() - t0
+    elapsed = time.perf_counter() - t0
 
     # --- Report ---
     delta = sample_costs - greedy_cost
@@ -194,7 +205,8 @@ def main() -> int:
         with open(args.output_csv, "w", newline="") as f:
             w = csv.writer(f)
             w.writerow([
-                "idx", "greedy_cost", "sample_cost", "delta", "gap_pct", "decode_steps",
+                "idx", "greedy_cost", "sample_cost", "delta", "gap_pct",
+                "decode_steps", "wall_clock_ms",
             ])
             for i in range(B):
                 w.writerow([
@@ -204,6 +216,7 @@ def main() -> int:
                     f"{delta[i].item():+.6f}",
                     f"{gap_pct[i].item():+.4f}",
                     decode_steps_per_inst,
+                    f"{wall_clock_ms[i].item():.3f}",
                 ])
         print(f"Wrote {args.output_csv}")
 

@@ -31,6 +31,14 @@ from typing import Optional
 # Mapping from (method, leaf_eval) → (glob pattern, regex pattern) for source CSVs.
 # Glob pattern uses '*' for K; regex pattern has one capture group on K (integer).
 SOURCES_TSP20 = [
+    # Stage 3 cpp re-runs (preferred — already instrumented at val_size=1000).
+    ('mcts', 'rollout',
+     'outputs/stage3/tsp20_K*_rollout.csv',
+     r'tsp20_K(\d+)_rollout\.csv'),
+    ('mcts', 'value_head',
+     'outputs/stage3/tsp20_K*_value_head.csv',
+     r'tsp20_K(\d+)_value_head\.csv'),
+    # Stage 2 reuse (only kicks in for K not present above).
     ('mcts', 'rollout',
      'outputs/stage2/tsp20_K*_rollout_canonical.csv',
      r'tsp20_K(\d+)_rollout_canonical\.csv'),
@@ -98,6 +106,19 @@ def _decode_steps_from_csv(rows: list[dict]) -> Optional[float]:
     return statistics.mean(counts)
 
 
+def _wall_clock_ms_from_csv(rows: list[dict]) -> Optional[tuple[float, float]]:
+    """Return (median, mean) wall-clock ms per instance, or None if unavailable.
+
+    Median is preferred for the headline plot because the laptop GPU
+    occasionally stalls for one instance (suspend / driver / context-switch),
+    producing multi-second outliers that swamp the arithmetic mean.
+    """
+    if not rows or 'wall_clock_ms' not in rows[0]:
+        return None
+    times = [float(r['wall_clock_ms']) for r in rows]
+    return statistics.median(times), statistics.mean(times)
+
+
 def _decode_steps_from_cache(cache: dict, graph_size: int, leaf_eval: str, K: int,
                               method: str) -> Optional[float]:
     """Look up a probed decode_steps mean from the cache JSON."""
@@ -132,6 +153,14 @@ def _aggregate_one(method: str, leaf_eval: str, K: int, csv_path: str,
               f"emit row with decode_steps_mean=NaN", file=sys.stderr)
         decode_steps = float('nan')
 
+    # Wall-clock per instance (only present in cpp re-runs and Phase-A-instrumented sampling).
+    wc_pair = _wall_clock_ms_from_csv(rows)
+    if wc_pair is None:
+        wall_clock_ms_median = float('nan')
+        wall_clock_ms_mean = float('nan')
+    else:
+        wall_clock_ms_median, wall_clock_ms_mean = wc_pair
+
     # Quality metrics.
     if optimum is not None and optimum > 0:
         gap_to_opt_pct = (s_mean - optimum) / optimum * 100.0
@@ -154,6 +183,8 @@ def _aggregate_one(method: str, leaf_eval: str, K: int, csv_path: str,
         'leaf_eval': leaf_eval,
         'K': K,
         'decode_steps_mean': decode_steps,
+        'wall_clock_ms_median': wall_clock_ms_median,
+        'wall_clock_ms_mean': wall_clock_ms_mean,
         'mean_cost': s_mean,
         'std_cost': s_std,
         'mean_gap_to_opt_pct': gap_to_opt_pct,
@@ -177,6 +208,8 @@ def _greedy_row(graph_size: int, optimum: Optional[float], n: int, g_mean: float
         'leaf_eval': '-',
         'K': 1,
         'decode_steps_mean': float(graph_size),
+        'wall_clock_ms_median': float('nan'),
+        'wall_clock_ms_mean': float('nan'),
         'mean_cost': g_mean,
         'std_cost': float('nan'),
         'mean_gap_to_opt_pct': gap_to_opt_pct,
@@ -278,15 +311,16 @@ def main() -> int:
         print(f"Greedy baseline:   {greedy_mean:.4f} (gap to opt: {gap_g:.3f}%)")
     else:
         print(f"Greedy baseline:   {greedy_mean:.4f}")
-    header = ['method', 'leaf_eval', 'K', 'decode_steps_mean', 'mean_cost',
-              'gap_to_opt_pct', 'gap_red_pct', 'win_rate', 'n']
-    fmt = "{:8s} {:11s} {:>5} {:>12.1f} {:>9.4f} {:>10.3f} {:>10.2f} {:>9.3f} {:>5}"
+    header = ['method', 'leaf_eval', 'K', 'decode_steps_mean', 'wall_ms_med',
+              'mean_cost', 'gap_to_opt_pct', 'gap_red_pct', 'win_rate', 'n']
+    fmt = "{:8s} {:11s} {:>5} {:>12.1f} {:>12.1f} {:>9.4f} {:>10.3f} {:>10.2f} {:>9.3f} {:>5}"
     print()
     print('  '.join(f'{h:>10s}' for h in header))
     for r in rows_out:
         print(fmt.format(
             r['method'], r['leaf_eval'], r['K'],
-            r['decode_steps_mean'], r['mean_cost'],
+            r['decode_steps_mean'], r['wall_clock_ms_median'],
+            r['mean_cost'],
             r['mean_gap_to_opt_pct'], r['gap_reduction_vs_greedy_pct'],
             r['win_rate_vs_greedy'], r['n_instances'],
         ))
@@ -297,6 +331,7 @@ def main() -> int:
         with open(args.output_csv, 'w', newline='') as f:
             w = csv.writer(f)
             cols = ['method', 'leaf_eval', 'K', 'decode_steps_mean',
+                    'wall_clock_ms_median', 'wall_clock_ms_mean',
                     'mean_cost', 'std_cost',
                     'mean_gap_to_opt_pct', 'gap_reduction_vs_greedy_pct',
                     'win_rate_vs_greedy', 'tie_rate_vs_greedy',
@@ -306,6 +341,8 @@ def main() -> int:
                 w.writerow([
                     r['method'], r['leaf_eval'], r['K'],
                     f"{r['decode_steps_mean']:.2f}",
+                    f"{r['wall_clock_ms_median']:.3f}",
+                    f"{r['wall_clock_ms_mean']:.3f}",
                     f"{r['mean_cost']:.6f}",
                     f"{r['std_cost']:.6f}",
                     f"{r['mean_gap_to_opt_pct']:.4f}",

@@ -190,15 +190,22 @@ def main() -> int:
     pending_collection_successes = torch.empty(B, dtype=torch.long)
     virtual_collision_count = torch.empty(B, dtype=torch.long)
     max_virtual_visits_remaining = torch.empty(B, dtype=torch.long)
-    t0 = time.time()
+    wall_clock_ms = torch.empty(B, dtype=torch.float64)
+    t0 = time.perf_counter()
     iterator = range(B)
     if not args.no_progress_bar:
         iterator = tqdm(iterator, desc="MCTS")
     for i in iterator:
+        t_inst = time.perf_counter()
         c_i, t_i = solver.solve_instance(
             inputs[i:i+1].to(device),
             bl_val=float(bl_vals[i].item()),
         )
+        # Sync GPU before stopping the per-instance clock so wall-clock measurements
+        # capture actual GPU compute, not just kernel launch.
+        if device.type == 'cuda':
+            torch.cuda.synchronize()
+        wall_clock_ms[i] = (time.perf_counter() - t_inst) * 1000.0
         costs[i] = c_i.detach().cpu()
         tours[i] = t_i.detach().cpu()
         decode_steps[i] = solver.fwd_count_decode
@@ -214,7 +221,7 @@ def main() -> int:
         pending_collection_successes[i] = getattr(solver, 'pending_collection_successes', 0)
         virtual_collision_count[i] = getattr(solver, 'virtual_collision_count', 0)
         max_virtual_visits_remaining[i] = getattr(solver, 'max_virtual_visits_remaining', 0)
-    elapsed = time.time() - t0
+    elapsed = time.perf_counter() - t0
 
     # --- Report ---
     gap_vs_greedy = (costs - greedy_cost)                  # negative = improvement
@@ -284,6 +291,7 @@ def main() -> int:
             w.writerow([
                 "idx", "greedy_cost", "mcts_cost", "delta", "gap_pct",
                 "decode_steps", "rollout_steps", "value_calls",
+                "wall_clock_ms",
                 "simulation_batch_size", "virtual_loss_weight", "virtual_loss_margin",
                 "batch_eval_calls", "batch_eval_rows",
                 "pending_batch_calls", "pending_batch_rows",
@@ -300,6 +308,7 @@ def main() -> int:
                     int(decode_steps[i].item()),
                     int(rollout_steps[i].item()),
                     int(value_calls[i].item()),
+                    f"{wall_clock_ms[i].item():.3f}",
                     args.simulation_batch_size,
                     f"{args.virtual_loss_weight:.6f}",
                     f"{args.virtual_loss_margin:.6f}",

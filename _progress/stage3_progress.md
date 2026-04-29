@@ -2,8 +2,8 @@
 
 **Plan:** `_plans/stage3_plan.md`
 **Started:** 2026-04-27
-**Last updated:** 2026-04-29 — **Phase E (Stage 2 cleanup) CLOSED.** E.1 off-policy R² probe: TSP-20 K=400 rollout cpp on 1000 instances logged 40,160 leaf rows; off-policy R² = **0.9949 vs Stage 1 in-distribution 0.9965** (delta −0.0016 — value head is essentially in-distribution-accurate on MCTS-visited states). E.2 sqrt_n ablation: `sqrt_n` uniformly slightly worse than `bl` at TSP-20 K=200 rollout (mean 3.8321 vs 3.8319; gap-red 63.5% vs 65.2%; win 0.388 vs 0.439). **`bl` stays canonical**; per-instance greedy `bl_val` pass remains in Stage 4 critical path. Phase F bs=2048 TSP-20/TSP-50 follow-up finished. TSP-100 reduced-compute AM+value remains in flight. Current MCTS canonical remains sequential C++ (`simulation_batch_size=1`).
-**Status:** **Phases A, B, C (TSP-50), D (TSP-100 K∈{20,50} — D.3 STRICT PASS), E (Stage 2 cleanup) all closed via cpp; Phase F preflight + TSP-20/TSP-50 bs=2048 follow-up complete; TSP-100 reduced-compute training in flight; Phase G C++ backend extended and benchmarked through virtual visits + virtual loss; canonical remains sequential C++ MCTS.**
+**Last updated:** 2026-04-29 — **Phase B recheck (TSP-20 cpp, dual-axis budget plot) CLOSED.** Re-ran TSP-20 K-sweep with cpp backend at val_size=1000 seed=1234 (rollout K∈{20,50,100,200,400}, value_head K∈{20,50,100,200,400,800}, sampling K∈{1,100,500}) so the TSP-20 row of the headline figure now matches TSP-50/TSP-100 in provenance (cpp 1000-inst CSVs with `decode_steps` + `wall_clock_ms`, no probe-cache fallback). Added per-instance `wall_clock_ms` column to both `run_mcts.py` and `run_sampling.py`; aggregator now emits `wall_clock_ms_median` (robust to laptop GPU stalls — one rollout K=400 instance hit a 3.6-hour stall during a sleep/driver pause and would have polluted the arithmetic mean). Plot script extended with `--x_metric {decode_steps, wall_clock_ms}`. Two TSP-20 figures saved: `outputs/stage3/figures/budget_curve_tsp20.png` (forward-pass axis) and `outputs/stage3/figures/budget_curve_tsp20_walltime.png` (wall-clock axis). **Headline:** at matched forward-pass budget, MCTS rollout K=400 (405 fwd/inst) reaches 0.087% gap vs sampling K=500 (10000 fwd/inst, 0.081% gap) — MCTS at **25× fewer fwd passes** for ~equivalent quality. On wall-clock the picture inverts: sampling K=500 = 7.4 ms vs MCTS K=400 = 44.8 ms (6× slower) because cpp MCTS solves one instance at a time while sampling batches all 1000 instances per GPU dispatch. The wall-clock gap is an artifact of cross-instance batching, not algorithmic efficiency, and motivates a future cross-instance-batched MCTS for Stage 4.
+**Status:** **Phase B recheck (TSP-20 cpp + dual-axis plots) CLOSED 2026-04-29; Phases A, C (TSP-50), D (TSP-100 K∈{20,50} — D.3 STRICT PASS), E (Stage 2 cleanup) all closed via cpp; Phase F preflight + TSP-20/TSP-50 bs=2048 follow-up complete; TSP-100 reduced-compute training in flight; Phase G C++ backend extended and benchmarked through virtual visits + virtual loss; canonical remains sequential C++ MCTS.**
 **Phase G update:** 2026-04-27 - C++ backend implemented, built, smoke-tested, benchmarked, and closed through G.7 with a logic-preserving decoder cache plus whole-rollout leaf callback.
 **Phase G hygiene update:** 2026-04-28 — `src/am_baseline/search/mcts_cpp/solver.py` cleanup (single-source per-instance dist matrix via `np.linalg.norm`; cache-key comment expanded for `first=-1` invariant). Smoke A1..A11 cpp passes; 100-inst TSP-20 K=20 rollout cpp byte-identical to canonical CSV (max diff 0.0). Plan: `~/.claude/plans/can-you-check-the-wise-brook.md`.
 **Phase G.8 update:** 2026-04-28 — implemented opt-in batched virtual-visit C++ MCTS (`simulation_batch_size>1`) plus batched Python/PyTorch evaluator and batched greedy rollout callback. Validation: `python -m scripts.smoke_mcts --backend cpp` passes including new A12 batch checks (`simulation_batch_size=4` value_head/rollout, no virtual-visit leaks); `python -m scripts.smoke_mcts --backend python` passes and rejects Python-backend batched MCTS. Small comparison sweeps completed at TSP-100 K=20/val100 and TSP-50 K=20/val100. Diagnosis: virtual visits only increase effective visit counts and leave Q unchanged, so with sharp AM priors and `c_puct=0.05`, collection repeatedly returns to the same pending leaf; collision overhead dominates.
@@ -28,6 +28,46 @@
     - Implied priors expansions = 341.2 − 307.4 = **33.8** per instance across 20 tour-steps × 200 sims = 4000 sims (≈0.85% expand rate). Lower than I'd predicted from `K·(N+d̄)` because **tree_reuse fills the upper subtree quickly**: most simulations after the first few tour-steps descend into already-expanded territory and exit at terminal leaves with no new expand. The per-leaf rollout fraction (307.4/33.8 ≈ 9.1) is consistent with rollouts averaging depth d̄ ≈ N − 9 = 11.
   - [x] **Sampling-K=1 vs greedy** (TSP-20, val_size=100): sampling K=1 mean = 3.8672 vs greedy mean = 3.8665, delta +0.019%, **84/100 tied + 6 sampling-wins + 10 sampling-losses**. Multinomial-1 on a near-deterministic policy is close to greedy but not identical (a couple of multimodal-distribution instances per 100 deviate). The plan's "match within 1e-4" self-check was incorrect; relaxing to "within ~0.05%" (and document that K=1 is a noisy-greedy anchor on the sampling curve, not a strict match).
   - **Headline implication for Phase B forward-pass plot**: at TSP-20 K=200 rollout, MCTS uses ~341 decode_steps per instance — comparable to **sampling K≈17** (340 decode_steps). MCTS K=200 rollout already gave Stage 2's 65.2 % gap reduction; sampling K=17 would not come close. Strong indicator that the budget plot will show MCTS dominating sampling at matched x-axis.
+
+### Phase B recheck — TSP-20 cpp dual-axis (CLOSED 2026-04-29)
+
+The original Phase B plot (2026-04-27) was built from Stage 2 Python rollout/value_head CSVs joined to a `decode_step` probe that ran on val_size=20 instances. After Phase G's cpp backend landed and TSP-50/TSP-100 used cpp val_size=1000 CSVs directly, TSP-20 was the odd row out. Recheck re-ran the entire TSP-20 K-sweep with cpp at val_size=1000 seed=1234 so the three figures share provenance. Recheck also added a second budget axis: median wall-clock per instance.
+
+- [x] Added `wall_clock_ms` per-instance column to `src/scripts/run_mcts.py` and `src/scripts/run_sampling.py`. MCTS times each `solve_instance` separately (with `torch.cuda.synchronize()` on CUDA before stopping the per-instance clock); sampling broadcasts the chunk wall-clock to each instance in the chunk because `sample_many` cannot be split per-instance without forfeiting GPU batching. Both runners use `time.perf_counter()` (monotonic, high-resolution).
+- [x] Updated `src/scripts/aggregate_stage3.py` to emit `wall_clock_ms_median` and `wall_clock_ms_mean` columns. **Median is the canonical statistic** because the laptop GPU occasionally stalls one instance for seconds (one observed K=400 rollout instance took 12,873,871 ms = 3.6 h, presumably during a driver/suspend event), which would swamp the mean. Median is unaffected. SOURCES_TSP20 now prefers the cpp re-runs at `outputs/stage3/tsp20_K*_{rollout,value_head}.csv` and falls back to Stage 2 only for K-points the cpp sweep skipped.
+- [x] Updated `src/scripts/plot_stage3.py` with `--x_metric {decode_steps, wall_clock_ms}`. Both figures are titled `... — forward-pass budget` and `... — wall-clock budget` respectively.
+- [x] Re-ran the full TSP-20 sweep on RTX 4060 Laptop GPU. Wall-clock and quality numbers in the table below.
+- [x] Final figures saved:
+  - `outputs/stage3/figures/budget_curve_tsp20.png` (forward-pass axis)
+  - `outputs/stage3/figures/budget_curve_tsp20_walltime.png` (wall-clock axis)
+- [ ] **Open follow-up:** TSP-50 and TSP-100 cpp CSVs predate the `wall_clock_ms` column. To get the dual-axis plot for those graph sizes, both need a re-run. Estimated compute: ~30 min for TSP-50, ~45 min for TSP-100. Decode-steps plot for TSP-50/TSP-100 already in place.
+
+#### Phase B recheck — comparison table (TSP-20 cpp val_size=1000 seed=1234)
+
+| Method     | leaf_eval  |   K | decode_steps | wall_ms (med) | mean cost | gap_to_opt | gap_red | win_rate |
+|:-----------|:-----------|----:|-------------:|--------------:|----------:|-----------:|--------:|---------:|
+| greedy     | -          |   1 |         20.0 |             — |    3.8394 |     0.301% |    0.0% |    0.000 |
+| sampling   | -          |   1 |         20.0 |          0.05 |    3.8411 |     0.345% |  −14.5% |    0.062 |
+| sampling   | -          | 100 |         2000 |          1.50 |    3.8322 |     0.112% |   62.8% |    0.304 |
+| sampling   | -          | 500 |        10000 |          7.40 |    3.8310 |     0.081% |   73.2% |    0.339 |
+| MCTS       | rollout    |  20 |        306.3 |         28.10 |    3.8346 |     0.176% |   41.6% |    0.172 |
+| MCTS       | rollout    |  50 |        337.9 |         27.20 |    3.8335 |     0.146% |   51.6% |    0.208 |
+| MCTS       | rollout    | 100 |        360.7 |         24.90 |    3.8326 |     0.122% |   59.3% |    0.248 |
+| MCTS       | rollout    | 200 |        383.2 |         27.80 |    3.8319 |     0.104% |   65.4% |    0.277 |
+| MCTS       | rollout    | 400 |        405.0 |         44.80 |    3.8312 |     0.087% |   71.1% |    0.304 |
+| MCTS       | value_head |  20 |         28.2 |         22.40 |    3.8360 |     0.211% |   30.1% |    0.150 |
+| MCTS       | value_head |  50 |         31.4 |         24.40 |    3.8352 |     0.190% |   36.9% |    0.178 |
+| MCTS       | value_head | 100 |         33.6 |         24.40 |    3.8348 |     0.181% |   40.0% |    0.201 |
+| MCTS       | value_head | 200 |         36.1 |         27.10 |    3.8343 |     0.167% |   44.4% |    0.224 |
+| MCTS       | value_head | 400 |         38.6 |         33.30 |    3.8338 |     0.153% |   49.1% |    0.249 |
+| MCTS       | value_head | 800 |         41.2 |         39.80 |    3.8333 |     0.140% |   53.4% |    0.272 |
+
+#### Phase B recheck — interpretation
+
+- **Forward-pass axis** (proposal headline): MCTS rollout dominates sampling at matched compute. MCTS rollout K=200 (383 fwd/inst, 0.104% gap) beats sampling K=100 (2000 fwd/inst, 0.112% gap) at **5× fewer forward passes AND** strictly better quality. MCTS rollout K=400 (405 fwd/inst, 0.087% gap) reaches the sampling K=500 frontier (10000 fwd/inst, 0.081% gap) at **25× fewer forward passes** for ~equivalent quality. Value_head curve dominates the ultra-low-budget regime (≤41 fwd/inst).
+- **Wall-clock axis** (RTX 4060 Laptop): sampling beats MCTS by ~6× at matched quality. Sampling K=500 = 7.4 ms / 0.081% gap; MCTS rollout K=400 = 44.8 ms / 0.087% gap. **This is not an algorithmic loss** — it is a cross-instance-batching artifact: sampling batches all 1000 instances per GPU dispatch (≈5k forwards total), while cpp MCTS calls `decode_step` per-instance with batch size 1 (≈400k forwards total at K=400). The cpp port already removed 98% of Python tree-walk overhead (Phase G); the remaining gap is GPU dispatch overhead at batch size 1.
+- **Implication for Stage 4:** within-tree batching (G.8 virtual visits, G.9 virtual loss) has been ruled out (`simulation_batch_size=1` canonical). Cross-instance batching — solving N MCTS trees in parallel and batching the leaf-eval pass across them — is the right wall-clock fix and a clean prerequisite for Stage 4 self-play.
+- **Wall-clock noise floor:** even after a warm-up run, the laptop GPU produced 2–4× wall-clock spikes on individual K-configs (transient driver/scheduler activity). Median over 1000 instances absorbs this; arithmetic mean does not (one observed K=400 rollout instance took 3.6 hours; mean would have been ~13 s/inst, median was 44.8 ms).
 
 ### Phase B — TSP-20 headline — COMPLETE 2026-04-27
 
@@ -333,6 +373,9 @@ Conclusion: this gets Phase G past the original `>=10x` TSP-20 rollout speed tar
 | E.1 | TSP-20 K=400 rollout off-policy R² probe, val_size=1000, cpp | 69.9 s | RTX 4060 Laptop |
 | E.2 | TSP-20 K=200 rollout `value_norm='sqrt_n'`, val_size=1000, cpp | 37.3 s | RTX 4060 Laptop |
 | **Phase E total** | Stage 2 cleanup (E.1 + E.2 + 5-inst smoke) | **~108 s** | RTX 4060 Laptop |
+| B-recheck | TSP-20 cpp K-sweep total (rollout K∈{20..400}, value_head K∈{20..800}, sampling K∈{1,100,500}) | ~7 min | RTX 4060 Laptop |
+| B-recheck | TSP-20 K=400 rollout median wall-clock per inst | 44.8 ms | RTX 4060 Laptop |
+| B-recheck | TSP-20 K=800 value_head median wall-clock per inst | 39.8 ms | RTX 4060 Laptop |
 
 ---
 
