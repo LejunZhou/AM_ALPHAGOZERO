@@ -118,11 +118,10 @@ Plot footnote: "Forward-pass = `decode_step` calls per instance; encoder pass an
 
 **D.3 Sampling sweep at TSP-100.** K ∈ {1, 100, 500, 1280}. ~2-3 h. (K=2560 dropped per the same reasoning as TSP-50; sampling-1280 is the AM-paper reference.)
 
-**D.4 Rollout MCTS K-sweep at TSP-100.** K ∈ {20, 50, 100} (K=200 deferred — would be ~19 h alone; reassess after K=100 lands).
+**D.4 Rollout MCTS K-sweep at TSP-100.** K ∈ {20, 50}. K=100 is no longer required for the current Stage 3 decision because K=20 and K=50 already close the strict TSP-100 pass gate; keep K=100/K=200 deferred unless a paper-quality curve later needs more high-budget points.
 - K=20: ~2 h
 - K=50: ~5 h
-- K=100: ~9.7 h
-- Total: ~17 h overnight.
+- Total: ~7 h overnight.
 
 **D.5 Aggregator + plot.** Output `outputs/stage3/comparison_tsp100.csv` and `outputs/stage3/figures/budget_curve_tsp100.png`.
 
@@ -169,6 +168,17 @@ Plot footnote: "Forward-pass = `decode_step` calls per instance; encoder pass an
 
 **G.7 (Stretch)** Batched leaf evaluation across simultaneous trees. Useful for Stage 4 self-play where thousands of trees run in parallel; not required for Stage 3.
 
+**G.8 (Post-Phase-G extension)** Batched virtual-visit search within one C++ tree.
+- Add `simulation_batch_size` with default `1` so the original sequential C++ backend remains the reference.
+- For `simulation_batch_size>1`, collect multiple pending simulations with CPU-side virtual visits, then batch leaf/value/rollout evaluation through the existing Python/PyTorch model boundary.
+- Keep true multithreaded tree mutation and full virtual loss deferred; this extension is single-threaded tree search plus batched neural inference.
+- Finding after small TSP-50/TSP-100 sweeps: virtual visits alone are too weak for useful batching. Realized batch stays near `1.02–1.03` because deterministic PUCT repeatedly collides on the same pending leaf; collision overhead can erase or reverse any GPU batching gain.
+
+**G.9 (Post-G.8 extension)** Virtual-loss batched search within one C++ tree.
+- Add `virtual_loss_weight` and `virtual_loss_margin` to temporarily lower Q and inflate effective visits on pending edges, following KataGo's virtual-loss idea.
+- Smoke result on TSP-50 K=20 val_size=100: virtual loss creates real pending batches (`6.67–18.35`) but badly fails the objective: wall-clock is ~12–14× slower and optimality gap regresses. It over-diversifies low-K search before backups arrive and destroys the decoder-cache advantage.
+- Keep `simulation_batch_size=1` as canonical. If batching is revisited, prefer cross-instance/tree batching or a much more conservative selection-diversification rule rather than aggressive within-tree virtual loss.
+
 **Effort estimate.** ~3-5 days of focused engineering for G.1-G.6. Independent of Phases A-F GPU compute — runs in parallel with Stage 3 experiments.
 
 **Critical-path implications.** None for Stage 3 (Python MCTS is sufficient for the headline plot). For Stage 4 the C++ port is effectively a hard prerequisite — self-play wall-clock at Python speeds would put Stage 4 well outside laptop-feasible compute. Including Phase G in Stage 3 lets Stage 4 start unencumbered.
@@ -193,8 +203,8 @@ Plot footnote: "Forward-pass = `decode_step` calls per instance; encoder pass an
 ### D.3 — TSP-100 (released AM checkpoint, rollout-only)
 
 - ✅ MCTS rollout (any K) achieves ≥ 30% gap reduction vs greedy (proposal target: 30-50%). TSP-50 K=100 hit 59% so this should be comfortable.
-- ✅ Rollout K=100 achieves ≤ sampling-1280's mean cost using ≤ 50% of sampling-1280's decode_steps. Concretely: rollout K=100 has ~100 · (100 + 50) ≈ 15k decode_steps; sampling-1280 has 1280 · 100 = 128k. Target: ~8× fewer steps for equal-or-better quality.
-- ✅ Curve monotone decreasing across K ∈ {20, 50, 100}.
+- ✅ Rollout K=50 is sufficient for the current Stage 3 strict pass gate against the sampling-1280 anchor. K=100 is deferred rather than required.
+- ✅ Curve monotone decreasing across the required K ∈ {20, 50}.
 
 ---
 
@@ -242,6 +252,8 @@ If Phase D's TSP-100 rollout K=200 is added later (currently deferred), add anot
 5. **TSP-100 rollout K=100 wall-clock estimate is extrapolated.** Stage 2 numbers came from TSP-20/50; TSP-100 has 2× the cities so per-instance time may be larger than 9.7 h. Time-box K=100 at 12 h, then reassess K=200 inclusion.
 
 6. **C++ MCTS correctness drift (Phase G).** Porting MCTS from Python to C++ introduces fp-arithmetic ordering risks (PUCT's argmax can flip on near-ties), state-mirror bugs (mismatched `update`/`get_mask` semantics), and pybind11-marshalling overhead that can erase the speedup. Mitigation: bit-for-bit validation against Python MCTS at fixed seed (G.5); smoke A1..A11 must pass before any benchmark claim; if marshalling overhead dominates, batched callback (G.7) is the fallback.
+
+7. **Within-tree batching may not reduce time or preserve quality.** G.8 virtual visits did not create real batch width; G.9 virtual loss created batch width but over-diversified low-K search, reduced cache hits, and worsened both wall-clock and optimality gap. Mitigation: keep `simulation_batch_size=1` as the reference; only revisit batching through cross-instance/tree batching or a conservative rule with an explicit time+gap promotion gate.
 
 ---
 

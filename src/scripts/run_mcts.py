@@ -38,6 +38,16 @@ def main() -> int:
                         help='Optional path to a .pkl dataset; if omitted, generates fresh')
     parser.add_argument('--seed', type=int, default=1234)
     parser.add_argument('--n_simulations', type=int, default=200)
+    parser.add_argument('--simulation_batch_size', type=int, default=1,
+                        help="C++ backend only. Number of pending simulations to collect "
+                             "with virtual visits before batched leaf/rollout evaluation "
+                             "(1 = original sequential MCTS).")
+    parser.add_argument('--virtual_loss_weight', type=float, default=3.0,
+                        help="C++ batched mode only. Pending-edge virtual loss weight "
+                             "(0 = virtual visits only). Ignored by the sequential path.")
+    parser.add_argument('--virtual_loss_margin', type=float, default=0.5,
+                        help="C++ batched mode only. Temporary Q penalty for pending edges. "
+                             "Ignored by the sequential path.")
     parser.add_argument('--c_puct', type=float, default=0.05,
                         help='PUCT exploration constant. TSP minimization needs a small value '
                              '(~0.05) because Q differences are small on near-optimal policies; '
@@ -99,6 +109,12 @@ def main() -> int:
               f"Retrain with value_enabled=True, or pass --leaf_eval rollout.",
               file=sys.stderr)
         return 2
+    if args.backend == 'python' and args.simulation_batch_size != 1:
+        print(
+            "ERROR: --simulation_batch_size > 1 is only supported with --backend cpp.",
+            file=sys.stderr,
+        )
+        return 2
 
     # --- Dataset ---
     if args.dataset:
@@ -123,6 +139,9 @@ def main() -> int:
     # --- MCTS run ---
     cfg = MCTSConfig(
         n_simulations=args.n_simulations,
+        simulation_batch_size=args.simulation_batch_size,
+        virtual_loss_weight=args.virtual_loss_weight,
+        virtual_loss_margin=args.virtual_loss_margin,
         c_puct=args.c_puct,
         temperature=args.temperature,
         dirichlet_alpha=args.dirichlet_alpha,
@@ -163,6 +182,14 @@ def main() -> int:
     value_calls = torch.empty(B, dtype=torch.long)
     eval_cache_hits = torch.empty(B, dtype=torch.long)
     eval_cache_misses = torch.empty(B, dtype=torch.long)
+    batch_eval_calls = torch.empty(B, dtype=torch.long)
+    batch_eval_rows = torch.empty(B, dtype=torch.long)
+    pending_batch_calls = torch.empty(B, dtype=torch.long)
+    pending_batch_rows = torch.empty(B, dtype=torch.long)
+    pending_collection_attempts = torch.empty(B, dtype=torch.long)
+    pending_collection_successes = torch.empty(B, dtype=torch.long)
+    virtual_collision_count = torch.empty(B, dtype=torch.long)
+    max_virtual_visits_remaining = torch.empty(B, dtype=torch.long)
     t0 = time.time()
     iterator = range(B)
     if not args.no_progress_bar:
@@ -179,6 +206,14 @@ def main() -> int:
         value_calls[i] = solver.fwd_count_value
         eval_cache_hits[i] = getattr(solver, 'eval_cache_hits', 0)
         eval_cache_misses[i] = getattr(solver, 'eval_cache_misses', 0)
+        batch_eval_calls[i] = getattr(solver, 'batch_eval_calls', 0)
+        batch_eval_rows[i] = getattr(solver, 'batch_eval_rows', 0)
+        pending_batch_calls[i] = getattr(solver, 'pending_batch_calls', 0)
+        pending_batch_rows[i] = getattr(solver, 'pending_batch_rows', 0)
+        pending_collection_attempts[i] = getattr(solver, 'pending_collection_attempts', 0)
+        pending_collection_successes[i] = getattr(solver, 'pending_collection_successes', 0)
+        virtual_collision_count[i] = getattr(solver, 'virtual_collision_count', 0)
+        max_virtual_visits_remaining[i] = getattr(solver, 'max_virtual_visits_remaining', 0)
     elapsed = time.time() - t0
 
     # --- Report ---
@@ -199,6 +234,31 @@ def main() -> int:
     print(f"  fwd passes : decode_steps mean={decode_steps.float().mean().item():.1f} "
           f"(rollout subset mean={rollout_steps.float().mean().item():.1f}, "
           f"value_head calls mean={value_calls.float().mean().item():.1f})")
+    total_batch_calls = int(batch_eval_calls.sum().item())
+    total_batch_rows = int(batch_eval_rows.sum().item())
+    if total_batch_calls or total_batch_rows:
+        realized_batch = total_batch_rows / max(total_batch_calls, 1)
+        print(f"  batch eval : calls={total_batch_calls} rows={total_batch_rows} "
+              f"realized_batch={realized_batch:.2f} "
+              f"simulation_batch_size={args.simulation_batch_size}")
+    total_pending_calls = int(pending_batch_calls.sum().item())
+    total_pending_rows = int(pending_batch_rows.sum().item())
+    total_pending_attempts = int(pending_collection_attempts.sum().item())
+    total_pending_successes = int(pending_collection_successes.sum().item())
+    if total_pending_calls or total_pending_rows or total_pending_attempts:
+        realized_pending_batch = total_pending_rows / max(total_pending_calls, 1)
+        success_rate = 100.0 * total_pending_successes / max(total_pending_attempts, 1)
+        print(f"  pending    : calls={total_pending_calls} rows={total_pending_rows} "
+              f"realized_batch={realized_pending_batch:.2f} "
+              f"attempts={total_pending_attempts} successes={total_pending_successes} "
+              f"success_rate={success_rate:.2f}% "
+              f"vloss_weight={args.virtual_loss_weight:g} "
+              f"vloss_margin={args.virtual_loss_margin:g}")
+    total_collisions = int(virtual_collision_count.sum().item())
+    max_virtual_left = int(max_virtual_visits_remaining.max().item()) if B > 0 else 0
+    if args.simulation_batch_size > 1 or total_collisions or max_virtual_left:
+        print(f"  virtual    : collisions={total_collisions} "
+              f"max_remaining={max_virtual_left}")
     total_cache_hits = int(eval_cache_hits.sum().item())
     total_cache_misses = int(eval_cache_misses.sum().item())
     if total_cache_hits or total_cache_misses:
@@ -224,6 +284,11 @@ def main() -> int:
             w.writerow([
                 "idx", "greedy_cost", "mcts_cost", "delta", "gap_pct",
                 "decode_steps", "rollout_steps", "value_calls",
+                "simulation_batch_size", "virtual_loss_weight", "virtual_loss_margin",
+                "batch_eval_calls", "batch_eval_rows",
+                "pending_batch_calls", "pending_batch_rows",
+                "pending_collection_attempts", "pending_collection_successes",
+                "virtual_collision_count", "max_virtual_visits_remaining",
             ])
             for i in range(B):
                 w.writerow([
@@ -235,6 +300,17 @@ def main() -> int:
                     int(decode_steps[i].item()),
                     int(rollout_steps[i].item()),
                     int(value_calls[i].item()),
+                    args.simulation_batch_size,
+                    f"{args.virtual_loss_weight:.6f}",
+                    f"{args.virtual_loss_margin:.6f}",
+                    int(batch_eval_calls[i].item()),
+                    int(batch_eval_rows[i].item()),
+                    int(pending_batch_calls[i].item()),
+                    int(pending_batch_rows[i].item()),
+                    int(pending_collection_attempts[i].item()),
+                    int(pending_collection_successes[i].item()),
+                    int(virtual_collision_count[i].item()),
+                    int(max_virtual_visits_remaining[i].item()),
                 ])
         print(f"Wrote {args.output_csv}")
 

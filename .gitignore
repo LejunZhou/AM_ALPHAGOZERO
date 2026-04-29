@@ -30,3 +30,4 @@ wandb/
 
 # Throwaway diagnostic scripts (not part of the project)
 scripts_tmp/
+.tmp/

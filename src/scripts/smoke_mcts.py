@@ -129,6 +129,38 @@ def _run_cpp_smoke() -> int:
             assert torch.isfinite(costs[i]), f"[CPP {label}] non-finite cost on instance {i}"
         print(f"[CPP {label} OK] mean cost {costs.mean().item():.4f}")
 
+    batch_checks = [
+        ("A12 batch value_head", MCTSConfig(n_simulations=16, simulation_batch_size=4,
+                                           c_puct=0.05, temperature=0.0,
+                                           leaf_eval='value_head', fpu_mode='running_q',
+                                           fpu_fallback=-1.0, seed=1234)),
+        ("A12 batch rollout", MCTSConfig(n_simulations=16, simulation_batch_size=4,
+                                        c_puct=0.05, temperature=0.0,
+                                        leaf_eval='rollout', fpu_mode='running_q',
+                                        fpu_fallback=-1.0, seed=1234)),
+        ("A12 batch rollout no_vloss", MCTSConfig(n_simulations=16, simulation_batch_size=4,
+                                                  virtual_loss_weight=0.0,
+                                                  c_puct=0.05, temperature=0.0,
+                                                  leaf_eval='rollout', fpu_mode='running_q',
+                                                  fpu_fallback=-1.0, seed=1234)),
+    ]
+    for label, check_cfg in batch_checks:
+        solver_b = CppMCTSSolver(model, check_cfg, torch.device('cpu'))
+        costs, tours = solver_b.solve_batch(inputs)
+        for i in range(B):
+            _check_valid_tour(tours[i], N)
+            assert torch.isfinite(costs[i]), f"[CPP {label}] non-finite cost on instance {i}"
+        assert solver_b.max_virtual_visits_remaining == 0, (
+            f"[CPP {label}] virtual visits leaked: {solver_b.max_virtual_visits_remaining}"
+        )
+        assert solver_b.batch_eval_calls > 0, f"[CPP {label}] expected batched eval calls"
+        assert solver_b.pending_batch_calls > 0, f"[CPP {label}] expected pending batches"
+        assert solver_b.pending_batch_rows > 0, f"[CPP {label}] expected pending rows"
+        print(f"[CPP {label} OK] mean cost {costs.mean().item():.4f}; "
+              f"batch_calls={solver_b.batch_eval_calls}, rows={solver_b.batch_eval_rows}, "
+              f"pending={solver_b.pending_batch_rows}/{solver_b.pending_batch_calls}, "
+              f"collisions={solver_b.virtual_collision_count}")
+
     try:
         CppMCTSSolver(model, MCTSConfig(value_norm='sqrt_n', leaf_eval='value_head'),
                       device=torch.device('cpu'))
@@ -328,7 +360,15 @@ def main() -> int:
         raise AssertionError("[A9] leaf_eval='garbage' should have raised ValueError")
     except ValueError:
         pass
-    print("[A9 OK] config validation rejects sqrt_n+value_head and bogus enums")
+    # 3. Python backend does not support batched virtual-visit simulation.
+    try:
+        MCTSSolver(model, MCTSConfig(simulation_batch_size=2),
+                   device=torch.device('cpu'))
+        raise AssertionError("[A9] Python backend should reject simulation_batch_size > 1")
+    except ValueError as e:
+        assert 'simulation_batch_size' in str(e), \
+            f"[A9] ValueError raised but message lacks simulation_batch_size hint: {e!r}"
+    print("[A9 OK] config validation rejects sqrt_n+value_head, bogus enums, and Python batched MCTS")
 
     # --- A10: node_value FPU consistency + root v_estimate ---
     # At a non-root node, fpu_value_for(node_value) must equal
@@ -372,6 +412,12 @@ def main() -> int:
         f"[A11] default leaf_eval drifted to {default_cfg.leaf_eval!r}, expected 'rollout'"
     assert default_cfg.tree_reuse is True, \
         f"[A11] default tree_reuse drifted to {default_cfg.tree_reuse!r}, expected True"
+    assert default_cfg.simulation_batch_size == 1, \
+        f"[A11] default simulation_batch_size drifted to {default_cfg.simulation_batch_size!r}, expected 1"
+    assert default_cfg.virtual_loss_weight == 3.0, \
+        f"[A11] default virtual_loss_weight drifted to {default_cfg.virtual_loss_weight!r}, expected 3.0"
+    assert default_cfg.virtual_loss_margin == 0.5, \
+        f"[A11] default virtual_loss_margin drifted to {default_cfg.virtual_loss_margin!r}, expected 0.5"
     print("[A11 OK] MCTSConfig() defaults are canonical (rollout + tree_reuse)")
 
     print("[OK] Stage 2 Milestone A1+A2..A11 smoke PASSED")

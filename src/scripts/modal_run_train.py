@@ -97,7 +97,7 @@ if _wandb_key:
 
 @app.function(
     volumes={VOLUME_PATH: volume},
-    timeout=60 * 60 * 16,
+    timeout=60 * 60 * 24,
     env=run_env,
     image=image,
     gpu=DEFAULT_GPU,

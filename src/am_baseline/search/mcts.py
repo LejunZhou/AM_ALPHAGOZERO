@@ -35,6 +35,9 @@ from am_baseline.search.tree import MCTSNode
 class MCTSConfig:
     # --- search budget / exploration ---
     n_simulations: int = 200
+    simulation_batch_size: int = 1            # C++ backend only; 1 = sequential reference
+    virtual_loss_weight: float = 3.0          # C++ batched mode only; 0 = virtual visits only
+    virtual_loss_margin: float = 0.5          # temporary Q penalty per pending edge
     c_puct: float = 0.05                      # routing sweet spot; AlphaGo's 1.0 is wrong here
     temperature: float = 0.0                  # 0 = argmax, >0 = sample from N^(1/τ)
     dirichlet_alpha: float = 0.3
@@ -87,6 +90,11 @@ class MCTSSolver:
                  cfg: MCTSConfig,
                  device: Optional[torch.device] = None):
         self._validate_config(cfg, model)
+        if cfg.simulation_batch_size != 1:
+            raise ValueError(
+                "simulation_batch_size > 1 is only supported by the C++ MCTS backend. "
+                "Use --backend cpp, or leave simulation_batch_size=1 for the Python backend."
+            )
 
         self.model = model
         self.cfg = cfg
@@ -114,6 +122,18 @@ class MCTSSolver:
         """
         if cfg.leaf_eval not in cls.VALID_LEAF_EVAL:
             raise ValueError(f"cfg.leaf_eval={cfg.leaf_eval!r} not in {cls.VALID_LEAF_EVAL}")
+        if cfg.simulation_batch_size < 1:
+            raise ValueError(
+                f"cfg.simulation_batch_size={cfg.simulation_batch_size!r} must be >= 1"
+            )
+        if cfg.virtual_loss_weight < 0:
+            raise ValueError(
+                f"cfg.virtual_loss_weight={cfg.virtual_loss_weight!r} must be >= 0"
+            )
+        if cfg.virtual_loss_margin < 0:
+            raise ValueError(
+                f"cfg.virtual_loss_margin={cfg.virtual_loss_margin!r} must be >= 0"
+            )
         if cfg.value_norm not in cls.VALID_VALUE_NORM:
             raise ValueError(f"cfg.value_norm={cfg.value_norm!r} not in {cls.VALID_VALUE_NORM}")
         if cfg.fpu_mode not in cls.VALID_FPU_MODE:

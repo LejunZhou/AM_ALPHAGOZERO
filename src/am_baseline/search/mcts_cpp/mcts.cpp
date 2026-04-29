@@ -43,6 +43,9 @@ std::vector<unsigned char> sequence_to_bools(py::handle handle) {
 Config Config::from_python(py::dict cfg) {
   Config out;
   out.n_simulations = get_or<int>(cfg, "n_simulations", out.n_simulations);
+  out.simulation_batch_size = get_or<int>(cfg, "simulation_batch_size", out.simulation_batch_size);
+  out.virtual_loss_weight = get_or<double>(cfg, "virtual_loss_weight", out.virtual_loss_weight);
+  out.virtual_loss_margin = get_or<double>(cfg, "virtual_loss_margin", out.virtual_loss_margin);
   out.c_puct = get_or<double>(cfg, "c_puct", out.c_puct);
   out.temperature = get_or<double>(cfg, "temperature", out.temperature);
   out.dirichlet_alpha = get_or<double>(cfg, "dirichlet_alpha", out.dirichlet_alpha);
@@ -54,6 +57,15 @@ Config Config::from_python(py::dict cfg) {
   out.root_select = get_or<std::string>(cfg, "root_select", out.root_select);
   out.tree_reuse = get_or<bool>(cfg, "tree_reuse", out.tree_reuse);
   out.seed = get_or<std::uint64_t>(cfg, "seed", out.seed);
+  if (out.simulation_batch_size < 1) {
+    throw std::runtime_error("simulation_batch_size must be >= 1");
+  }
+  if (out.virtual_loss_weight < 0.0) {
+    throw std::runtime_error("virtual_loss_weight must be >= 0");
+  }
+  if (out.virtual_loss_margin < 0.0) {
+    throw std::runtime_error("virtual_loss_margin must be >= 0");
+  }
   return out;
 }
 
@@ -134,12 +146,14 @@ py::dict TspState::to_python() const {
 Node::Node(const TspState& state_)
     : state(state_),
       n_visits(static_cast<std::size_t>(state_.n), 0),
+      virtual_n(static_cast<std::size_t>(state_.n), 0),
       w_total(static_cast<std::size_t>(state_.n), 0.0),
       q_value(static_cast<std::size_t>(state_.n), 0.0),
       prior(static_cast<std::size_t>(state_.n), 0.0),
       has_prior(static_cast<std::size_t>(state_.n), 0),
       children(static_cast<std::size_t>(state_.n)),
-      v_estimate(std::numeric_limits<double>::quiet_NaN()) {}
+      v_estimate(std::numeric_limits<double>::quiet_NaN()),
+      pending_eval(false) {}
 
 bool Node::is_terminal() const {
   return state.all_finished();
@@ -151,6 +165,14 @@ bool Node::is_expanded() const {
 
 int Node::total_visits() const {
   return std::accumulate(n_visits.begin(), n_visits.end(), 0);
+}
+
+int Node::total_effective_visits() const {
+  int total = 0;
+  for (std::size_t i = 0; i < n_visits.size(); ++i) {
+    total += n_visits[i] + virtual_n[i];
+  }
+  return total;
 }
 
 double Node::sum_w() const {
@@ -185,9 +207,16 @@ py::dict Solver::solve_instance(std::shared_ptr<const std::vector<double>> coord
       apply_dirichlet(*root);
     }
 
-    for (int i = 0; i < cfg_.n_simulations; ++i) {
-      simulate(*root, bl_val);
+    if (cfg_.simulation_batch_size == 1) {
+      for (int i = 0; i < cfg_.n_simulations; ++i) {
+        simulate(*root, bl_val);
+      }
+    } else {
+      simulate_batched(*root, bl_val);
     }
+
+    counters_.max_virtual_visits_remaining =
+        std::max<long long>(counters_.max_virtual_visits_remaining, max_virtual_visits(*root));
 
     const int action = pick_root_action(*root);
     tour.push_back(action);
@@ -211,6 +240,14 @@ py::dict Solver::solve_instance(std::shared_ptr<const std::vector<double>> coord
   out["decode_steps"] = counters_.decode;
   out["rollout_steps"] = counters_.rollout;
   out["value_calls"] = counters_.value;
+  out["batch_eval_calls"] = counters_.batch_eval_calls;
+  out["batch_eval_rows"] = counters_.batch_eval_rows;
+  out["pending_batch_calls"] = counters_.pending_batch_calls;
+  out["pending_batch_rows"] = counters_.pending_batch_rows;
+  out["pending_collection_attempts"] = counters_.pending_collection_attempts;
+  out["pending_collection_successes"] = counters_.pending_collection_successes;
+  out["virtual_collision_count"] = counters_.virtual_collision_count;
+  out["max_virtual_visits_remaining"] = counters_.max_virtual_visits_remaining;
   return out;
 }
 
@@ -232,6 +269,49 @@ EvalResult Solver::evaluate(const TspState& state, bool need_value) {
     counters_.value += 1;
   }
   return eval;
+}
+
+std::vector<EvalResult> Solver::evaluate_many(const std::vector<TspState>& states, bool need_value) {
+  std::vector<EvalResult> evals;
+  if (states.empty()) {
+    return evals;
+  }
+
+  py::list snapshots;
+  for (const TspState& state : states) {
+    snapshots.append(state.to_python());
+  }
+
+  py::sequence results = evaluator_(snapshots, need_value).cast<py::sequence>();
+  if (static_cast<std::size_t>(py::len(results)) != states.size()) {
+    throw std::runtime_error("C++ MCTS batched evaluator returned the wrong number of rows");
+  }
+
+  evals.reserve(states.size());
+  for (std::size_t row = 0; row < states.size(); ++row) {
+    py::tuple result = py::cast<py::tuple>(results[row]);
+    if (result.size() != 3) {
+      throw std::runtime_error("C++ MCTS batched evaluator rows must be (probs, mask, value)");
+    }
+
+    EvalResult eval;
+    eval.probs = sequence_to_doubles(result[0]);
+    eval.mask = sequence_to_bools(result[1]);
+    eval.value = py::cast<double>(result[2]);
+    if (static_cast<int>(eval.probs.size()) != states[row].n ||
+        static_cast<int>(eval.mask.size()) != states[row].n) {
+      throw std::runtime_error("C++ MCTS batched evaluator returned vectors with the wrong graph size");
+    }
+    evals.push_back(std::move(eval));
+  }
+
+  counters_.decode += static_cast<long long>(states.size());
+  if (need_value) {
+    counters_.value += static_cast<long long>(states.size());
+  }
+  counters_.batch_eval_calls += 1;
+  counters_.batch_eval_rows += static_cast<long long>(states.size());
+  return evals;
 }
 
 void Solver::fill_priors(Node& node, const EvalResult& eval) {
@@ -346,6 +426,44 @@ double Solver::rollout_remaining_real(const TspState& state) {
   return cur.final_cost() - start_length;
 }
 
+std::vector<double> Solver::rollout_many_remaining_real(const std::vector<TspState>& states) {
+  std::vector<double> remaining;
+  if (states.empty()) {
+    return remaining;
+  }
+
+  if (!rollout_evaluator_.is_none()) {
+    py::list snapshots;
+    for (const TspState& state : states) {
+      snapshots.append(state.to_python());
+    }
+
+    py::tuple result = rollout_evaluator_(snapshots).cast<py::tuple>();
+    if (result.size() != 3) {
+      throw std::runtime_error(
+          "C++ MCTS batched rollout evaluator must return (remaining_costs, decode_steps, rollout_steps)");
+    }
+    py::sequence costs = py::reinterpret_borrow<py::sequence>(result[0]);
+    if (static_cast<std::size_t>(py::len(costs)) != states.size()) {
+      throw std::runtime_error("C++ MCTS batched rollout evaluator returned the wrong number of costs");
+    }
+
+    remaining.reserve(states.size());
+    for (py::handle item : costs) {
+      remaining.push_back(py::cast<double>(item));
+    }
+    counters_.decode += py::cast<long long>(result[1]);
+    counters_.rollout += py::cast<long long>(result[2]);
+    return remaining;
+  }
+
+  remaining.reserve(states.size());
+  for (const TspState& state : states) {
+    remaining.push_back(rollout_remaining_real(state));
+  }
+  return remaining;
+}
+
 void Solver::simulate(Node& root, double bl_val) {
   std::vector<std::pair<Node*, int>> path;
   Node* node = &root;
@@ -383,6 +501,171 @@ void Solver::simulate(Node& root, double bl_val) {
   }
 }
 
+void Solver::simulate_batched(Node& root, double bl_val) {
+  int completed = 0;
+  while (completed < cfg_.n_simulations) {
+    const int target = std::min(cfg_.simulation_batch_size, cfg_.n_simulations - completed);
+    std::vector<PendingSimulation> pending;
+    pending.reserve(static_cast<std::size_t>(target));
+
+    const int max_attempts = std::max(target * 4, target + root.state.n);
+    for (int attempt = 0; attempt < max_attempts && static_cast<int>(pending.size()) < target; ++attempt) {
+      PendingSimulation sim;
+      counters_.pending_collection_attempts += 1;
+      if (collect_pending(root, bl_val, sim)) {
+        counters_.pending_collection_successes += 1;
+        pending.push_back(std::move(sim));
+      }
+    }
+
+    if (pending.empty()) {
+      simulate(root, bl_val);
+      completed += 1;
+      continue;
+    }
+
+    counters_.pending_batch_calls += 1;
+    counters_.pending_batch_rows += static_cast<long long>(pending.size());
+    evaluate_pending(pending, bl_val);
+    completed += static_cast<int>(pending.size());
+    counters_.max_virtual_visits_remaining =
+        std::max<long long>(counters_.max_virtual_visits_remaining, max_virtual_visits(root));
+  }
+}
+
+bool Solver::collect_pending(Node& root, double bl_val, PendingSimulation& pending) {
+  Node* node = &root;
+
+  while (node->is_expanded() && !node->is_terminal()) {
+    const double fpu = fpu_value_for(*node, bl_val);
+    const int action = select_action(*node, fpu);
+    const std::size_t idx = static_cast<std::size_t>(action);
+    pending.path.push_back(PathEntry{node, action});
+    node->virtual_n[idx] += 1;
+
+    std::unique_ptr<Node>& child = node->children[idx];
+    if (!child) {
+      child = std::make_unique<Node>(node->state.updated(action));
+    }
+    node = child.get();
+  }
+
+  if (!node->is_terminal()) {
+    if (node->pending_eval) {
+      undo_virtual_visits(pending.path);
+      pending.path.clear();
+      counters_.virtual_collision_count += 1;
+      return false;
+    }
+    node->pending_eval = true;
+  }
+  pending.leaf = node;
+  return true;
+}
+
+void Solver::evaluate_pending(std::vector<PendingSimulation>& pending, double bl_val) {
+  std::vector<std::size_t> eval_indices;
+  std::vector<TspState> eval_states;
+  eval_indices.reserve(pending.size());
+  eval_states.reserve(pending.size());
+
+  for (std::size_t i = 0; i < pending.size(); ++i) {
+    PendingSimulation& sim = pending[i];
+    Node& leaf = *sim.leaf;
+    if (leaf.is_terminal()) {
+      leaf.v_estimate = 0.0;
+      sim.total_norm = leaf.state.final_cost() / bl_val;
+    } else {
+      eval_indices.push_back(i);
+      eval_states.push_back(leaf.state);
+    }
+  }
+
+  if (!eval_states.empty()) {
+    const bool need_value = cfg_.leaf_eval == "value_head";
+    std::vector<EvalResult> evals = evaluate_many(eval_states, need_value);
+    std::vector<double> rollout_values;
+    if (cfg_.leaf_eval == "rollout") {
+      rollout_values = rollout_many_remaining_real(eval_states);
+      if (rollout_values.size() != eval_states.size()) {
+        throw std::runtime_error("batched rollout returned a mismatched number of values");
+      }
+    }
+
+    for (std::size_t row = 0; row < eval_indices.size(); ++row) {
+      PendingSimulation& sim = pending[eval_indices[row]];
+      Node& leaf = *sim.leaf;
+      fill_priors(leaf, evals[row]);
+
+      double v_remaining_norm = 0.0;
+      if (cfg_.leaf_eval == "value_head") {
+        v_remaining_norm = evals[row].value;
+      } else if (cfg_.leaf_eval == "rollout") {
+        v_remaining_norm = rollout_values[row] / bl_val;
+      } else {
+        throw std::runtime_error("unknown leaf_eval: " + cfg_.leaf_eval);
+      }
+      leaf.v_estimate = v_remaining_norm;
+      sim.total_norm = leaf.state.length / bl_val + v_remaining_norm;
+    }
+  }
+
+  for (PendingSimulation& sim : pending) {
+    if (sim.leaf != nullptr) {
+      sim.leaf->pending_eval = false;
+    }
+    backup_pending(sim, -sim.total_norm);
+  }
+}
+
+void Solver::backup_pending(PendingSimulation& pending, double value_for_backup) {
+  undo_virtual_visits(pending.path);
+  for (PathEntry& entry : pending.path) {
+    Node* parent = entry.parent;
+    const int action = entry.action;
+    const std::size_t idx = static_cast<std::size_t>(action);
+    parent->n_visits[idx] += 1;
+    parent->w_total[idx] += value_for_backup;
+    parent->q_value[idx] = parent->w_total[idx] / static_cast<double>(parent->n_visits[idx]);
+  }
+}
+
+void Solver::undo_virtual_visits(const std::vector<PathEntry>& path) {
+  for (const PathEntry& entry : path) {
+    if (entry.parent == nullptr || entry.action < 0) {
+      continue;
+    }
+    const std::size_t idx = static_cast<std::size_t>(entry.action);
+    if (entry.parent->virtual_n[idx] <= 0) {
+      throw std::runtime_error("attempted to remove a missing virtual visit");
+    }
+    entry.parent->virtual_n[idx] -= 1;
+  }
+}
+
+int Solver::max_virtual_visits(const Node& node) const {
+  int max_virtual = 0;
+  for (int v : node.virtual_n) {
+    max_virtual = std::max(max_virtual, v);
+  }
+  for (const std::unique_ptr<Node>& child : node.children) {
+    if (child) {
+      max_virtual = std::max(max_virtual, max_virtual_visits(*child));
+    }
+  }
+  return max_virtual;
+}
+
+double Solver::total_effective_visits(const Node& node) const {
+  const double pending_weight = cfg_.virtual_loss_weight > 0.0 ? cfg_.virtual_loss_weight : 1.0;
+  double total = 0.0;
+  for (std::size_t i = 0; i < node.n_visits.size(); ++i) {
+    total += static_cast<double>(node.n_visits[i]) +
+             static_cast<double>(node.virtual_n[i]) * pending_weight;
+  }
+  return total;
+}
+
 double Solver::fpu_value_for(const Node& node, double bl_val) const {
   if (cfg_.fpu_mode == "fallback") {
     return cfg_.fpu_fallback;
@@ -404,8 +687,9 @@ double Solver::fpu_value_for(const Node& node, double bl_val) const {
 }
 
 int Solver::select_action(const Node& node, double fpu_value) const {
-  const int total_n = node.total_visits();
-  const double sqrt_total = std::sqrt(static_cast<double>(std::max(total_n, 1)));
+  const double total_n = total_effective_visits(node);
+  const double sqrt_total = std::sqrt(std::max(total_n, 1.0));
+  const double pending_weight = cfg_.virtual_loss_weight > 0.0 ? cfg_.virtual_loss_weight : 1.0;
 
   int best_action = -1;
   double best_score = -std::numeric_limits<double>::infinity();
@@ -415,8 +699,18 @@ int Solver::select_action(const Node& node, double fpu_value) const {
       continue;
     }
     const int n_sa = node.n_visits[idx];
-    const double q_sa = n_sa > 0 ? node.q_value[idx] : fpu_value;
-    const double u_sa = cfg_.c_puct * node.prior[idx] * sqrt_total / static_cast<double>(1 + n_sa);
+    const int pending = node.virtual_n[idx];
+    const double effective_n_sa = static_cast<double>(n_sa) +
+                                  static_cast<double>(pending) * pending_weight;
+    double q_sa = n_sa > 0 ? node.q_value[idx] : fpu_value;
+    if (pending > 0 && cfg_.virtual_loss_weight > 0.0 && cfg_.virtual_loss_margin > 0.0) {
+      const double real_weight = std::max(0.25, static_cast<double>(n_sa));
+      const double loss_weight = static_cast<double>(pending) * cfg_.virtual_loss_weight;
+      const double loss_q = q_sa - cfg_.virtual_loss_margin;
+      q_sa = (q_sa * real_weight + loss_q * loss_weight) / (real_weight + loss_weight);
+    }
+    const double u_sa =
+        cfg_.c_puct * node.prior[idx] * sqrt_total / (1.0 + effective_n_sa);
     const double score = q_sa + u_sa;
     if (score > best_score) {
       best_score = score;

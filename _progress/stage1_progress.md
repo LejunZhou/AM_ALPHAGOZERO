@@ -2,8 +2,8 @@
 
 **Plan:** `_plans/stage1_plan.md`
 **Started:** 2026-04-23
-**Last updated:** 2026-04-24 morning (TSP-50 verification closed; Stage 1 fully complete)
-**Status:** **Stage 1 COMPLETE.** Phases A–D all closed. Required runs (canonical 100-epoch, λ-sweep, target-norm ablation) all met both success criteria. Optional TSP-50 verification finished 2026-04-24 — both AM-baseline (`apy5m2lf` → 5.8072) and AM+value (`123x2qr5` → 5.7999, R²=0.9957) reproduce / slightly exceed AM paper's TSP-50 reference, and the value head's "no policy degradation" claim holds at the larger graph size. Throughput refactor verified on A10 (compute% ≈ 80, memBW% ≈ 51, VRAM ≈ 10% at batch 2048). Stage 2 is now consuming Stage 1's TSP-20 (`xg7t2dlb`) and TSP-50 (`123x2qr5`) checkpoints.
+**Last updated:** 2026-04-29 (bs=2048 TSP-20/TSP-50 follow-up finished; reduced-compute TSP-100 AM+value still running)
+**Status:** **Stage 1 COMPLETE.** Phases A–D all closed. Required runs (canonical 100-epoch, λ-sweep, target-norm ablation) all met both success criteria. Optional TSP-50 verification finished 2026-04-24 — both AM-baseline (`apy5m2lf` → 5.8072) and AM+value (`123x2qr5` → 5.7999, R²=0.9957) reproduce / slightly exceed AM paper's TSP-50 reference, and the value head's "no policy degradation" claim holds at the larger graph size. The full-epoch bs=2048 follow-up is finished: TSP-20 nearly matches canonical, but TSP-50 shows a meaningful same-LR large-batch quality regression. Reduced-compute TSP-100 AM+value remains in flight. Stage 2 is consuming Stage 1's TSP-20 (`xg7t2dlb`) and TSP-50 (`123x2qr5`) checkpoints.
 
 ---
 
@@ -209,6 +209,35 @@ Two parallel Modal A10 runs launched 2026-04-23 UTC 03:24; finished 2026-04-24 U
 - **Value head R² = 0.9957 at TSP-50**, comparable to TSP-20's 0.9965. Generalization of the value head to larger graphs is clean — no re-tuning was needed.
 
 **Stage 1 is now fully complete.** Both TSP-20 (canonical `xg7t2dlb`) and TSP-50 (canonical `123x2qr5`) checkpoints exist, with trained value heads satisfying proposal §Stage 1's success criteria (R² ≥ 0.7, policy unchanged). Checkpoints pulled to `outputs/tsp_50/stage1_tsp50_{am_baseline,with_value}_20260424T032356/` for Stage 2 use.
+
+## Batch-size 2048 full-epoch follow-up — FINISHED 2026-04-29
+
+Purpose: test whether the earlier bs=2048 target-norm ablation result at epoch 29 (`val_avg_cost` ≈ 3.867) was undertrained rather than an actual convergence penalty. Both runs keep the canonical Stage 1 AM+value settings fixed except `batch_size=2048`: `n_epochs=100`, `epoch_size=1280000`, `lr_model=1e-4`, `baseline=rollout`, `bl_warmup_epochs=1`, `seed=1234`, `num_workers=4`, `lambda_v=1.0`, `value_target_norm=bl`, `checkpoint_epochs=1`.
+
+| Graph | Run name | Modal app | W&B run | Final/best `val_avg_cost` | Final R² | Wall-clock | Checkpoint |
+|:--|:--|:--|:--|--:|--:|--:|:--|
+| TSP-20 | `stage1_tsp20_bs2048_with_value` | `ap-AhoMWtyvqPBc0xJ9Nh800i` | [`xlvmpbez`](https://wandb.ai/lejun/am-alphagozero/runs/xlvmpbez) | **3.84443 @ ep99** | **0.99624** | 10285 s (~2.86 h) | `outputs/tsp_20/stage1_tsp20_bs2048_with_value_20260428T225424/epoch-99.pt` |
+| TSP-50 | `stage1_tsp50_bs2048_with_value` | `ap-UieLJ9tjzHoxCbNcXwjXzY` | [`9rfnufk5`](https://wandb.ai/lejun/am-alphagozero/runs/9rfnufk5) | **5.81350 @ ep99** | **0.99498** | 29904 s (~8.31 h) | `outputs/tsp_50/stage1_tsp50_bs2048_with_value_20260428T225947/epoch-99.pt` |
+
+Notes:
+- Modal rejected the attempted 48 h wrapper timeout (`Timeout must be between 10s and 86400s`), so `src/scripts/modal_run_train.py` is set to Modal's 24 h maximum.
+- Both runs reached epoch 99 cleanly, and the best validation cost for both was the final epoch.
+- Modal volume artifact check confirmed `epoch-99.pt`, `epochs.csv`, `metrics.csv`, and per-epoch checkpoints under both output directories.
+- Against canonical bs=512: TSP-20 `3.84443` vs `xg7t2dlb` `3.8424` is a small +0.0020 regression, so full training almost removes the earlier epoch-29 undertraining gap. TSP-50 `5.81350` vs `123x2qr5` `5.7999` is a clearer +0.0136 regression.
+- Conclusion: same-LR bs=2048 is acceptable as a throughput diagnostic, but not promoted as the canonical training recipe for TSP-50. Keep canonical/highest-quality AM+value checkpoints at bs=512 unless a future large-batch LR retune recovers the gap.
+
+## TSP-100 reduced-compute AM+value — LAUNCHED 2026-04-28
+
+Purpose: produce a usable TSP-100 value-head checkpoint faster than canonical AM-equivalent training. This is a reduced-compute run, not directly comparable to AM's 2500-batches/epoch setup. Settings: `batch_size=1024`, `epoch_size=640000`, `n_epochs=100`, `lr_model=1e-4`, `baseline=rollout`, `bl_warmup_epochs=1`, `seed=1234`, `num_workers=4`, `lambda_v=1.0`, `value_target_norm=bl`, `checkpoint_epochs=1`.
+
+| Run name | Modal app | W&B run | Status at launch check |
+|:--|:--|:--|:--|
+| `stage1_tsp100_bs1024_ep640k_with_value` | `ap-yqtUhNFW9YMjgf4WHCY82v` | [`g7jxkixo`](https://wandb.ai/lejun/am-alphagozero/runs/g7jxkixo) | running; logs reached epoch 1 |
+
+Notes:
+- Intended update count confirmed: `640000 / 1024 = 625` batches per epoch, `62500` total updates over 100 epochs.
+- Initial TSP-100 logs show `gpu_mem_peak ≈ 13806 MB` (61.1% of A10's 22588 MB), safely below the 20 GB watch threshold.
+- Completion analysis should record final `val_avg_cost`, best `val_avg_cost`, final `val_value_r2_overall`, final checkpoint path, wall-clock, and explicitly label the run as reduced-compute.
 
 ## Per-step value diagnostic — added 2026-04-24
 
