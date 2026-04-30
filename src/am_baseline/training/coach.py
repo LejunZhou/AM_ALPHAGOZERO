@@ -7,6 +7,9 @@ Phase B of `_plans/stage4_plan.md` lives here. The full coach orchestrator
     ring-buffer eviction and stratified-by-step sampling.
   - `reconstruct_state`: rebuild a `StateTSP` named-tuple from a buffer batch
     so the AM decoder can score it inside `train_step_alphazero`.
+  - Phase C additions: `make_self_play_config` and `generate_self_play_batch`
+    drive `CppBatchMCTSSolver` with `return_root_visits=True` and pack the
+    results into the buffer's `push_instance` schema.
 
 Design notes (see plan §Phase B and spec §3.5/§3.6):
   - Storage is CPU-resident (~520 MB at default capacity); training-time
@@ -20,6 +23,7 @@ Design notes (see plan §Phase B and spec §3.5/§3.6):
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import Dict, List, Optional
 
 import numpy as np
@@ -499,3 +503,254 @@ def reconstruct_state(
         cur_coord=cur_coord,
         i=i_t,
     )
+
+
+# ---------------------------------------------------------------------------
+# Phase C — self-play config + batched self-play generator
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class InstanceRecord:
+    """Phase C self-play record. Mirrors the per-instance arguments of
+    `MCTSReplayBuffer.push_instance`. Kept as a tiny carrier dataclass so the
+    coach orchestrator (Phase D) can iterate `records` and unpack into
+    `buf.push_instance(coords, bl_val, tour_cost, per_step)`.
+    """
+    coords: torch.Tensor          # (N, 2) float32, CPU
+    bl_val: float                 # scalar, frozen at generation
+    tour_cost: float              # scalar, MCTS-played tour cost
+    per_step: List[Dict]          # length N; per-step dict matches push_instance
+
+
+def make_self_play_config(graph_size: int, n_simulations: int):
+    """AlphaGo-Zero-style self-play preset.
+
+    Returns an `MCTSConfig` configured per Stage 4 plan §Phase C.1:
+      - `leaf_eval='value_head'` (canonical AGZ; Stage 3 E.2 explicitly allows
+        this with `value_norm='bl'`).
+      - `c_puct=0.05` (Stage 2 routing sweet spot for TSP-20).
+      - `temperature=1.0` base τ; switch to greedy after step 30 lives in
+        Phase E (`temperature_schedule` field not yet on MCTSConfig).
+      - Dirichlet root noise (`alpha = 10/N`, `epsilon = 0.25`) — AGZ default.
+      - `tree_reuse=True` (Stage 2 default; Pareto-better on TSP-20).
+      - `return_root_visits=True` so the generator can read per-step root
+        visit dicts off `solver.root_visit_dists_per_instance`.
+
+    Phase E is in flight in a sibling worktree and will add
+    `MCTSConfig.temperature_schedule`. Until then we leave a TODO: the smoke
+    case A2 bypasses this with `temperature=0`, and Phase D's coach will set
+    a temperature schedule directly when E lands.
+    """
+    # Local import to avoid circular import at module load.
+    from am_baseline.search.mcts import MCTSConfig
+    cfg = MCTSConfig(
+        n_simulations=n_simulations,
+        leaf_eval='value_head',
+        value_norm='bl',
+        c_puct=0.05,
+        temperature=1.0,
+        # TODO(phase E): add temperature_schedule='step30' once
+        # MCTSConfig.temperature_schedule is merged from the Phase E worktree.
+        dirichlet_alpha=10.0 / graph_size,
+        dirichlet_epsilon=0.25,
+        fpu_mode='running_q',
+        fpu_fallback=-1.0,
+        root_select='visits',
+        tree_reuse=True,
+        return_root_visits=True,
+    )
+    return cfg
+
+
+def _compute_edge_costs(coords: np.ndarray, tour: np.ndarray) -> np.ndarray:
+    """Per-edge costs along a played tour, matching `TSP.get_edge_costs`.
+
+    Args:
+        coords: (N, 2) float32 — graph coordinates.
+        tour:   (N,) int — visit order.
+
+    Returns:
+        (N,) float32 with edge_costs[k] = ||coords[tour[k+1]] - coords[tour[k]]||
+        for k in [0, N-2], and edge_costs[N-1] = ||coords[tour[0]] - coords[tour[N-1]]||
+        (the closing edge).
+
+    Sanity: edge_costs.sum() == realized tour cost.
+    """
+    N = tour.shape[0]
+    if N == 0:
+        return np.zeros(0, dtype=np.float32)
+    ordered = coords[tour]                                  # (N, 2)
+    fwd = np.linalg.norm(ordered[1:] - ordered[:-1], axis=-1)            # (N-1,)
+    closing = np.linalg.norm(ordered[0] - ordered[-1])                   # scalar
+    return np.concatenate([fwd, np.array([closing])]).astype(np.float32)
+
+
+def _mask_from_tour(prefix_tour: np.ndarray, N: int) -> np.ndarray:
+    """Boolean (N,) mask: True for cities visited so far (i.e. in `prefix_tour`)."""
+    mask = np.zeros(N, dtype=bool)
+    if prefix_tour.size > 0:
+        mask[prefix_tour] = True
+    return mask
+
+
+def _normalize_visit_dict(d: Dict[int, int], N: int) -> np.ndarray:
+    """Scatter sparse visit dict into dense (N,) τ=1 distribution.
+
+    Sparse format: `d` only contains keys for actions that were touched in
+    backup at this tour-step (Phase A note in `_progress/stage4_progress.md`).
+    Visited cities are never keys.
+
+    Args:
+        d: dict mapping action -> visit count (non-negative ints).
+        N: graph size (output length).
+
+    Returns:
+        (N,) float32 with sum == 1 (or 0 if `d` is empty — a degenerate case
+        that should not occur with K > 0; we guard with an assertion).
+    """
+    out = np.zeros(N, dtype=np.float32)
+    total = 0
+    for a, c in d.items():
+        out[int(a)] = float(c)
+        total += int(c)
+    if total <= 0:
+        # Degenerate: no visits at this step. Cannot happen with K > 0 unless
+        # the step is forced (one legal action) and tree_reuse fast-paths it.
+        # Surface the bug clearly rather than emit a uniform fallback that
+        # would silently corrupt the training target.
+        raise AssertionError(
+            f"_normalize_visit_dict: empty visit dict (total visits == 0). "
+            f"Either K == 0 or an upstream bug; refusing to fabricate a target."
+        )
+    out /= float(total)
+    return out
+
+
+def generate_self_play_batch(
+    best_model,
+    M: int,
+    graph_size: int,
+    cfg,
+    device: torch.device,
+    mcts_batch_size: int = 64,
+) -> List[InstanceRecord]:
+    """Generate `M` TSP-`graph_size` self-play instances under MCTS guided by
+    `best_model` (θ★) using config `cfg`.
+
+    For each instance we:
+      1. Sample fresh coordinates via `TSP.make_dataset`.
+      2. Compute `bl_val = greedy_cost(theta_star, coords)` once and freeze it.
+      3. Run `CppBatchMCTSSolver.solve_batch` to produce a tour and per-step
+         root visit dicts (sparse `dict[int,int]` per tour-step per instance).
+      4. Pack into `InstanceRecord` matching `MCTSReplayBuffer.push_instance`'s
+         per-step schema:
+             { 'visited', 'first', 'prev', 'lengths', 'pi', 'cost_to_go' }
+
+    The cost-to-go targets are derived from the played tour's edge costs via
+    `value_targets_from_edges` — same convention the value head was trained
+    against in Stage 1 (closing edge included exactly once; entry [t] is the
+    cost of every edge still to traverse from state s_t).
+
+    Args:
+        best_model: AttentionModel — θ★ that runs MCTS and provides bl_val.
+        M: number of instances to generate.
+        graph_size: TSP graph size N.
+        cfg: MCTSConfig (typically from `make_self_play_config`).
+        device: torch device for solver / model.
+        mcts_batch_size: cross-instance NN-eval batch size for
+            `CppBatchMCTSSolver`. Default 64 is fine on CPU.
+
+    Returns:
+        list of `InstanceRecord` with length M, ready for
+        `MCTSReplayBuffer.push_instance(rec.coords, rec.bl_val, rec.tour_cost,
+        rec.per_step)`.
+    """
+    # Local imports defer heavy / circular deps to call time.
+    from am_baseline.problem.tsp import TSP
+    from am_baseline.search.mcts_cpp.solver import CppBatchMCTSSolver
+    from am_baseline.utils.tensor_ops import value_targets_from_edges
+
+    if M <= 0:
+        raise ValueError(f"M must be positive, got {M}")
+    if graph_size <= 0:
+        raise ValueError(f"graph_size must be positive, got {graph_size}")
+    if not cfg.return_root_visits:
+        raise ValueError(
+            "generate_self_play_batch requires cfg.return_root_visits=True so "
+            "the generator can read root visit dicts; got False."
+        )
+
+    # 1. Sample instances.
+    dataset = TSP.make_dataset(size=graph_size, num_samples=M)
+    coords = torch.stack([dataset[i] for i in range(M)]).to(device)   # (M, N, 2)
+
+    # 2. Frozen baseline normalizer = greedy cost under θ★. One forward pass.
+    best_model.eval()
+    prev_decode_type = best_model.decoder.decode_type
+    with torch.no_grad():
+        best_model.set_decode_type('greedy')
+        bl_costs, _ = best_model(coords)
+        bl_val_t = bl_costs.detach().cpu()                            # (M,) float32
+    if prev_decode_type is not None:
+        best_model.set_decode_type(prev_decode_type)
+
+    # 3. Run cross-instance batched MCTS. Pass our frozen bl_val so the solver
+    #    does not silently recompute one — keeps generator targets consistent.
+    solver = CppBatchMCTSSolver(
+        best_model, cfg, device=device, mcts_batch_size=mcts_batch_size
+    )
+    tour_costs, tours = solver.solve_batch(
+        coords, bl_vals=bl_val_t.to(device)
+    )
+    visits_per_inst = solver.root_visit_dists_per_instance            # list[list[dict]]
+    if len(visits_per_inst) != M:
+        raise RuntimeError(
+            f"CppBatchMCTSSolver returned {len(visits_per_inst)} visit-dist "
+            f"rows for {M} instances — return_root_visits not propagating."
+        )
+
+    # 4. Pack records. cost-to-go is derived per-instance from realized edges.
+    coords_cpu = coords.detach().cpu()
+    tours_cpu = tours.detach().cpu()
+    tour_costs_cpu = tour_costs.detach().cpu()
+
+    records: List[InstanceRecord] = []
+    for i in range(M):
+        coords_i = coords_cpu[i].numpy()                              # (N, 2)
+        tour_i = tours_cpu[i].numpy().astype(np.int64)                # (N,)
+        edge_costs_i = _compute_edge_costs(coords_i, tour_i)          # (N,)
+
+        # cost_to_go[t] = total cost still to traverse from s_t (V_CURRENT
+        # convention; see utils.tensor_ops.value_targets_from_edges).
+        ec_t = torch.from_numpy(edge_costs_i).unsqueeze(0)            # (1, N)
+        ctg = value_targets_from_edges(ec_t).squeeze(0).numpy()       # (N,)
+
+        per_step: List[Dict] = []
+        for t in range(graph_size):
+            visited_mask = _mask_from_tour(tour_i[:t], graph_size)
+            pi_t = _normalize_visit_dict(visits_per_inst[i][t], graph_size)
+            # state.lengths convention from Stage 1: 0 at t=0 and t=1, else
+            # cumulative cost of edges traversed BEFORE arriving at s_t.
+            if t < 2:
+                length_t = 0.0
+            else:
+                length_t = float(edge_costs_i[: t - 1].sum())
+
+            per_step.append({
+                'visited': visited_mask,
+                'first': int(tour_i[0]) if t > 0 else -1,
+                'prev':  int(tour_i[t - 1]) if t > 0 else -1,
+                'lengths': length_t,
+                'pi': pi_t,
+                'cost_to_go': float(ctg[t]),
+            })
+
+        records.append(InstanceRecord(
+            coords=coords_cpu[i],
+            bl_val=float(bl_val_t[i].item()),
+            tour_cost=float(tour_costs_cpu[i].item()),
+            per_step=per_step,
+        ))
+
+    return records

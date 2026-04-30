@@ -42,7 +42,12 @@ if _SRC not in sys.path:
 
 from am_baseline.config import Config
 from am_baseline.model.attention_model import AttentionModel
-from am_baseline.training.coach import MCTSReplayBuffer, reconstruct_state
+from am_baseline.training.coach import (
+    MCTSReplayBuffer,
+    reconstruct_state,
+    make_self_play_config,
+    generate_self_play_batch,
+)
 from am_baseline.training.trainer import train_step_alphazero
 
 
@@ -302,14 +307,130 @@ def test_state_reconstruction_roundtrip(N: int = 6) -> None:
     print("  [A1b] OK")
 
 
+def test_self_play_generator(N: int = 20, M: int = 10, K: int = 20) -> None:
+    """Smoke A2 — self-play generator end-to-end on TSP-N.
+
+    Drives `generate_self_play_batch` with `temperature=0` so MCTS picks the
+    argmax-N action at every root, then verifies for every per-step π_t:
+        (i)   sums to 1 within float tolerance,
+        (ii)  has zero mass on visited cities,
+        (iii) argmax(π_t) equals the action MCTS chose at step t (= tour[t]
+              when temperature=0 because root_select='visits' picks argmax N
+              and π_t = N / Σ N).
+    Also verifies that `value_norm='bl' + leaf_eval='value_head'` is accepted
+    by `MCTSConfig._validate_config` (Stage 3 E.2 explicitly allows this combo).
+    """
+    print(f"  [A2] generate_self_play_batch on N={N}, M={M}, K={K} ...")
+    torch.manual_seed(0)
+    np.random.seed(0)
+
+    cfg_model = Config(
+        graph_size=N,
+        embedding_dim=32,
+        n_encode_layers=2,
+        n_heads=4,
+        value_enabled=True,
+        value_hidden_dim=32,
+    )
+    model = AttentionModel(cfg_model).cpu().eval()
+
+    # A2 explicitly checks the bl + value_head combo is accepted (no raise).
+    cfg = make_self_play_config(graph_size=N, n_simulations=K)
+    assert cfg.leaf_eval == 'value_head', "A2 expects AGZ-canonical value_head leaf"
+    assert cfg.value_norm == 'bl', "A2 expects bl normalization"
+    # Greedy at the root so π argmax aligns with the chosen tour action.
+    cfg.temperature = 0.0
+    # Disable Dirichlet root noise so greedy argmax is deterministic across
+    # runs and π_t reflects pure MCTS visits.
+    cfg.dirichlet_epsilon = 0.0
+
+    records = generate_self_play_batch(
+        best_model=model,
+        M=M,
+        graph_size=N,
+        cfg=cfg,
+        device=torch.device("cpu"),
+        mcts_batch_size=8,
+    )
+    assert len(records) == M, f"expected {M} records, got {len(records)}"
+
+    # Push into a buffer to confirm the records match `push_instance`'s schema.
+    buf = MCTSReplayBuffer(graph_size=N, capacity_instances=M)
+    for rec in records:
+        assert rec.coords.shape == (N, 2)
+        assert math.isfinite(rec.bl_val) and rec.bl_val > 0
+        assert math.isfinite(rec.tour_cost) and rec.tour_cost > 0
+        assert len(rec.per_step) == N
+        buf.push_instance(rec.coords, rec.bl_val, rec.tour_cost, rec.per_step)
+    assert buf.step_counts() == [M] * N, f"step_counts mismatch: {buf.step_counts()}"
+
+    # Per-step π invariants — across all instances and all tour-steps.
+    for inst_i, rec in enumerate(records):
+        # Reconstruct chosen tour from per_step['prev'] / 'first' for cross-check.
+        # `tour[t]` = the action MCTS chose at step t. We can recover it from
+        # the difference between visited masks at consecutive steps:
+        #   tour[t] = the unique city where visited[t+1] is True but visited[t] is False.
+        for t in range(N):
+            ps = rec.per_step[t]
+            pi_t = ps['pi']
+            visited = ps['visited']
+
+            # (i) sums to 1.
+            s = float(pi_t.sum())
+            assert abs(s - 1.0) < 1e-5, (
+                f"inst={inst_i} step={t}: pi sums to {s}, not 1")
+            assert (pi_t >= 0).all(), (
+                f"inst={inst_i} step={t}: pi has negative entries")
+
+            # (ii) zero mass on visited.
+            masked_mass = float((pi_t * visited.astype(np.float32)).sum())
+            assert masked_mass == 0.0, (
+                f"inst={inst_i} step={t}: pi has {masked_mass} mass on visited cities")
+
+            # (iii) argmax(pi_t) == the action chosen at step t.
+            #       At step t, the chosen action is the city that is unvisited
+            #       at step t but visited at step t+1 (or, for t == N-1, it's
+            #       the unique remaining unvisited city).
+            if t < N - 1:
+                next_visited = rec.per_step[t + 1]['visited']
+                chosen_arr = np.where(next_visited & ~visited)[0]
+                assert chosen_arr.size == 1, (
+                    f"inst={inst_i} step={t}: cannot recover chosen action "
+                    f"from visited deltas (got {chosen_arr})")
+                chosen = int(chosen_arr[0])
+            else:
+                # Last step: only one unvisited city left.
+                rem = np.where(~visited)[0]
+                assert rem.size == 1, (
+                    f"inst={inst_i} step={t} (last): expected exactly 1 "
+                    f"unvisited, got {rem}")
+                chosen = int(rem[0])
+
+            argmax_a = int(np.argmax(pi_t))
+            assert argmax_a == chosen, (
+                f"inst={inst_i} step={t}: argmax(pi)={argmax_a} but MCTS "
+                f"chose action {chosen} (temperature=0, so they should match)")
+
+    # Sanity on cost_to_go: for t == 0, cost_to_go should equal tour_cost
+    # within float tolerance (V_CURRENT at s_0 is the entire tour).
+    for inst_i, rec in enumerate(records):
+        ctg0 = rec.per_step[0]['cost_to_go']
+        assert abs(ctg0 - rec.tour_cost) < 1e-3, (
+            f"inst={inst_i}: cost_to_go[0]={ctg0} but tour_cost={rec.tour_cost}")
+
+    print(f"     M={M} records produced; all π_t invariants hold")
+    print("  [A2] OK")
+
+
 def main() -> int:
-    print("Stage 4 Phase B smoke harness")
+    print("Stage 4 Phase B + C smoke harness")
     print("=" * 64)
     try:
         test_buffer_invariants(N=8)
         test_save_load_roundtrip(N=6)
         test_state_reconstruction_roundtrip(N=6)
         test_train_step_alphazero(N=8)
+        test_self_play_generator(N=20, M=10, K=20)
     except AssertionError as e:
         print(f"FAIL: {e}", file=sys.stderr)
         return 1
@@ -319,7 +440,7 @@ def main() -> int:
         print(f"ERROR: {e}", file=sys.stderr)
         return 2
     print("=" * 64)
-    print("PASS — all Phase B smoke checks succeeded.")
+    print("PASS — all Phase B + C smoke checks succeeded.")
     return 0
 
 
