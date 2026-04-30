@@ -186,7 +186,7 @@ scripts/
 ## Verification Commands (end-to-end)
 
 ```bash
-# Conda env (per CLAUDE.md)
+# Conda env
 conda activate AM_AlphaGoZero
 
 # Smoke test: CPU, 2 epochs, small settings

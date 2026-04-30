@@ -315,6 +315,5 @@ Forward-looking dependencies: Stage 2 (test-time MCTS) is now actively consuming
 ## Notes
 
 - Plan file mirrored here: `_plans/stage1_plan.md`
-- Original plan file (Claude Code plans dir): `C:\Users\Jun18\.claude\plans\we-have-done-stage-lucky-perlis.md`
 - Design discussion captured in the plan's **Context** + **Design Summary** sections — key decision is that `v` is auxiliary only (does not enter the policy gradient), isolating the value-head variable for Stage 1's success criteria.
 - All eleven W&B run IDs for Stage 1 (5 primary TSP-20 + 2 aborted λ=1.0 attempts + 2 target-norm ablation + 2 TSP-50 verification): `xg7t2dlb` (TSP-20 canonical), `hnqxy48u` (λ=0.1), `dw6i9bf0` (λ=0.5), `0gfvqjh9` (λ=1.0 aborted), `4a6uc50g` (λ=1.0 aborted), `9p6h52iu` (λ=1.0), `hg8o92i1` (λ=2.0), `fq82w24n` (ablation `bl`), `rnjgavla` (ablation `sqrt_n`), `apy5m2lf` (TSP-50 AM-baseline), `123x2qr5` (TSP-50 AM+value). All under project `lejun/am-alphagozero`.

@@ -3,7 +3,6 @@
 **Created:** 2026-04-27
 **Predecessor:** Stage 2 (`_plans/stage2_plan.md`, `_progress/stage2_progress.md`) — closed.
 **Reference:** Proposal §Stage 3 (`proposal.md:100-115`).
-**Original plan file (Claude Code plans dir):** `C:\Users\Jun18\.claude\plans\cozy-discovering-eich.md`
 **Status:** Approved 2026-04-27. Phase A in flight / pending kickoff.
 
 ---

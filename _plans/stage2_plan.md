@@ -4,7 +4,6 @@
 **Last revised:** 2026-04-24 (post per-step value diagnostic: added off-policy R² probe, `value_norm='sqrt_n'` ablation, sharpened Risks #4 with per-step bias mechanism, Stage 4 forward note)
 **Predecessor:** Stage 1 (`_plans/stage1_plan.md`) — TSP-20 closed (canonical `xg7t2dlb`, val 3.8424, R²=0.9965); TSP-50 verification runs in flight (`apy5m2lf`, `123x2qr5`)
 **Reference:** Proposal §Stage 2 (`proposal.md:75–96`)
-**Original plan file (Claude Code plans dir):** `C:\Users\Jun18\.claude\plans\ok-let-s-then-move-lazy-petal.md`
 **Status:** **Stage 2 substantively complete (2026-04-26).** Phases A–D all closed: smoke A1..A8 green; canonical config locked (`c_puct=0.05`, `tree_reuse=True`, `fpu_running_q`/`-1.0`, `root_select=visits`); TSP-20 K-curve through K=800 (value_head 53.3 % gap reduction; rollout K=400 71.3 %); TSP-50 K-curve through K=400 canonical + K=100 rollout (rollout 59.0 %); decode-step micro-benchmark added (per-call cost flat in N up to 200, overhead-dominated). Outstanding tactical items: off-policy R² probe (Phase D step 13), `value_norm='sqrt_n'` MCTS ablation (Phase D step 14), clean TSP-50 K=100 rollout wall-clock (background task `bln0tv1pg`). None block Stage 3/4. See `_progress/stage2_progress.md` §Stage 2 Conclusions for the full readout.
 
 ---

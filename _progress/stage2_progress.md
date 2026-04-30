@@ -262,7 +262,7 @@ Hardware: local GPU (single-instance MCTS, no cross-tree batching). 1000-instanc
 
 ## Decode-step micro-benchmark + rollout-vs-value_head wall-clock decomposition (added 2026-04-26)
 
-Investigation triggered by user question "why is rollout barely slower than value_head, and does that flip at large N?". Plan: `C:\Users\Jun18\.claude\plans\i-currently-get-what-composed-cook.md`.
+Investigation triggered by user question "why is rollout barely slower than value_head, and does that flip at large N?".
 
 ### Part 2 — Single decode_step cost as a function of N (RTX 4060 Laptop, batch=1)
 
@@ -398,7 +398,6 @@ Caveat for Stage 4: `rollout` is the right default for Stage 2/3 *test-time* MCT
 ## Notes
 
 - Plan file mirrored here: `_plans/stage2_plan.md`
-- Original plan (Claude Code plans dir): `C:\Users\Jun18\.claude\plans\ok-let-s-then-move-lazy-petal.md`
 - Stage 2 uses the Stage 1 canonical TSP-20 checkpoint (W&B `xg7t2dlb`) — requires pulling from Modal volume since local `outputs/tsp_20/` only has the Stage 0 partial run.
 - Stage 1 TSP-50 runs are in flight (`apy5m2lf`, `123x2qr5`); their checkpoints unlock the TSP-50 validation branch.
 - Gurobi optimal reference from Stage 0: 1000 TSP-20 instances, mean 3.8279 (Stage 0 `eval_baselines.py` output).
