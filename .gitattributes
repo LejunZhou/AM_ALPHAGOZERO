@@ -1,0 +1,29 @@
+# Normalize all text files to LF in the repo, regardless of platform.
+# This prevents CRLF churn on Windows clones (where core.autocrlf=true is the
+# default) and keeps `git diff` quiet across machines.
+* text=auto eol=lf
+
+# Explicit binary types that must never be line-ending-normalized.
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.pdf binary
+*.zip binary
+*.tar binary
+*.gz binary
+*.so binary
+*.dll binary
+*.dylib binary
+*.pyd binary
+*.pt binary
+*.pth binary
+*.ckpt binary
+*.npz binary
+*.npy binary
+*.parquet binary
+*.ipynb binary
+
+# Third-party reference projects under ref/ — never touched by normalization,
+# regardless of file type. Preserve the upstream line endings as committed.
+ref/** -text
