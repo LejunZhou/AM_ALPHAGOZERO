@@ -28,6 +28,10 @@ struct Config {
   double fpu_fallback = -1.0;
   std::string root_select = "visits";
   bool tree_reuse = true;
+  // Stage 4 Phase A: when true, Solver::solve_instance / BatchSearch dump
+  // per-tour-step root visit counts (raw root.n_visits) into the result dict.
+  // Defaults false to preserve Stage 2/3 wire format.
+  bool return_root_visits = false;
   std::uint64_t seed = 0;
 
   static Config from_python(py::dict cfg);

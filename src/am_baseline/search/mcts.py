@@ -68,6 +68,15 @@ class MCTSConfig:
     # quality, 17% wall-clock saved on TSP-20). Strictly Pareto-better.
     tree_reuse: bool = True
 
+    # --- Stage 4 Phase A: visit-distribution exposure ---
+    # When True, MCTSSolver.solve_instance populates `solver.root_visit_dists`
+    # with one dict {action: visit_count} per tour-step (raw root.N snapshots
+    # taken AFTER the K simulations and the final root-action pick, BEFORE the
+    # tree-reuse advance). Phase C's buffer push consumes these to compute the
+    # AGZ training target π_t = N(s_t,·)/Σ N. Defaults to False so existing
+    # Stage 2/3 callers see no behavioral or memory change.
+    return_root_visits: bool = False
+
     seed: Optional[int] = None
 
 
@@ -113,6 +122,13 @@ class MCTSSolver:
         self.fwd_count_decode = 0
         self.fwd_count_value = 0
         self.fwd_count_rollout = 0
+
+        # Stage 4 Phase A — per-tour-step root visit distributions.
+        # Populated by `solve_instance` only when `cfg.return_root_visits=True`;
+        # one dict per tour-step (length N after a full solve). Snapshots are
+        # taken AFTER `_pick_root_action` and BEFORE the tree-reuse advance so
+        # the dict contains the visit counts for the action chosen at this step.
+        self.root_visit_dists: list[dict[int, int]] = []
 
     @classmethod
     def _validate_config(cls, cfg: MCTSConfig, model: AttentionModel) -> None:
@@ -203,6 +219,10 @@ class MCTSSolver:
         self.fwd_count_value = 0
         self.fwd_count_rollout = 0
 
+        # Stage 4 Phase A — reset visit-dist log for this instance.
+        if self.cfg.return_root_visits:
+            self.root_visit_dists = []
+
         embeddings = self.model.encode(input_1)
         fixed = self.model.precompute_decoder(embeddings)
 
@@ -231,6 +251,15 @@ class MCTSSolver:
 
             a = self._pick_root_action(root)
             tour_actions.append(a)
+
+            # Stage 4 Phase A — snapshot root visit counts BEFORE tree-reuse
+            # advance (root is about to be replaced by its `a`-child if reuse
+            # is enabled). dict() copies the {action: N} mapping so future
+            # mutations of `root.N` (in subsequent simulations rooted at the
+            # child) cannot corrupt earlier snapshots.
+            if self.cfg.return_root_visits:
+                self.root_visit_dists.append(dict(root.N))
+
             state = state.update(torch.tensor([a], dtype=torch.long, device=self.device))
 
             if self.cfg.tree_reuse and a in root.children:

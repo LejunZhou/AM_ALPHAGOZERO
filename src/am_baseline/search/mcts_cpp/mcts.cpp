@@ -56,6 +56,7 @@ Config Config::from_python(py::dict cfg) {
   out.fpu_fallback = get_or<double>(cfg, "fpu_fallback", out.fpu_fallback);
   out.root_select = get_or<std::string>(cfg, "root_select", out.root_select);
   out.tree_reuse = get_or<bool>(cfg, "tree_reuse", out.tree_reuse);
+  out.return_root_visits = get_or<bool>(cfg, "return_root_visits", out.return_root_visits);
   out.seed = get_or<std::uint64_t>(cfg, "seed", out.seed);
   if (out.simulation_batch_size < 1) {
     throw std::runtime_error("simulation_batch_size must be >= 1");
@@ -194,6 +195,14 @@ py::dict Solver::solve_instance(std::shared_ptr<const std::vector<double>> coord
   std::vector<int> tour;
   tour.reserve(static_cast<std::size_t>(n));
 
+  // Stage 4 Phase A — per-tour-step root visit dumps. Each inner vector
+  // holds (action, N) pairs for actions with N > 0 at the root immediately
+  // BEFORE the tree-reuse advance. Empty unless cfg_.return_root_visits.
+  std::vector<std::vector<std::pair<int, int>>> root_visits_per_step;
+  if (cfg_.return_root_visits) {
+    root_visits_per_step.reserve(static_cast<std::size_t>(n));
+  }
+
   while (!state.all_finished()) {
     if (!root || !cfg_.tree_reuse) {
       root = std::make_unique<Node>(state);
@@ -220,6 +229,23 @@ py::dict Solver::solve_instance(std::shared_ptr<const std::vector<double>> coord
 
     const int action = pick_root_action(*root);
     tour.push_back(action);
+
+    // Stage 4 Phase A — snapshot raw root visit counts BEFORE the tree-reuse
+    // advance below moves `root` to its `action`-child. Only actions with
+    // N > 0 are recorded; this matches the Python solver's `dict(root.N)`
+    // semantics (which only contains entries that were touched in backup).
+    if (cfg_.return_root_visits) {
+      std::vector<std::pair<int, int>> step_visits;
+      step_visits.reserve(static_cast<std::size_t>(root->state.n));
+      for (int a = 0; a < root->state.n; ++a) {
+        const int count = root->n_visits[static_cast<std::size_t>(a)];
+        if (count > 0) {
+          step_visits.emplace_back(a, count);
+        }
+      }
+      root_visits_per_step.push_back(std::move(step_visits));
+    }
+
     state.update_in_place(action);
 
     if (cfg_.tree_reuse && root->children[static_cast<std::size_t>(action)]) {
@@ -248,6 +274,21 @@ py::dict Solver::solve_instance(std::shared_ptr<const std::vector<double>> coord
   out["pending_collection_successes"] = counters_.pending_collection_successes;
   out["virtual_collision_count"] = counters_.virtual_collision_count;
   out["max_virtual_visits_remaining"] = counters_.max_virtual_visits_remaining;
+
+  // Stage 4 Phase A — emit per-step root visit dists if requested.
+  // Wire format: list[step] of list[(action, count)]; the Python wrapper
+  // converts each inner list to a dict.
+  if (cfg_.return_root_visits) {
+    py::list py_steps;
+    for (const auto& step_visits : root_visits_per_step) {
+      py::list py_pairs;
+      for (const auto& kv : step_visits) {
+        py_pairs.append(py::make_tuple(kv.first, kv.second));
+      }
+      py_steps.append(py_pairs);
+    }
+    out["root_visit_dists"] = py_steps;
+  }
   return out;
 }
 
@@ -1171,6 +1212,21 @@ struct BatchInstance {
 
       const int action = batch_pick_root_action(*root, cfg, rng);
       tour.push_back(action);
+
+      // Stage 4 Phase A — snapshot raw root visit counts BEFORE the tree-reuse
+      // advance moves `root` to its child. Only actions with N > 0 are stored.
+      if (cfg.return_root_visits) {
+        std::vector<std::pair<int, int>> step_visits;
+        step_visits.reserve(static_cast<std::size_t>(root->state.n));
+        for (int a = 0; a < root->state.n; ++a) {
+          const int count = root->n_visits[static_cast<std::size_t>(a)];
+          if (count > 0) {
+            step_visits.emplace_back(a, count);
+          }
+        }
+        root_visits_per_step.push_back(std::move(step_visits));
+      }
+
       state.update_in_place(action);
 
       if (cfg.tree_reuse && root->children[static_cast<std::size_t>(action)]) {
@@ -1242,6 +1298,9 @@ struct BatchInstance {
   std::vector<PathEntry> pending_path;
   Counters counters;
   std::mt19937_64 rng;
+  // Stage 4 Phase A — per-tour-step root visit dumps for this instance.
+  // Empty unless cfg.return_root_visits.
+  std::vector<std::vector<std::pair<int, int>>> root_visits_per_step;
 };
 
 }  // namespace
@@ -1336,6 +1395,13 @@ py::dict BatchSearch::results() const {
   py::list rollout_steps;
   py::list value_calls;
 
+  // Stage 4 Phase A — `return_root_visits` is a search-wide flag; the C++
+  // BatchSearch wires the same Config to every BatchInstance, so peeking at
+  // the first instance is sufficient. (Defends against zero-instance batches.)
+  const bool emit_visits =
+      !impl_->instances.empty() && impl_->instances.front().cfg.return_root_visits;
+  py::list root_visits_per_instance;
+
   for (const BatchInstance& instance : impl_->instances) {
     if (!instance.state.all_finished()) {
       throw std::runtime_error("results called before all batch instances finished");
@@ -1350,6 +1416,18 @@ py::dict BatchSearch::results() const {
     decode_steps.append(instance.counters.decode);
     rollout_steps.append(instance.counters.rollout);
     value_calls.append(instance.counters.value);
+
+    if (emit_visits) {
+      py::list py_steps;
+      for (const auto& step_visits : instance.root_visits_per_step) {
+        py::list py_pairs;
+        for (const auto& kv : step_visits) {
+          py_pairs.append(py::make_tuple(kv.first, kv.second));
+        }
+        py_steps.append(py_pairs);
+      }
+      root_visits_per_instance.append(py_steps);
+    }
   }
 
   py::dict out;
@@ -1358,6 +1436,9 @@ py::dict BatchSearch::results() const {
   out["decode_steps"] = decode_steps;
   out["rollout_steps"] = rollout_steps;
   out["value_calls"] = value_calls;
+  if (emit_visits) {
+    out["root_visit_dists_per_instance"] = root_visits_per_instance;
+  }
   return out;
 }
 

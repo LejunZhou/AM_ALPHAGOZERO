@@ -33,6 +33,15 @@ Tests (run in order; each aborts on first failure):
   A11. Default-config canary: MCTSConfig() returns the canonical
         leaf_eval='rollout', tree_reuse=True (reproducibility footgun
         regression detector).
+  A13. (Stage 4 Phase A.4) Per-tour-step root visit-distribution exposure.
+        Sub-cases:
+          a) Production config (tree_reuse=True, K=200): per-step legality
+             invariants on `solver.root_visit_dists` for value_head and
+             rollout leaf eval, on python / cpp / cpp_batch.
+          b) tree_reuse=False, K=200: Σ_a N(s_t, a) == K exactly.
+          c) Deterministic-clamp bit-equivalence: dirichlet_epsilon=0,
+             temperature=0; python and cpp produce identical visit dicts
+             at every tour-step (no fp drift in integer counts).
 
 Run:
     PYTHONPATH=src python -m scripts.smoke_mcts
@@ -58,6 +67,279 @@ def _check_valid_tour(tour: torch.Tensor, n: int) -> None:
     nodes = torch.sort(tour).values
     expected = torch.arange(n, dtype=torch.long)
     assert torch.equal(nodes, expected), f"tour is not a permutation of [0,{n}): {tour.tolist()}"
+
+
+def _assert_visits_legal(label: str,
+                         visit_dists: list,
+                         tour: torch.Tensor,
+                         n: int,
+                         k: int,
+                         require_exact_k: bool = False) -> None:
+    """Stage 4 Phase A.4 legality invariants on per-tour-step root visit dicts.
+
+    For each tour-step t with chosen action a_t = tour[t]:
+      (i)   Σ_a N(s_t, a) > 0; π_t = N/ΣN sums to 1 within fp.
+      (ii)  N(s_t, a) == 0 for every action a in {a_0, .., a_{t-1}} (visited cities).
+      (iii) support(N) ⊆ unvisited(s_t) (subset; PUCT may leave some legal-but-
+            unvisited actions at N=0 under sharp prior + small c_puct).
+      (iv)  argmax_a N(s_t, a) is a legal (unvisited) action.
+      (v)   No inf/nan (counts are integers).
+      (vi)  Counts are non-negative.
+      Optionally (require_exact_k=True for tree_reuse=False):
+            Σ_a N(s_t, a) == K exactly.
+    """
+    import math as _math
+    tour_list = [int(a) for a in tour.tolist()]
+    assert len(visit_dists) == n, (
+        f"[{label}] expected {n} per-step visit dicts, got {len(visit_dists)}"
+    )
+    visited_so_far: set = set()
+    for t, dist in enumerate(visit_dists):
+        a_t = tour_list[t]
+        assert isinstance(dist, dict), f"[{label}] step {t} visit dist is not a dict: {type(dist)}"
+
+        # (vi) non-negative; (v) finite (integers are always finite, but guard anyway).
+        for a, c in dist.items():
+            assert isinstance(c, int) and c >= 0, (
+                f"[{label}] step {t} action {a} has invalid count {c!r}"
+            )
+            assert _math.isfinite(float(c)), f"[{label}] step {t} action {a} count not finite"
+
+        total = sum(dist.values())
+        assert total > 0, f"[{label}] step {t}: zero total visits at root"
+
+        # (i) π_t sums to 1.
+        pi_sum = sum(c / total for c in dist.values())
+        assert abs(pi_sum - 1.0) < 1e-9, f"[{label}] step {t}: pi sum {pi_sum} != 1"
+
+        # (ii) visited cities have count 0.
+        for a in visited_so_far:
+            assert dist.get(a, 0) == 0, (
+                f"[{label}] step {t}: visited city {a} has non-zero N={dist[a]}"
+            )
+
+        # (iii) support ⊆ unvisited (no count on visited city).
+        for a in dist:
+            assert a not in visited_so_far, (
+                f"[{label}] step {t}: action {a} appears in N but was already visited"
+            )
+            assert 0 <= a < n, f"[{label}] step {t}: action {a} out of range [0,{n})"
+
+        # (iv) argmax is unvisited (must be legal).
+        argmax_a = max(dist.keys(), key=lambda a: (dist[a], -a))  # tiebreak by smaller index
+        assert argmax_a not in visited_so_far, (
+            f"[{label}] step {t}: argmax action {argmax_a} is already visited"
+        )
+
+        # (vi-bis) π_t non-negative (trivially from non-negative counts).
+        for a, c in dist.items():
+            pi_a = c / total
+            assert pi_a >= 0.0, f"[{label}] step {t}: pi[{a}] = {pi_a} < 0"
+
+        if require_exact_k:
+            assert total == k, (
+                f"[{label}] step {t}: expected sum N == K={k} (tree_reuse=False), got {total}"
+            )
+
+        visited_so_far.add(a_t)
+
+
+def _run_a13_visit_dists(backend: str) -> None:
+    """Stage 4 Phase A.4 — visit-distribution exposure smoke.
+
+    Sub-cases (extracted from `_plans/stage4_plan.md` Phase A.4):
+      A13.a (production config — tree_reuse=True, K=200, value_head): per-step
+            legality invariants (i)-(vi) on root visit dicts. Run for both
+            value_head and rollout leaf eval, on each backend.
+      A13.b (tree_reuse=False, K=200): exact-count invariant Σ N == K at every
+            step.
+      A13.c (deterministic-clamp bit-equivalence): python vs cpp (and cpp_batch
+            vs cpp), dirichlet_epsilon=0, temperature=0, tree_reuse=True.
+            Visit dicts must match exactly across backends.
+
+    `backend` controls which backend section runs: 'python' executes only the
+    Python invariant checks plus python-vs-cpp bit-equivalence (cpp side is
+    cheap; we always exercise it as the bit-eq witness when available);
+    'cpp' / 'cpp_batch' add the corresponding backend's leaf-eval coverage.
+    """
+    from am_baseline.search import (
+        CppBatchMCTSSolver,
+        CppMCTSSolver,
+        HAVE_CPP_MCTS,
+    )
+
+    torch.manual_seed(4242)
+    N = 20
+    B = 3   # 3 instances × 20 steps × 2 leaf-eval modes is plenty for invariants
+    K = 200
+
+    cfg = Config(graph_size=N, batch_size=32, epoch_size=32)
+    model = AttentionModel(cfg).cpu().eval()
+    rng = torch.Generator().manual_seed(4242)
+    inputs = torch.rand(B, N, 2, generator=rng)
+
+    # ---- A13.a: production config legality across leaf-eval modes ----
+    leaf_evals = ['value_head', 'rollout']
+    for leaf_eval in leaf_evals:
+        # (a) Python solver — always run as the reference invariant.
+        py_cfg = MCTSConfig(
+            n_simulations=K, c_puct=0.05, temperature=0.0,
+            leaf_eval=leaf_eval, fpu_mode='running_q', fpu_fallback=-1.0,
+            tree_reuse=True, dirichlet_epsilon=0.0,
+            return_root_visits=True, seed=4242,
+        )
+        solver_py = MCTSSolver(model, py_cfg, torch.device('cpu'))
+        for i in range(B):
+            cost_i, tour_i = solver_py.solve_instance(inputs[i:i+1])
+            _check_valid_tour(tour_i, N)
+            assert torch.isfinite(cost_i)
+            _assert_visits_legal(
+                f"A13.a python leaf={leaf_eval} inst={i}",
+                solver_py.root_visit_dists, tour_i, N, K,
+                require_exact_k=False,
+            )
+        print(f"[A13.a python leaf_eval={leaf_eval} OK] legality on {B} instances "
+              f"(tree_reuse=True, K={K}, ε=0, τ=0)")
+
+        # (b) C++ sequential.
+        if HAVE_CPP_MCTS and backend in ('cpp', 'cpp_batch', 'python'):
+            cpp_cfg = MCTSConfig(
+                n_simulations=K, c_puct=0.05, temperature=0.0,
+                leaf_eval=leaf_eval, fpu_mode='running_q', fpu_fallback=-1.0,
+                tree_reuse=True, dirichlet_epsilon=0.0,
+                return_root_visits=True, seed=4242,
+            )
+            solver_cpp = CppMCTSSolver(model, cpp_cfg, torch.device('cpu'))
+            for i in range(B):
+                cost_i, tour_i = solver_cpp.solve_instance(inputs[i:i+1])
+                _check_valid_tour(tour_i, N)
+                assert torch.isfinite(cost_i)
+                _assert_visits_legal(
+                    f"A13.a cpp leaf={leaf_eval} inst={i}",
+                    solver_cpp.root_visit_dists, tour_i, N, K,
+                    require_exact_k=False,
+                )
+            print(f"[A13.a cpp leaf_eval={leaf_eval} OK] legality on {B} instances")
+
+        # (c) C++ batched.
+        if HAVE_CPP_MCTS and backend in ('cpp_batch', 'python'):
+            cb_cfg = MCTSConfig(
+                n_simulations=K, c_puct=0.05, temperature=0.0,
+                leaf_eval=leaf_eval, fpu_mode='running_q', fpu_fallback=-1.0,
+                tree_reuse=True, dirichlet_epsilon=0.0,
+                return_root_visits=True, seed=4242,
+            )
+            solver_cb = CppBatchMCTSSolver(
+                model, cb_cfg, torch.device('cpu'), mcts_batch_size=2,
+            )
+            costs_cb, tours_cb = solver_cb.solve_batch(inputs)
+            assert len(solver_cb.root_visit_dists_per_instance) == B, (
+                f"[A13.a cpp_batch] expected {B} per-instance visit dists, "
+                f"got {len(solver_cb.root_visit_dists_per_instance)}"
+            )
+            for i in range(B):
+                _check_valid_tour(tours_cb[i], N)
+                assert torch.isfinite(costs_cb[i])
+                _assert_visits_legal(
+                    f"A13.a cpp_batch leaf={leaf_eval} inst={i}",
+                    solver_cb.root_visit_dists_per_instance[i],
+                    tours_cb[i], N, K,
+                    require_exact_k=False,
+                )
+            print(f"[A13.a cpp_batch leaf_eval={leaf_eval} OK] legality on {B} instances")
+
+    # ---- A13.b: tree_reuse=False, exact-count Σ N == K ----
+    nr_cfg = MCTSConfig(
+        n_simulations=K, c_puct=0.05, temperature=0.0,
+        leaf_eval='value_head', fpu_mode='running_q', fpu_fallback=-1.0,
+        tree_reuse=False, dirichlet_epsilon=0.0,
+        return_root_visits=True, seed=4242,
+    )
+    solver_nr = MCTSSolver(model, nr_cfg, torch.device('cpu'))
+    cost_nr, tour_nr = solver_nr.solve_instance(inputs[0:1])
+    _check_valid_tour(tour_nr, N)
+    _assert_visits_legal(
+        "A13.b python tree_reuse=False",
+        solver_nr.root_visit_dists, tour_nr, N, K,
+        require_exact_k=True,
+    )
+    print(f"[A13.b python OK] tree_reuse=False, K={K}: Σ N == K at every step")
+
+    if HAVE_CPP_MCTS:
+        nr_cpp_cfg = MCTSConfig(
+            n_simulations=K, c_puct=0.05, temperature=0.0,
+            leaf_eval='value_head', fpu_mode='running_q', fpu_fallback=-1.0,
+            tree_reuse=False, dirichlet_epsilon=0.0,
+            return_root_visits=True, seed=4242,
+        )
+        solver_nr_cpp = CppMCTSSolver(model, nr_cpp_cfg, torch.device('cpu'))
+        cost_nr_cpp, tour_nr_cpp = solver_nr_cpp.solve_instance(inputs[0:1])
+        _check_valid_tour(tour_nr_cpp, N)
+        _assert_visits_legal(
+            "A13.b cpp tree_reuse=False",
+            solver_nr_cpp.root_visit_dists, tour_nr_cpp, N, K,
+            require_exact_k=True,
+        )
+        print(f"[A13.b cpp OK] tree_reuse=False, K={K}: Σ N == K at every step")
+
+    # ---- A13.c: deterministic-clamp bit-equivalence python vs cpp ----
+    if HAVE_CPP_MCTS:
+        bit_cfg_py = MCTSConfig(
+            n_simulations=K, c_puct=0.05, temperature=0.0,
+            leaf_eval='value_head', fpu_mode='running_q', fpu_fallback=-1.0,
+            tree_reuse=True, dirichlet_epsilon=0.0,
+            return_root_visits=True, seed=4242,
+        )
+        bit_cfg_cpp = MCTSConfig(
+            n_simulations=K, c_puct=0.05, temperature=0.0,
+            leaf_eval='value_head', fpu_mode='running_q', fpu_fallback=-1.0,
+            tree_reuse=True, dirichlet_epsilon=0.0,
+            return_root_visits=True, seed=4242,
+        )
+        s_py = MCTSSolver(model, bit_cfg_py, torch.device('cpu'))
+        s_cp = CppMCTSSolver(model, bit_cfg_cpp, torch.device('cpu'))
+        cost_py, tour_py = s_py.solve_instance(inputs[0:1])
+        cost_cp, tour_cp = s_cp.solve_instance(inputs[0:1])
+        # Same tour and same cost (Stage 3 already guaranteed this; we restate).
+        assert torch.equal(tour_py, tour_cp), (
+            f"[A13.c] python tour {tour_py.tolist()} != cpp tour {tour_cp.tolist()}"
+        )
+        assert torch.isclose(cost_py, cost_cp, atol=1e-5), (
+            f"[A13.c] python cost {cost_py.item()} != cpp cost {cost_cp.item()}"
+        )
+        # Per-step visit dicts must match exactly (integer counts, no fp drift).
+        assert len(s_py.root_visit_dists) == len(s_cp.root_visit_dists)
+        for t, (dpy, dcp) in enumerate(
+            zip(s_py.root_visit_dists, s_cp.root_visit_dists)
+        ):
+            assert dpy == dcp, (
+                f"[A13.c] step {t} visit dict mismatch python={dpy} cpp={dcp}"
+            )
+        print(f"[A13.c python==cpp OK] deterministic visit dicts match across "
+              f"all {N} steps (ε=0, τ=0, K={K})")
+
+        # Also check cpp_batch agrees with cpp (deterministic; same RNG path).
+        bit_cfg_cb = MCTSConfig(
+            n_simulations=K, c_puct=0.05, temperature=0.0,
+            leaf_eval='value_head', fpu_mode='running_q', fpu_fallback=-1.0,
+            tree_reuse=True, dirichlet_epsilon=0.0,
+            return_root_visits=True, seed=4242,
+        )
+        s_cb = CppBatchMCTSSolver(
+            model, bit_cfg_cb, torch.device('cpu'), mcts_batch_size=1,
+        )
+        costs_cb, tours_cb = s_cb.solve_batch(inputs[0:1])
+        assert torch.equal(tours_cb[0], tour_cp)
+        assert torch.isclose(costs_cb[0], cost_cp, atol=1e-5)
+        for t, (dcp, dcb) in enumerate(
+            zip(s_cp.root_visit_dists, s_cb.root_visit_dists_per_instance[0])
+        ):
+            assert dcp == dcb, (
+                f"[A13.c cpp_batch] step {t} mismatch cpp={dcp} cpp_batch={dcb}"
+            )
+        print(f"[A13.c cpp==cpp_batch OK] visit dicts match across all {N} steps")
+
+    print("[OK] Stage 4 Phase A.4 (A13) visit-distribution smoke PASSED")
 
 
 def _run_cpp_smoke() -> int:
@@ -169,6 +451,9 @@ def _run_cpp_smoke() -> int:
         pass
     print("[CPP A9 OK] config validation is shared with Python solver")
 
+    # --- A13 (Stage 4 Phase A.4): visit-distribution exposure ---
+    _run_a13_visit_dists('cpp')
+
     print("[OK] C++ MCTS smoke PASSED")
     return 0
 
@@ -241,6 +526,9 @@ def _run_cpp_batch_smoke() -> int:
     assert batched.batch_eval_rows >= batched.batch_eval_calls
     print(f"[CPP_BATCH A2 OK] K=4 matches sequential cpp; "
           f"batch_calls={batched.batch_eval_calls}, rows={batched.batch_eval_rows}")
+
+    # --- A13 (Stage 4 Phase A.4): visit-distribution exposure ---
+    _run_a13_visit_dists('cpp_batch')
 
     print("[OK] Cross-instance C++ batch MCTS smoke PASSED")
     return 0
@@ -494,6 +782,11 @@ def main() -> int:
     assert default_cfg.virtual_loss_margin == 0.5, \
         f"[A11] default virtual_loss_margin drifted to {default_cfg.virtual_loss_margin!r}, expected 0.5"
     print("[A11 OK] MCTSConfig() defaults are canonical (rollout + tree_reuse)")
+
+    # --- A13 (Stage 4 Phase A.4): visit-distribution exposure ---
+    # Always exercise A13 from the Python entrypoint as well; this also covers
+    # bit-equivalence vs the C++ backend when the extension is available.
+    _run_a13_visit_dists('python')
 
     print("[OK] Stage 2 Milestone A1+A2..A11 smoke PASSED")
     return 0

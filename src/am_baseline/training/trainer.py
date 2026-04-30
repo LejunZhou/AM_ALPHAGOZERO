@@ -235,3 +235,122 @@ def train_batch(model, optimizer, baseline, epoch, batch_id, step, batch, logger
         logger.log_step(step, epoch, batch_id, cost, grad_norms,
                         log_likelihood, reinforce_loss, bl_loss,
                         value_loss=value_loss)
+
+
+def train_step_alphazero(model, optimizer, batch, opts):
+    """Stage 4 distillation training step (AlphaGo-Zero-style).
+
+    Implements the loss in `_plans/stage4_algorithm_spec.md` §3 over a
+    stratified-by-step minibatch produced by `MCTSReplayBuffer.sample()` /
+    `sample_step()`. All rows in `batch` share the same scalar `state_i`.
+
+    Args:
+        model: AttentionModel with encoder, decoder, and value_head heads.
+        optimizer: torch.optim.Optimizer; L2 regularization is applied via
+            `weight_decay`, NOT in the loss expression.
+        batch: dict from `MCTSReplayBuffer.sample(...)`. Required keys:
+            state_i (int), coords (B, N, 2), visited (B, N) bool,
+            first_a / prev_a (B,), lengths (B,), pi (B, N), z (B,).
+        opts: object exposing `lambda_v` (value-loss weight, default 1.0)
+            and `device`. `max_grad_norm` is honored if present (>0).
+
+    Returns:
+        dict of metrics: policy_loss, value_loss, total_loss,
+        mean_entropy_pi, mean_z, gradient_norm.
+    """
+    from am_baseline.training.coach import reconstruct_state
+
+    device = getattr(opts, "device", torch.device("cpu"))
+    if not isinstance(device, torch.device):
+        device = torch.device(device)
+
+    model.train()
+
+    # Move minibatch to model device. Buffer is CPU-resident at default
+    # capacity (~520 MB); transfer happens here, not in the buffer.
+    coords = batch["coords"].to(device=device, dtype=torch.float32)
+    pi_target = batch["pi"].to(device=device, dtype=torch.float32)
+    z_target = batch["z"].to(device=device, dtype=torch.float32)
+
+    # ---- Forward ----------------------------------------------------------
+    # Critical (plan B.2): gradient must flow through the same compute graph
+    # used during self-play. encode + precompute_decoder are called INSIDE
+    # the train step so the encoder's parameters receive gradient.
+    encoded = model.encode(coords)                         # (B, N, embed_dim)
+    fixed = model.precompute_decoder(encoded)              # AttentionModelFixed
+
+    # Reconstruct state with scalar state.i (stratified batch).
+    state = reconstruct_state(
+        {
+            "state_i": batch["state_i"],
+            "coords": coords,
+            "visited": batch["visited"].to(device=device),
+            "first_a": batch["first_a"].to(device=device),
+            "prev_a": batch["prev_a"].to(device=device),
+            "lengths": batch["lengths"].to(device=device),
+        },
+        device=device,
+    )
+
+    log_p, mask, glimpse = model.decode_step(fixed, state, return_glimpse=True)
+    # decode_step returns (B, 1, N) for log_p / mask. Strip the per-step axis
+    # before the cross-entropy to avoid a (B, B, N) broadcast against pi.
+    log_p = log_p.squeeze(1)                               # (B, N)
+    mask = mask.squeeze(1)                                 # (B, N) bool — True == visited / illegal
+    if model.value_head is None:
+        raise RuntimeError(
+            "train_step_alphazero requires model.value_head to be enabled "
+            "(value_enabled=True at construction)."
+        )
+    v = model.value_head(glimpse)                          # (B,)
+
+    # ---- Policy distillation cross-entropy --------------------------------
+    # log_p has -inf at masked positions (the decoder writes -inf into
+    # visited cities). pi_target is masked-zero on visited cities by
+    # construction (raw normalized visit counts; visited cities had N=0).
+    # 0 * -inf = NaN in IEEE float, so we replace -inf with 0 before the
+    # multiply. Masked entries then contribute 0 to the sum, which is the
+    # correct cross-entropy under the legality mask.
+    log_p_safe = torch.where(mask, torch.zeros_like(log_p), log_p)
+    policy_loss = -(pi_target * log_p_safe).sum(dim=-1).mean()
+
+    # ---- Value loss -------------------------------------------------------
+    # batch['z'] = cost_to_go / bl_val is the V_CURRENT cost-to-go target
+    # (matches Stage 1 shape). MSE against the value head's per-step output.
+    value_loss = F.mse_loss(v, z_target)
+
+    # ---- Total loss -------------------------------------------------------
+    lambda_v = float(getattr(opts, "lambda_v", 1.0))
+    total_loss = policy_loss + lambda_v * value_loss
+
+    # ---- Backward + step --------------------------------------------------
+    optimizer.zero_grad(set_to_none=True)
+    total_loss.backward()
+
+    # Optional gradient clipping. We compute the unclipped grad-norm for
+    # logging regardless of whether clipping is active.
+    max_grad_norm = float(getattr(opts, "max_grad_norm", 0.0))
+    if max_grad_norm > 0:
+        grad_norm = torch.nn.utils.clip_grad_norm_(
+            model.parameters(), max_norm=max_grad_norm
+        )
+    else:
+        grad_norm = torch.nn.utils.clip_grad_norm_(
+            model.parameters(), max_norm=math.inf
+        )
+    optimizer.step()
+
+    # ---- Metrics ----------------------------------------------------------
+    # Entropy of the *target* pi (sanity diagnostic — degenerates as MCTS
+    # becomes more peaked). 0 * log(0) := 0; mask-aware via clamp.
+    pi_clamped = pi_target.clamp(min=1e-12)
+    entropy_pi = -(pi_target * pi_clamped.log()).sum(dim=-1).mean()
+
+    return {
+        "policy_loss": float(policy_loss.detach().cpu()),
+        "value_loss": float(value_loss.detach().cpu()),
+        "total_loss": float(total_loss.detach().cpu()),
+        "mean_entropy_pi": float(entropy_pi.detach().cpu()),
+        "mean_z": float(z_target.mean().detach().cpu()),
+        "gradient_norm": float(grad_norm.detach().cpu() if torch.is_tensor(grad_norm) else grad_norm),
+    }

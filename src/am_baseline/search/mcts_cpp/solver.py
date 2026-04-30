@@ -70,6 +70,11 @@ class CppMCTSSolver:
         #    "v_predicted": value_head(glimpse) at the leaf state,
         #    "z_realized": (greedy rollout remaining real cost) / bl_val}
         self.r2_records: list = []
+        # Stage 4 Phase A — per-tour-step raw root visit counts. Populated by
+        # `solve_instance` only when `cfg.return_root_visits=True`. One dict
+        # per tour-step (length N after a full solve); each dict maps
+        # action -> visit count for actions touched in backup at that step.
+        self.root_visit_dists: list = []
 
     @torch.no_grad()
     def solve_batch(self, inputs: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -143,6 +148,7 @@ class CppMCTSSolver:
         self.virtual_collision_count = 0
         self.max_virtual_visits_remaining = 0
         self.r2_records = []
+        self.root_visit_dists = []
         r2_records_out = self.r2_records if enable_r2_log else None
 
         embeddings = self.model.encode(input_1)
@@ -176,6 +182,17 @@ class CppMCTSSolver:
         self.pending_collection_successes = int(result["pending_collection_successes"])
         self.virtual_collision_count = int(result["virtual_collision_count"])
         self.max_virtual_visits_remaining = int(result["max_virtual_visits_remaining"])
+        # Stage 4 Phase A — Plumb per-step root visit dumps back to Python.
+        # The C++ side emits the field as `list[list[(int, int)]]` only when
+        # cfg.return_root_visits is True; we convert each step's pairs into
+        # a {action: count} dict here so callers see the same shape as the
+        # pure-Python `MCTSSolver.root_visit_dists`.
+        if self.cfg.return_root_visits and "root_visit_dists" in result:
+            self.root_visit_dists = [
+                {int(a): int(c) for a, c in step} for step in result["root_visit_dists"]
+            ]
+        else:
+            self.root_visit_dists = []
 
         cost = torch.tensor(float(result["cost"]), device=self.device, dtype=input_1.dtype)
         tour = torch.tensor(list(result["tour"]), device=self.device, dtype=torch.long)
@@ -590,6 +607,12 @@ class CppBatchMCTSSolver(CppMCTSSolver):
         self.fwd_count_value_per_instance = []
         self.eval_cache_hits_per_instance = []
         self.eval_cache_misses_per_instance = []
+        # Stage 4 Phase A — per-instance per-step root visit dumps. Each entry
+        # is a list (length N) of dicts {action: visit_count}, mirroring the
+        # `MCTSSolver.root_visit_dists` shape but indexed by instance.
+        # Populated by `solve_batch` / `solve_instance` only when
+        # `cfg.return_root_visits=True`.
+        self.root_visit_dists_per_instance: list = []
 
     @torch.no_grad()
     def solve_instance(
@@ -604,6 +627,13 @@ class CppBatchMCTSSolver(CppMCTSSolver):
         if bl_val is not None:
             bl_vals = torch.tensor([float(bl_val)], device=self.device)
         costs, tours = self.solve_batch(input_1, bl_vals=bl_vals)
+        # Stage 4 Phase A — for a single-instance solve through the batched
+        # backend, expose the per-step visit dists via the same attribute name
+        # as the sequential solver (`root_visit_dists`).
+        if self.cfg.return_root_visits and self.root_visit_dists_per_instance:
+            self.root_visit_dists = self.root_visit_dists_per_instance[0]
+        else:
+            self.root_visit_dists = []
         return costs[0], tours[0]
 
     @torch.no_grad()
@@ -629,6 +659,7 @@ class CppBatchMCTSSolver(CppMCTSSolver):
         self.eval_cache_misses_per_instance = []
         self.batch_eval_calls = 0
         self.batch_eval_rows = 0
+        self.root_visit_dists_per_instance = []
 
         for start in range(0, bsz, self.mcts_batch_size):
             end = min(start + self.mcts_batch_size, bsz)
@@ -645,6 +676,8 @@ class CppBatchMCTSSolver(CppMCTSSolver):
             self.eval_cache_misses_per_instance.extend(chunk_stats["cache_misses"])
             self.batch_eval_calls += chunk_stats["batch_eval_calls"]
             self.batch_eval_rows += chunk_stats["batch_eval_rows"]
+            if "root_visit_dists" in chunk_stats:
+                self.root_visit_dists_per_instance.extend(chunk_stats["root_visit_dists"])
 
         self.fwd_count_decode = int(sum(self.fwd_count_decode_per_instance))
         self.fwd_count_rollout = int(sum(self.fwd_count_rollout_per_instance))
@@ -925,4 +958,11 @@ class CppBatchMCTSSolver(CppMCTSSolver):
             "batch_eval_calls": batch_eval_calls,
             "batch_eval_rows": batch_eval_rows,
         }
+        # Stage 4 Phase A — convert raw `list[list[(int, int)]]` per instance
+        # into `list[list[dict]]` to match the sequential solver's shape.
+        if self.cfg.return_root_visits and "root_visit_dists_per_instance" in raw:
+            stats["root_visit_dists"] = [
+                [{int(a): int(c) for a, c in step} for step in inst]
+                for inst in raw["root_visit_dists_per_instance"]
+            ]
         return costs, tours, stats
