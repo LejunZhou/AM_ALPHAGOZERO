@@ -126,8 +126,54 @@ Defaults are unchanged: `MCTSConfig.temperature_schedule = None` ≡ `'const'` �
     | K=200 rol no-explore | 3.85384 | -0.00786 ✓ | 40.0% | 9.5% |
 
     The big takeaways are: (a) `ε=0.25` is catastrophic regardless of K or leaf eval; (b) `ε ≤ 0.05` is the safe regime for warm-started training; (c) `leaf_eval='rollout'` slightly beats `value_head` at every K and is more robust to residual exploration noise; (d) MCTS quality scales with K (K=200 rollout no-explore is the strongest), but K=100 rollout step30+ε=0.05 is the best **wall-clock-vs-quality** trade-off and is the recommended F.3 retry config.
-- [ ] **F.3 attempt 2 (PENDING)** — Adjusted recipe per probe: `K=100, leaf_eval='rollout', dirichlet_epsilon=0.05, temperature_schedule='step30'`. Other params unchanged (M=1000, train_steps=100, buffer=50K, gate_every=5, val_size=10000). Estimated wall-clock ~25-30 min on RTX 4060. The expected MCTS-vs-greedy gap is now **negative** (≈ -0.006), so distillation should have a positive signal — pilot conditions 1 and 4 should be reachable.
-- [ ] **F.4** TSP-20 main (100 iter × M=1000 × K=100 × 200 train_steps). **DEFERRED — pending F.3 attempt 2.**
+- [x] **F.3 attempt 2 (FAILED 2026-04-30; bug discovered)** — Same CLI as attempt 3 below, but a hidden bug in `make_self_play_config` hardcoded `leaf_eval='value_head', dirichlet_epsilon=0.25, temperature_schedule='step30', dirichlet_alpha=10/N`, ignoring all four corresponding CLI flags. So v2 actually ran with EXACTLY the canonical-AGZ recipe (only K differed: 100 instead of 50). Buffer mean(bl − mcts) = +0.114 (worse than v1's +0.077 — more K on a corrupted prior amplifies the bad signal). val_avg_cost(iter 19) = 3.84407, fail by 0.0056. Output: `outputs/tsp_20/stage4_pilot_v2_20260430T031137/`.
+  - **Bug fix (commit 419a857):** `make_self_play_config(graph_size, n_simulations, leaf_eval=…, dirichlet_epsilon=…, dirichlet_alpha_factor=…, temperature_schedule=…)` now takes all four as kwargs; `MCTSCoach.learn` reads them from `opts`. Smokes B0/B1/A1b/A1/A2/A3/A5/A6 still pass.
+- [x] **F.3 attempt 3 (PARTIAL 2026-04-30)** — Bug-fixed recipe: `K=100, leaf_eval='rollout', dirichlet_epsilon=0.05, temperature_schedule='step30'`. Output: `outputs/tsp_20/stage4_pilot_v3_20260430T034502/`. ~42 min wall-clock (~125 s/iter; rollout K=100 is ~2.5× the plan's K=50-vh estimate).
+  - **Buffer signal verified clean:** mean(bl − mcts) = **+0.00609** (MCTS *better* than greedy by 0.006), 36.1% strict-better, 48.6% tied, 15.2% worse. Probe prediction was -0.006; actual is +0.006 (same magnitude, sign flip is just my probe's "MCTS − greedy" vs buffer's "bl − mcts" convention). The bug fix took effect.
+  - **Pilot conditions:** (1) val_avg_cost(iter 19) = **3.84127**, threshold 3.83843 → **fail by 0.00284**. (2) no NaN ✓. (3) gating fired 4× all rejected ✓ literal; 0 accepts. (4) val_avg_cost spread 3.8404-3.8423 (range 0.0019, **within ±0.001 noise band — partial pass**); but trajectory is FLAT, not monotone-decreasing.
+  - **The flat-val plateau:** val_avg_cost dropped from 3.84154 (iter 0) to a min of 3.84037 (iter 9), then bounced back to 3.84127 (iter 19). Best ever was 3.84037. The policy is wandering around a local optimum near the MCTS-K=100-rollout argmax solution, with random fluctuations.
+  - **Gating diff trend (candidate − baseline on gating set):** +0.0014, +0.0003, +0.0015, +0.0011 — oscillating, not converging toward acceptance. Without a gate-accept, `best_model` (the MCTS prior) never updates, so MCTS never gets stronger, so the policy iteration cycle is stuck.
+  - **Catch-22 diagnosed:** Stage 4's improvement loop is paused at the AGZ "policy iteration" cycle. To break out, MCTS needs a stronger prior (gating accept), but gating won't accept without a candidate that's reproducibly better — which requires either (a) more search depth (K) so MCTS targets are decisively better than the greedy baseline, (b) a longer warm-up period before gating, or (c) a softer gating threshold. Phase G.5 (gating cadence sweep) and G.1 (K sweep) become load-bearing rather than optional.
+- [x] **F.3 v3 resumed (FAILED 2026-04-30)** — Same recipe, iters 20-39 via `--resume_from`. Plateau confirmed: best val 3.84006 (iter 27), final 3.84059. 30 more iters bought 0.00031 of improvement — at that rate ~200 more iters to close the 0.002 gap (well beyond F.4's 100). Gating diff drifted slowly toward zero (+0.0011 → +0.0005) but never crossed.
+- [x] **F.3 v4 K=200 (FAILED 2026-04-30)** — `K=200, leaf_eval='rollout', dirichlet_epsilon=0.05, temperature_schedule='step30'`. Buffer signal stronger (mean(bl-mcts) = +0.00749 vs v3's +0.00609; 39% strict-better vs 36%) but val_avg_cost still flat. Final 3.84102, min 3.84016. Output: `outputs/tsp_20/stage4_pilot_v4_K200_20260430T052113/`.
+- [x] **Apples-to-apples comparison (Stage 1 vs Stage 4 v4, fixed seed=42 10K val):**
+  | Model | val_avg_cost | Δ vs Stage 1 |
+  |---|---|---|
+  | Stage 1 (loaded) | 3.83622 | — |
+  | Stage 4 v4 working | **3.83757** | **+0.00135 worse**, p_one_sided(S4<S1)=1.0 |
+  | Stage 4 v4 best_model | 3.83622 | identical (gating never accepted, frozen at Stage 1) |
+  Hard truth: Stage 4 with bug-fixed K=200 recipe **degrades Stage 1 by 0.00135** with strong significance. The +0.0075 buffer-level MCTS-better-than-greedy signal does NOT translate into a better greedy policy — distillation noise (cases where MCTS picks worse moves than greedy) overwhelms the small mean improvement.
+- [x] **F.3 v5 — `--gate_mode=always` test (Phase G.5.c) (FAILED 2026-04-30)** — Same K=200 recipe + new `--gate_mode always` CLI flag (and `MCTSCoach` opt) that bypasses the t-test and forces best_model = working_model every iter. Diagnostic intent: break the catch-22 where gating freezes best_model = Stage 1, so MCTS prior never strengthens. Output: `outputs/tsp_20/stage4_pilot_v5_alwaysgate_K200_*/`.
+  - Result: best_model now matches working_model (3.83732, both worse than Stage 1 by +0.00110). 0.00025 better than v4 but still net-worse.
+  - **The plateau is NOT a gating artifact.** Letting MCTS prior evolve via always-accept doesn't escape the plateau — the working model itself is the limit.
+- [ ] **F.4 TSP-20 main run (100 iter × K=100 × 200 train_steps)** — **NEGATIVE-RESULT BRANCH.** F.3 ran 5 attempts and could not achieve the F.3 pilot pass conditions even with the corrected recipe. Decision points pending user input: (a) run F.4 anyway with corrected recipe to document the longer-horizon trajectory, (b) try architecture-level interventions (lower lr, freeze encoder, or fresh value head) to break the plateau, (c) move to Stage 5 from-scratch where AGZ has a cleaner test, (d) test on TSP-50/TSP-100 where Stage 1 is weaker and there's more headroom for AGZ to add value.
+
+### Phase F — TSP-20 pilot diagnosis summary (2026-04-30)
+
+**Hypothesis under test:** AGZ-style MCTS self-improvement can lift the converged Stage 1 policy on TSP-20.
+
+**Result: hypothesis NOT supported in this regime.** Five pilot attempts (v1-v5) across canonical AGZ exploration (ε=0.25 step30), warm-start-adapted exploration (ε=0.05), strong MCTS (K=100 → K=200), and gating-off (always-accept). All five end at val_avg_cost in [3.840, 3.844] range, ~0.001-0.005 *worse* than Stage 1 on apples-to-apples comparison.
+
+**Two actionable findings transferable beyond Stage 4:**
+
+1. **AGZ's canonical exploration (ε=0.25 + step30 with τ=1) is unsafe on a converged warm-start.** With a sharp prior, 25% Dirichlet noise + temperature-1 sampling commits to disastrous prefixes within the first ⌈0.3·N⌉ steps. Probe (`src/scripts/probe_mcts_quality.py`) shows mean MCTS tour cost is **+0.246 *worse* than greedy** under this config. Safe regime for warm-started training: **ε ≤ 0.05** with rollout leaf eval. Memory note added so future sessions don't repeat the trap.
+
+2. **Bug fix `419a857`:** `make_self_play_config` was hardcoding leaf_eval, dirichlet, schedule kwargs and ignoring CLI flags. Fixed to read all four from opts. This is what let v3+ actually run a different recipe than v1.
+
+**Where the plateau comes from (best current explanation):**
+
+- The Stage 1 policy is already at the architectural ceiling for this AM model + TSP-20 distribution. Greedy decoding gets val_avg_cost ≈ 3.836-3.840.
+- Even strong MCTS (K=200 rollout) only beats greedy by ~0.008 on average — and only on 39% of instances. The other 61% are tied or worse.
+- Distillation captures the *mean* MCTS distribution (loss converges to ~0.10), but the per-instance "wins" and "losses" of MCTS-vs-greedy roughly cancel — leaving the distilled policy approximately tied with greedy, slightly worse on average due to gradient noise from the shared encoder.
+- Gating correctly detects "candidate is reproducibly slightly worse" and rejects (catch-22: best_model never updates → MCTS prior never strengthens → loop converges to local optimum).
+- Always-accept gating doesn't help because the candidate's MCTS-prior-evolution is too noisy to compound into improvement.
+
+**What WOULD likely help (if we want to keep trying):**
+- Stronger MCTS at the leaf (K=1000+, AGZ-paper-scale) to get a cleaner improvement signal. Probe didn't extend that far; would need a separate experiment.
+- Filter distillation targets: only train on instances where MCTS strictly beats greedy (drop the noise). Plan deviation, not in spec.
+- Lower lr (1e-5) + many more iters (500+) for slower, more careful convergence. Potentially weeks of compute.
+- Wider AM model (more encoder layers / embed dim) — Stage 1's architectural capacity may be the bottleneck.
+- TSP-50 or TSP-100 — Stage 1 is weaker on larger N so there's more headroom for MCTS to add value (Phase G already wanted this; should hoist to a Stage 5 priority).
 - [x] **F.5** `src/scripts/plot_stage4.py` (~225 LOC) — reads Stage 1 `epochs.csv` + Stage 4 `iterations.csv`, projects each row to `(total_instances, val_avg_cost)`, log-x scatter with two curves + three reference horizontal lines (Gurobi opt 3.8279, Stage 1 final 3.83943, Stage 3 K=400 rollout 3.8312). CLI: `--stage1_dir`, `--stage4_dir`, `--out`. Stage-1 cumulative-instances axis read from `args.json:epoch_size` (fallback `1_280_000`). Self-test mode `--smoke` fabricates synthetic 5-row CSVs into a temp dir and verifies the PNG is written and non-empty (~96 KB). Smoke green on this dev box.
 
 **Phase F dev-portion completion note (2026-04-30):** Edits landed in this worktree:

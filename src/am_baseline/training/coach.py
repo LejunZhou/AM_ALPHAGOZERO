@@ -1079,11 +1079,18 @@ class MCTSCoach:
             gated = False
             accepted = None
             gate_every = int(getattr(opts, 'gate_every', 1))
+            gate_mode = str(getattr(opts, 'gate_mode', 'ttest'))
             if gate_every > 0 and (self.iter_idx + 1) % gate_every == 0:
                 gated = True
-                accepted = self.gating_baseline.epoch_callback(
-                    self.model, epoch=self.iter_idx
-                )
+                if gate_mode == 'always':
+                    # Phase G.5.c — skip the t-test, always accept.
+                    accepted = True
+                elif gate_mode == 'never':
+                    accepted = False
+                else:  # 'ttest' — Stage 1's paired-t at α=0.05 (current default).
+                    accepted = self.gating_baseline.epoch_callback(
+                        self.model, epoch=self.iter_idx
+                    )
                 if accepted:
                     self.best_model = self._copy.deepcopy(self.model)
                     self._save_checkpoint(tag=f'{self.iter_idx}_accepted')

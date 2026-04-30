@@ -64,6 +64,12 @@ def parse_opts(argv=None):
                         help='Train minibatch size (rows drawn from buffer).')
     parser.add_argument('--gate_every', type=int, default=5,
                         help='Gating cadence — paired t-test every k iterations.')
+    parser.add_argument('--gate_mode', type=str, default='ttest',
+                        choices=['ttest', 'always', 'never'],
+                        help='Gating decision rule. ttest = Stage 1 paired-t α=0.05 '
+                             '(default); always = accept every gating event (Phase G.5.c, '
+                             'AlphaZero-style no-gating); never = reject every event '
+                             '(diagnostic: freezes best_model = warm-start).')
     parser.add_argument('--temperature_schedule', type=str, default='step30',
                         choices=['const', 'step30', 'step50'],
                         help='Per-tour-step temperature schedule for action selection σ_t. '

@@ -99,6 +99,10 @@ def main():
         ('K=100 rol  step30+e0  ', 100, 'rollout',    0.0,  'step30'),
         ('K=100 vh   step30+e05 ', 100, 'value_head', 0.05, 'step30'),
         ('K=100 rol  step30+e05 ', 100, 'rollout',    0.05, 'step30'),
+        # Stronger MCTS for F.3 v4 candidate recipes
+        ('K=200 rol  step30+e05 ', 200, 'rollout',    0.05, 'step30'),
+        ('K=200 rol  step30+e0  ', 200, 'rollout',    0.0,  'step30'),
+        ('K=400 rol  no-explore ', 400, 'rollout',    0.0,  None),
     ]
 
     print(f"\n{'config':30s}  mean_cost   gap_vs_greedy  frac_better  frac_worse")
