@@ -36,13 +36,14 @@ This table pins every Stage 4 design choice to the AlphaGo Zero paper (Silver et
 |---|------|---|---|---|---|
 | 1 | **Search algorithm** | PUCT, U(s,a)=c·P(s,a)·√Σ_b N(s,b)/(1+N(s,a)); leaf NN-only (no rollout); virtual loss; tree reuse (Methods §Search algorithm, p.8) | `c_puct=0.05`, `leaf_eval='value_head'`, `tree_reuse=True`; PUCT identical | **Follow** | Stage 2 locked these via tuning; `c_puct=0.05` reflects sharp-AM-prior + smaller action space (N=20 vs Go's 362) |
 | 2 | **MCTS sims/move (training)** | 1,600 (Empirical analysis, p.355) | 50 (pilot) → 100 (main) | **Adapt** | TSP-20 has ~20 plies/game vs Go's ~250; per-game compute scales linearly. K=100 × 20 plies = 2,000 leaf evals/game ≈ AGZ's 1,600/move at much smaller per-step branching. F.3 pilot will confirm |
-| 3 | **Loss** | l = (z−v)² − π·log(p) + c·‖θ‖²; cross-entropy and MSE **weighted equally** (eq. 1, p.355; Methods §Optimization, p.7) | identical; `lambda_v=1.0`; weight_decay=`c=1e-4` via optimizer | **Follow** | Same equation; we route L2 through `optimizer.weight_decay` instead of inline (numerically identical for Adam/SGD) |
+| 3 | **Loss** | l = (z−v)² − π·log(p) + c·‖θ‖²; cross-entropy and MSE **weighted equally** (eq. 1, p.355; Methods §Optimization, p.7); z ∈ {−1, +1} broadcast across all plies | l = (z_t−v(s_t))² − π_t·log(p(·\|s_t)) + c·‖θ‖²; **z_t = per-state V_CURRENT cost-to-go** (not broadcast) | **Adapt (forced by domain)** | TSP cost is continuous; quantizing to ±1 discards the optimization signal. Existing MCTS leaf evaluator (`mcts.py:1-15`) computes `state.lengths/bl_val + v(state)` assuming v predicts remaining cost-to-go — broadcast-z would double-count. Reuses Stage 1's V_CURRENT shape from `value_targets_from_edges` (`utils/tensor_ops.py:57-78`) |
+| 3b | **Policy target π_t** | π_t = σ_t = N(s,·)^{1/τ}/Σ — uses same τ as action selection; one-hot late-game in Go (Methods §Self-play, p.358) | **π_t = N(s,·)/Σ N (raw τ=1 always)**, decoupled from action-selection σ_t (which uses step30) | **Adapt (deliberate)** | TSP-20's late steps have legal_actions(t≥18) ≤ 2; strict-AGZ one-hot late targets carry no information beyond "the chosen action was legal", wasting a distillation signal. Decoupling preserves multimodal MCTS visit information when present. G.4 ablates strict-AGZ coupling |
 | 4 | **Optimizer** | SGD with momentum=0.9; lr step-anneal {1e-2, 1e-2, 1e-3, 1e-4, 1e-4, 1e-4} across thousands-of-steps buckets {0–200, 200–400, 400–600, 600–700, 700–800, >800} (Methods §Optimization, p.7; Ext. Data Table 3, p.18) | **Adam, lr=1e-4 constant** | **Deviate** | Stage 1 warm-start was trained with Adam at 1e-4; switching optimizers from a converged checkpoint risks destabilizing fine-tuned weights. Total Stage 4 mini-batches (~20K) sit entirely in AGZ's final-bucket regime (lr=1e-4) anyway. SGD+momentum is the **F.4 fallback** if val plateaus early; logged as G.8 ablation if pursued |
 | 5 | **Mini-batch size** | 2,048 (32 per worker × 64 workers, Methods §Optimization) | 512 | **Adapt** | Single-GPU; 4× smaller buffer → 4× smaller batch keeps grad-noise scale comparable |
 | 6 | **Replay buffer** | last **500,000 games**, sampled uniformly (Methods §Optimization, p.7); 25K games/iter → ~20-iter window | last **200,000 instances** (~4M tuples); 1K/iter → 200-iter window | **Adapt + monitor** | Smaller absolute size; **but our reuse window is 10× wider in iters than AGZ's**. F.3 pilot will surface staleness; pilot will run with `buffer_capacity=50_000` (~50-iter window, closer to AGZ ratio) and main can scale up only if pilot is stable. KataGo-style power-law windowing (`shuffle.py:418-450`) is the Stage 5 fallback |
 | 7 | **Self-play volume / iter** | 25,000 games/iter (Methods §Self-play, p.8) | 1,000 instances/iter | **Adapt** | Linear-scaled to single-machine compute; total Stage 4 = 100K instances vs AGZ's 4.9M games |
 | 8 | **Train rows / data rows** | not stated explicitly; typical AGZ ratio ≈ 700K mini-batches × 2048 ÷ 4.9M games × 250 plies ≈ 1.2× | F.4: 200 steps × 512 ÷ (1K × 20) = **5.1×** | **Deviate (mild)** | Above AGZ-implicit but at KataGo's documented 4–8× cap (`SelfplayTraining.md` §`MAX_TRAIN_PER_DATA=8`). F.3 pilot watches val curve for over-fitting; reduce `train_steps_per_iter` to 100 if curve plateaus |
-| 9 | **Temperature schedule** | τ=1 for first **30 moves** of each game; τ→0 thereafter (Methods §Self-play, p.8). 30/~250 ≈ 12 % of game length | `step50` = first 50% of N tour-steps (10/20 for TSP-20) | **Deviate (mild)** | Plan's `step50` is more exploratory than AGZ. **New default `step30`** (first ⌈0.3·N⌉ steps = 6/20) added as a closer-to-AGZ option; G.4 ablation now compares `const`, `step30`, `step50`. Defer choice to F.3 pilot evidence |
+| 9 | **Temperature schedule (action selection σ_t)** | τ=1 for first **30 moves** of each game; τ→0 thereafter (Methods §Self-play, p.8). 30/~250 ≈ 12 % of game length | **`step30`** = τ=1 for first ⌈0.3·N⌉ tour-steps = 6/20 for TSP-20; τ→0 thereafter | **Adapt (proportional)** | Closest scaled analog of AGZ's "explore first 12%, exploit rest". `step50` and `const` are G.4 ablations |
 | 10 | **Dirichlet root noise** | ε=0.25, α=0.03 for Go (362 actions); P(s,a)=(1−ε)p_a + εη_a (Methods §Self-play, p.8) | ε=0.25, α=10/N=0.5 for TSP-20 | **Adapt** | Community/KataGo heuristic α≈10/A reproduces AGZ's α≈0.028 at A=362; for TSP-20, 10/20=0.5. ε identical |
 | 11 | **Gating** | 400 games at τ→0; promote if win rate **>55 %** (avoid "noise alone") (Methods §Evaluator, p.8) | paired t-test α=0.05 on val_size=10,000 (Stage 1 `RolloutBaseline.epoch_callback`) | **Adapt** | Stage 1's t-test signature is what we already trust; effectively a similar gate at TSP scale (lower variance per instance than per game). G.5.b ablation: replace t-test with explicit "≥55 % win rate AND mean cost improvement ≥ 0.0005" rule |
 | 12 | **Reject behavior** | candidate dropped, best player retained for self-play; trainer continues with current weights (Methods §Self-play training pipeline, p.7-8) | identical (scope decision 3) | **Follow** | |
@@ -59,7 +60,7 @@ This table pins every Stage 4 design choice to the AlphaGo Zero paper (Silver et
 
 ## Recommended approach (one paragraph)
 
-A thin `MCTSCoach` orchestrator (`src/am_baseline/training/coach.py`) drives an iterative loop on TSP-20: **(1) generate** — the *best* model produces M=1000 random TSP-20 instances per iteration with `CppBatchMCTSSolver` configured for self-play (`leaf_eval='value_head'`, `temperature=1.0` for first 50% of tour-steps then 0, `dirichlet_epsilon=0.25`, `dirichlet_alpha=0.5` for N=20); **(2) distill** — push (state_t, π_t, z) tuples into a deque-based replay buffer (capacity ~200K instances), sample mini-batches, and train one epoch with `loss = (z − v)² − π·log(p) + c·||θ||²` where π is the MCTS root visit distribution and p is the network's policy at the same state; **(3) gate** — every G=5 iterations evaluate the candidate model via greedy rollout against the current best on a frozen 10K-instance validation set, paired t-test α=0.05, accept on win. Warm-start from Stage 1's canonical TSP-20 checkpoint. The visit-count exposure problem (MCTS currently discards root.N after picking an action) is solved with an opt-in `MCTSConfig.return_root_visits` flag plus a side-effect attribute `solver.root_visit_dists`, mirroring Stage 3's instrumentation pattern; the C++ side already retains the per-step `root` pointer and just needs to dump `root.n_visits` at the right moment.
+A thin `MCTSCoach` orchestrator (`src/am_baseline/training/coach.py`) drives an iterative loop on TSP-20: **(1) generate** — the *best* model produces M=1000 random TSP-20 instances per iteration with `CppBatchMCTSSolver` configured for self-play (`leaf_eval='value_head'`, `temperature_schedule='step30'` — τ=1 for first ⌈0.3·N⌉ steps then τ=0, `dirichlet_epsilon=0.25`, `dirichlet_alpha=0.5` for N=20); **(2) distill** — push per-step (state_t, π_t, z_t) tuples into a flat-tensor replay buffer (capacity ~200K instances ≈ 4M per-step records), sample mini-batches, and train with `loss = (z_t − v_θ(s_t))² − π_t·log(p_θ(·|s_t)) + c·||θ||²` where **π_t = N(s_t,·)/Σ N (raw normalized visits, τ=1 always)** is the training target — distinct from the action-selection distribution σ_t which uses step30 — and **z_t = (tour_cost − lengths_t) / bl_val(x; θ★)** is the **per-state cost-to-go (V_CURRENT)** matching Stage 1's value-head training shape and `mcts.py:1-15` leaf-evaluator invariant; **(3) gate** — every G=5 iterations evaluate the candidate model via greedy rollout against the current best on a frozen 10K-instance validation set, paired t-test α=0.05, accept on win. Warm-start from Stage 1's canonical TSP-20 checkpoint. The visit-count exposure problem (MCTS currently discards root.N after picking an action) is solved with an opt-in `MCTSConfig.return_root_visits` flag plus a side-effect attribute `solver.root_visit_dists`, mirroring Stage 3's instrumentation pattern; the C++ side already retains the per-step `root` pointer and just needs to dump `root.n_visits` at the right moment.
 
 ---
 
@@ -82,9 +83,12 @@ A thin `MCTSCoach` orchestrator (`src/am_baseline/training/coach.py`) drives an 
 **A.3 C++ batched (`cpp_batch`)** — same pattern in `BatchSearch`, but the per-step root pointer is held per-instance in the cross-instance scheduler. Dump each tree's `root->n_visits` after that tree's `pick_root_action`; emit as `raw["root_visit_dists_per_instance"]: list[list[list[tuple[int,int]]]]`. Plumb through `_solve_chunk` to populate `self.root_visit_dists_per_instance: list[list[dict]]`. ~30 LOC C++ + ~10 LOC python.
 
 **A.4 Validation runs** (no new compute):
-- **A.4.a** Re-run TSP-20 K=200 rollout MCTS on 20 instances with `return_root_visits=True`. Assert per-step visit dicts have `Σ N[a] ≤ K + 1` (one root visit + K simulations through the root). Assert argmax of returned dist equals the chosen tour action when `temperature=0`.
-- **A.4.b** Bit-equivalence: run the same instance with `python` and `cpp` backends, both with `return_root_visits=True`. Assert per-step visit dicts match exactly (visit counts are integers, no fp drift).
-- **A.4.c** Smoke A12 extension in `src/scripts/smoke_mcts.py`: add A13 covering `return_root_visits=True` for both `value_head` and `rollout` leaf eval, both `python` and `cpp` backends, including a `cpp_batch` slice.
+- **A.4.a (legality, tree-reuse-on, the production config).** TSP-20 K=200 rollout MCTS on 20 instances with `return_root_visits=True`, `tree_reuse=True`. Per-step assertions: (i) `pi_t = N(s_t,·)/Σ N` sums to 1 within float tolerance; (ii) `pi_t[a] = 0` for every visited city (this is the *correctness* invariant — we never want to train the policy on a visited-city action); (iii) **`support(pi_t) ⊆ unvisited(s_t)`** (subset, not equality) — PUCT may legitimately leave some unvisited cities with N=0 at low K or under a sharp prior + small `c_puct`, so legal-but-unexplored actions get zero mass; (iv) `argmax(pi_t)` is a legal action (i.e., unvisited); (v) no inf/nan; (vi) `pi_t` is non-negative everywhere. **Do NOT assert `Σ N ≤ K + 1`** — under tree reuse, the root inherits its predecessor subtree's visits, so total root visits routinely exceed K. The cumulative bound is a feature, not a bug.
+- **A.4.b (exact-count, tree-reuse-off).** Same instance with `tree_reuse=False, K=200`. Assert `Σ_a N(s_t, a) == K` exactly at every tour-step. (Both backends only increment `parent.N[a]` once per simulation in backup — `mcts.py:288`, `mcts_cpp/mcts.cpp:498` — and there is no stored separate "root visit" count, so total edge visits at the root equal the simulation count exactly.) This validates the visit-counting code is correct in isolation.
+- **A.4.c (bit-equivalence python vs cpp — DETERMINISTIC SETTINGS ONLY).** Run the same instance with `python` and `cpp` backends, both with `return_root_visits=True`, `tree_reuse=True`, **`dirichlet_epsilon=0.0`** (no Dirichlet noise — priors are byte-identical from the shared model), **`temperature=0.0` for all steps** (greedy argmax — no multinomial action sampling). Under these settings both backends consume zero RNG state during search, so trees are identical iff their deterministic logic (PUCT, FPU, expand/backup, tree-reuse advance) agrees. Assert per-step visit dicts match exactly (integer counts, no fp drift). Matches Stage 3's existing canonical-cost bit-equivalence pattern.
+
+  **Why the deterministic clamp is required.** With `dirichlet_epsilon>0`, Python's `np.random.dirichlet` (Mersenne Twister) and C++'s `std::gamma_distribution` produce different bit patterns even at the same seed → priors diverge → trees diverge despite both implementations being correct. With `temperature>0`, multinomial action sampling diverges similarly. **Equality of `pi_t` between backends under the production self-play config (Dirichlet on, `step30`) is NOT a correctness invariant** — only distributional equivalence is, which a smoke test does not check.
+- **A.4.d (smoke harness extension).** Add A13 in `src/scripts/smoke_mcts.py` covering `return_root_visits=True` for both `value_head` and `rollout` leaf eval, both `python` and `cpp` backends, including a `cpp_batch` slice. Use the legality/support invariants from A.4.a (production config — applied to each backend *independently*, no cross-backend equality claim). One A13 sub-case toggles `tree_reuse=False` for the A.4.b exact-count check; another sub-case clamps `dirichlet_epsilon=0` and `temperature=0` for the A.4.c bit-equivalence check.
 
 **Code reuse:** Builds on Stage 3 Phase A's `fwd_count_*` instrumentation pattern (mcts.py:113-115; solver.py:53-72).
 
@@ -98,12 +102,48 @@ A thin `MCTSCoach` orchestrator (`src/am_baseline/training/coach.py`) drives an 
 
 **Goal:** Implement the data structure and training step that consume MCTS targets, in isolation from the coach loop.
 
-**B.1 `MCTSReplayBuffer`** — new module `src/am_baseline/training/coach.py` (~120 LOC for this class).
-- Storage: a deque-of-instances, each instance holding `coords: (N, 2)` plus a list of `(step, visited_mask, first, prev, length, pi_t, z)` per-step records. Per-instance keying avoids the N× duplication of the (N, 2) coordinate tensor.
-- Capacity: `capacity_instances` (default 200K instances → ~4M tuples at TSP-20).
-- Eviction: drop oldest *instance* (and all its tuples) on overflow.
-- Sampling: `sample(batch_size) → (coords_batch, step_batch, visited_batch, first_batch, prev_batch, length_batch, pi_batch, z_batch)` — uniform over tuples.
-- Persistence: `save(path)` / `load(path)` via `torch.save` of a flat dict-of-tensors. Useful for resume.
+**B.1 `MCTSReplayBuffer`** — new module `src/am_baseline/training/coach.py` (~150 LOC for this class).
+- **Storage: flat dict-of-pre-allocated-tensors** (not Python deque-of-objects — millions of small Python tuples explode in tensor-header overhead at ~600 B/tensor × 4M tuples = 2.4 GB of headers alone).
+  ```
+  buffer = {
+    # Per-instance (capacity_instances = 200_000):
+    'coords':       (capacity_instances, N, 2)   float32,
+    'bl_val':       (capacity_instances,)        float32,  # FROZEN at instance-push time, never refreshed
+    'tour_cost':    (capacity_instances,)        float32,
+
+    # Per-step (capacity_tuples = capacity_instances * N ≈ 4M):
+    'pi':           (capacity_tuples, N)         float32,  # raw τ=1 normalized visits
+    'visited':      (capacity_tuples, N)         bool,
+    'first_a':      (capacity_tuples,)           int16,
+    'prev_a':       (capacity_tuples,)           int16,
+    'lengths':      (capacity_tuples,)           float32,  # cumulative cost so far
+    'cost_to_go':   (capacity_tuples,)           float32,  # tour_cost - lengths
+    'inst_idx':     (capacity_tuples,)           int32,    # back-pointer to coords row
+  }
+  ```
+  Total ~520 MB pre-allocated. Fixed footprint, no Python-object overhead. Pattern matches KataGo's `python/shuffle.py` and AGZ-replicas.
+- **Capacity:** `capacity_instances` (default 200K instances → ~4M tuples at TSP-20).
+- **Eviction:** ring-buffer write head with `inst_idx % capacity_instances`; tuple slots `(inst_idx * N + step) % capacity_tuples`. Drops oldest instance + all its tuples atomically.
+- **Auxiliary index `_step_index: list[np.ndarray]`** (length N). `_step_index[t]` is the array of tuple-slot indices currently filled with step==t. Updated on every push (append the new tuple slot) and on every eviction (drop the oldest tuple slot for that step). Enables O(1) stratified sampling without scanning the whole buffer.
+- **All N per-step records are stored, including the final forced step.** No "skip when `legal_actions == 1`" — that mitigation conflicts with the dense layout (would require a `valid_mask` + rejection sampling or a variable-length `_step_index`). Late-step records carry near-zero policy gradient (CE between two near-identical one-hot distributions is small and finite), but the value-loss MSE is still informative. Matches AGZ Methods §Self-play, which stores tuples for every step up to termination.
+- **Sampling — stratified by step (fixes mixed-step decoder bug).** `sample(batch_size) → (state_i_scalar, coords_batch, visited_batch, first_batch, prev_batch, lengths_batch, pi_batch, z_batch)`:
+  ```python
+  step = np.random.randint(0, self.N)               # one scalar step per minibatch
+  step_indices = self._step_index[step]             # all tuple slots at this step
+  n_at_step = step_indices.shape[0]
+  if n_at_step < batch_size:
+      idx_within = np.random.randint(0, n_at_step, batch_size)   # with replacement (fresh buffer)
+  else:
+      idx_within = np.random.choice(n_at_step, batch_size, replace=False)
+  idx = step_indices[idx_within]
+  # Fancy-index per-step tensors at idx; per-instance tensors (coords, bl_val) at inst_idx[idx].
+  z_batch = cost_to_go[idx] / bl_val[inst_idx[idx]]
+  return {'state_i': step, 'coords': coords[inst_idx[idx]], ...}   # state_i is a SCALAR
+  ```
+  **Why stratified.** AM's decoder takes a single scalar `state.i` per `decode_step` call (`state.py:5-19`), with first-step branching that conditions on `state.i == 0` vs `> 0`. A uniform-over-tuples batch can mix step 3, 17, 9 records under one `state.i`, which silently produces wrong `log_p` distributions on the misaligned rows. Stratification picks one step per minibatch — every row's step matches the decoder's scalar `state.i`. Marginal distribution over (instance, step) across many train steps remains uniform; expectation of the gradient is unchanged; only per-batch variance is slightly higher (negligible at J=200 train steps × N=20 steps → ~10× coverage per step per iter). Pattern matches AGZ-style replicas (OpenSpiel, ELF OpenGo).
+- **`z_batch = cost_to_go[idx] / bl_val[inst_idx[idx]]`** — both terms are frozen-at-generation, so the per-instance training target $z_t$ is **stationary across all training steps that draw this record**.
+- **`bl_val` is frozen at instance-push time and never refreshed.** When `generate_self_play_batch(θ★, ...)` produces an instance, it computes `bl_val = cost(greedy_rollout(θ★, x))` once and writes it to the per-instance row alongside `tour_cost`. The owning θ★ may be superseded later by a gate accept; this does not invalidate the stored `bl_val`. Rationale: per-state $z_t$ + frozen `bl_val` makes the training target fully stationary per record, eliminating the moving-target concern (spec §3.5 Concern 1) without an `owner_id`-tagged refresh code path. The only "drift" is buffer-level: newer instances were generated under stronger θ★ and have smaller `bl_val`, so their $z_t$ is on a slightly different scale than older ones — but this is the *correct* mixture of "policy-iteration progress evidence" the loop is designed to learn from, not a bug.
+- **Persistence:** `save(path)` / `load(path)` via `torch.save` of the dict. `n_filled_tuples` and the write head are part of the dict.
 
 **B.2 State-tensor reconstruction utility** in the same file (~50 LOC).
 - Given a buffer record, reconstruct the `StateTSP` named-tuple needed by `model.decoder.decode_step`.
@@ -115,35 +155,46 @@ A thin `MCTSCoach` orchestrator (`src/am_baseline/training/coach.py`) drives an 
 Signature: `train_step_alphazero(model, optimizer, batch, opts) → dict`.
 
 ```
-# Pseudocode
-encoded = model.encode(coords_batch)                    # (B, N, embed_dim)
-fixed = model.precompute_decoder(encoded)               # AttentionModelFixed
-state = reconstruct_state(coords_batch, step_batch, ...)  # StateTSP-like
-log_p, mask, glimpse = model.decode_step(fixed, state, return_glimpse=True)
-                                                        # log_p: (B, 1, N); glimpse: (B, embed_dim)
-v = model.value_head(glimpse)                           # (B,)
+# Pseudocode. batch is the dict returned by buffer.sample(B):
+#   state_i  : scalar int (the single step value for this minibatch — stratified)
+#   coords   : (B, N, 2) float32
+#   visited  : (B, N) bool         — all aligned to state_i
+#   first_a, prev_a, lengths : (B,)   — all aligned to state_i
+#   pi       : (B, N) float32      — raw τ=1 normalized visits at step state_i
+#   z        : (B,)   float32      — cost-to-go / bl_val at step state_i
 
-# Policy distillation cross-entropy. pi_batch is masked-zero on visited cities.
+encoded = model.encode(batch['coords'])                  # (B, N, embed_dim)
+fixed = model.precompute_decoder(encoded)                # AttentionModelFixed
+state = reconstruct_state(batch, i=batch['state_i'])     # StateTSP NamedTuple, state.i = scalar
+log_p, mask, glimpse = model.decode_step(fixed, state, return_glimpse=True)
+                                                        # log_p: (B, 1, N); mask: (B, 1, N); glimpse: (B, embed_dim)
+log_p = log_p.squeeze(1)                                 # (B, N) — strip decoder's per-step axis
+mask  = mask.squeeze(1)                                  # (B, N) — match pi shape, avoid (B,B,N) broadcast
+v = model.value_head(glimpse)                            # (B,)
+
+# Policy distillation cross-entropy. batch['pi'] is (B, N), masked-zero on visited cities.
 # log_p has -inf at masked positions; replace with 0 to avoid 0 * -inf = NaN.
 log_p_safe = torch.where(mask, torch.zeros_like(log_p), log_p)
-policy_loss = -(pi_batch * log_p_safe).sum(dim=-1).mean()
+policy_loss = -(batch['pi'] * log_p_safe).sum(dim=-1).mean()
 
-# Value loss.
-# Z = bl_val cached per instance — recompute via greedy rollout once per epoch.
-target_v = (z_batch / Z_batch)
-value_loss = F.mse_loss(v, target_v)
+# Value loss — per-state V_CURRENT (cost-to-go), matching Stage 1's target shape
+# and the leaf-evaluator invariant in `mcts.py:1-15`.
+# batch['z'] = cost_to_go[idx] / bl_val[inst_idx[idx]] computed at sample time.
+value_loss = F.mse_loss(v, batch['z'])
 
 # Total. L2 handled via optimizer.weight_decay (not in this loss).
 loss = policy_loss + opts.lambda_v * value_loss
 ```
 
 **Design choices:**
-- **Per-step π distillation, per-step z target.** Each tour-step contributes a (state, π, z) tuple. π_t is the MCTS visit distribution at *that* step's root; z is the realized full-tour cost (broadcast across all N steps of the instance). Per-step cost-to-go (`value_targets_from_edges` from `tensor_ops.py:57-78`) is a Stage 5 alternative.
+- **Per-step π distillation target.** π_t = N(s_t, ·) / Σ N (raw τ=1 normalized visits, *not* the τ-tempered action-selection distribution σ_t). See spec §4.2 — choice (B): action selection uses step30, training target stays τ=1 for richer late-game distillation signal.
+- **Per-step V_CURRENT value target (NEW — was broadcast `z` in earlier plan rev).** z_t = (tour_cost − lengths_t) / bl_val matches Stage 1's `value_targets_from_edges` shape (`utils/tensor_ops.py:57-78`). Why: existing MCTS leaf evaluator computes `total_norm = state.lengths/bl_val + v(state)`, which assumes v predicts remaining cost-to-go. Training v on broadcast full-tour cost would double-count path cost at MCTS time. Per-state z_t makes Phase A's leaf evaluator a no-op vs Stage 3.
 - **L2 via `optimizer.weight_decay`.** Cleaner than computing `c·||θ||²` inside the loss. Default `weight_decay=1e-4`.
-- **`bl_val` re-computation cadence.** Once per training epoch. Uses the *current* model (greedy rollout on the buffer's instances, batched). The `bl_val` for a buffer instance can drift across epochs as the model improves — re-computing keeps Z self-consistent.
+- **`bl_val` from θ★, frozen at generation** — `generate_self_play_batch` in Phase C computes `bl_val(x) = cost(greedy_rollout(θ★, x))` at self-play time and stores it alongside `tour_cost` in the buffer's per-instance row. Same model that produced the tour produces the normalization. **No recomputation, no refresh** — when θ★ is superseded by a gate accept, existing buffer entries retain their original `bl_val`. The per-state $z_t = (\text{tour\_cost} - \text{lengths}_t)/\text{bl\_val}$ for any given buffer record is therefore **stationary across the record's entire lifetime**, eliminating the moving-target concern of broadcast-z designs.
 
 **B.4 Smoke unit test** — `src/scripts/smoke_alphazero.py` (~150 LOC; staged across phases).
-- A1: construct a 5-instance buffer manually (random pi_t, random z), run one `train_step_alphazero`, verify loss is finite, gradients flow into encoder + value_head + decoder.
+- **A1**: construct a 5-instance buffer manually (random pi_t, random z), run one `train_step_alphazero`, verify loss is finite, gradients flow into encoder + value_head + decoder.
+- **A1.5 (stratification)**: call `buffer.sample(batch_size=8)` repeatedly (≥30 calls); assert every returned batch has all rows aligned to the same scalar `state_i` value (i.e., the per-row reconstruction tensors are internally consistent). Assert that across the 30 calls, every step value 0..N-1 appears at least once (uniform-step coverage). Assert `pi_batch[r, a] == 0` for every visited city `a` per row `r` (correctness invariant — never train on visited-city actions); assert `pi_batch.sum(-1)` is 1 within float tolerance; assert `pi_batch >= 0` everywhere. **Do NOT** assert that every unvisited city has positive `pi_batch` mass — at low K or sharp priors, PUCT can leave legal actions unexplored (N=0 → π=0).
 
 **Code reuse:** value-target normalization machinery from `trainer.py:208-219` (the `bl_val.unsqueeze(-1)` Z pattern); decoder API from `attention_model.py:precompute_decoder, decode_step`.
 
@@ -166,13 +217,13 @@ def make_self_play_config(graph_size, n_simulations) -> MCTSConfig:
         leaf_eval='value_head',                  # AlphaGo Zero canonical
         value_norm='bl',
         c_puct=0.05,
-        temperature=1.0,                         # see Phase E (per-step decay)
-        temperature_schedule='step50',           # τ=1 for first N/2 steps, τ=0 after
+        temperature=1.0,                         # base τ for the schedule
+        temperature_schedule='step30',           # τ=1 for first ⌈0.3·N⌉ steps, τ=0 after (AGZ-proportional)
         dirichlet_alpha=10.0/graph_size,         # 0.5 for N=20
         dirichlet_epsilon=0.25,                  # AlphaGo Zero standard
         fpu_mode='running_q', fpu_fallback=-1.0,
         root_select='visits', tree_reuse=True,
-        return_root_visits=True,
+        return_root_visits=True,                 # exposes raw N(s_t, ·) for π_t target (τ=1 always)
     )
 ```
 
@@ -181,23 +232,46 @@ def make_self_play_config(graph_size, n_simulations) -> MCTSConfig:
 **C.2 Generator function** in `coach.py` (~120 LOC).
 
 ```python
-def generate_self_play_batch(model, M, graph_size, cfg, device) -> list[InstanceRecord]:
+def generate_self_play_batch(best_model, M, graph_size, cfg, device) -> list[InstanceRecord]:
     instances = TSP.make_dataset(size=graph_size, num_samples=M)
     coords = torch.stack([inst for inst in instances]).to(device)   # (M, N, 2)
-    solver = CppBatchMCTSSolver(model, cfg, device, mcts_batch_size=64)
-    costs, tours = solver.solve_batch(coords)
+
+    # bl_val from θ★ (the model that will run MCTS) — frozen for the lifetime of this batch.
+    # Cleaner than computing bl_val from the trainer's evolving θ; see spec §3.5 Concern 2.
+    with torch.no_grad():
+        best_model.set_decode_type('greedy')
+        bl_costs, _ = best_model(coords)
+        bl_val = bl_costs.cpu()                                     # (M,) float32
+
+    solver = CppBatchMCTSSolver(best_model, cfg, device, mcts_batch_size=64)
+    tour_costs, tours = solver.solve_batch(coords)
     visits = solver.root_visit_dists_per_instance                   # list[list[dict]]
 
     records = []
     for i in range(M):
-        z = costs[i].item()
+        tour_cost = tour_costs[i].item()
         tour = tours[i].cpu().numpy()
+        # Edge costs along the played tour (closing edge included as edge_costs[N-1]).
+        edge_costs = compute_edge_costs(coords[i].cpu().numpy(), tour)  # (N,) float32
+        # V_CURRENT at each step: cost of edges still to be traversed FROM s_t.
+        # value_targets_from_edges in utils/tensor_ops.py:57-78 produces this exact shape;
+        # equivalent to (tour_cost - lengths_t) for t ∈ {0..N-1}.
+        cost_to_go = value_targets_from_edges(torch.from_numpy(edge_costs).unsqueeze(0)).squeeze(0).numpy()  # (N,)
+
         per_step = []
         for t in range(graph_size):
-            visited = (np.arange(graph_size) <= t-1) [the cities at tour[:t]]
-            pi_t = normalize_visit_dict(visits[i][t], graph_size)   # (N,) float32
-            per_step.append((t, visited_mask, first, prev, length, pi_t, z))
-        records.append(InstanceRecord(coords=coords[i].cpu(), per_step=per_step))
+            visited_mask = mask_from_tour(tour[:t], graph_size)         # (N,) bool
+            pi_t = normalize_visit_dict(visits[i][t], graph_size)       # (N,) float32, τ=1 normalized
+            length_t = edge_costs[:max(0, t-1)].sum() if t > 0 else 0.0  # state.lengths at step t
+            per_step.append({
+                'visited': visited_mask, 'first': tour[0] if t > 0 else -1,
+                'prev': tour[t-1] if t > 0 else -1, 'lengths': length_t,
+                'pi': pi_t, 'cost_to_go': cost_to_go[t],
+            })
+        records.append(InstanceRecord(
+            coords=coords[i].cpu(), bl_val=bl_val[i].item(), tour_cost=tour_cost,
+            per_step=per_step,
+        ))
     return records
 ```
 
@@ -285,6 +359,8 @@ class MCTSCoach:
 
 **Code reuse:** `RolloutBaseline.epoch_callback` (`baselines.py:106-123`) handles the entire t-test gating verbatim — same paired t-test α=0.05 logic Stage 1 uses; `validate` (`trainer.py:13-19`) for the val curve; `MetricsLogger` (`logging.py`) for W&B plumbing.
 
+**CLI / init-order trap (caught at review).** `RolloutBaseline.__init__` constructs and caches its validation dataset using `opts.val_size` *at construction time*; subsequent calls to `epoch_callback` do not re-read this value. Therefore: `MCTSCoach.__init__` must construct `RolloutBaseline(model, problem, opts, ...)` *after* `opts.val_size` has been finalized from the CLI. There is no Stage-4-specific `gate_val_size` flag — `opts.val_size` is the single source of truth for the gating dataset size, inherited from Stage 1's CLI conventions. Smoke tests that need a smaller validation set pass `--val_size 100` directly.
+
 **Wall-clock:** 1.5 days dev.
 
 **Dependencies:** Phases A, B, C.
@@ -306,7 +382,9 @@ class MCTSCoach:
 
 **Justification for `step30` as default:** TSP tour permutations have most policy entropy in the early steps (first city → second city has N-1 candidates with similar Q); the last few cities are forced or near-forced. AGZ's pattern is "explore early, exploit late" — first 12 % of game uses τ=1, rest τ=0. For TSP-20 the N-step game is 12.5× shorter than Go, so a fixed-percentage analog (`step30`) gives ~6 of 20 plies of exploration, leaving 14 deterministic plies. `step50` is the more aggressive variant we initially proposed; G.4 ablates the two against `const`.
 
-**E.3 Validation** — extend smoke A3: TSP-20 K=50 self-play with `temperature_schedule='step30'`, plot per-step root entropy of N visit distribution; verify it decays sharply at step ⌈0.3·N⌉ = 6 and stays at zero thereafter.
+**E.3 Validation** — extend smoke A3: TSP-20 K=50 self-play with `temperature_schedule='step30'`. **Two distributions to verify separately:**
+- **Action-selection σ_t** (used to sample the played action): entropy decays sharply at step ⌈0.3·N⌉ = 6; collapses to one-hot (entropy = 0) thereafter.
+- **Training target π_t = N/Σ N** (raw τ=1 normalized, stored in buffer): entropy stays bounded above zero throughout — only collapses to one-hot when MCTS visit counts themselves become degenerate (last 1-2 plies where legal_actions = 1). Per choice (B) in spec §4.2: π_t is decoupled from the τ-schedule.
 
 **Wall-clock:** 0.5 day dev. Negligible compute.
 
@@ -328,7 +406,7 @@ class MCTSCoach:
   - `--train_steps_per_iter` (default 200) — minibatch updates per iteration
   - `--batch_size` (default 512)
   - `--gate_every` (default 5)
-  - `--gate_val_size` (default 10000)
+  - **No `--gate_val_size`** — `RolloutBaseline.__init__` reads `opts.val_size` once at construction time and freezes the validation set; a dedicated `--gate_val_size` flag would be a silent no-op unless we monkey-patch `opts.val_size` before the baseline is built. Stage 4 reuses Stage 1's existing `--val_size` (default 10000) for the gating dataset; override with `--val_size 100` for smoke tests.
   - `--temperature_schedule {const,step30,step50}` (default `step30` — closest to AGZ Methods §Self-play, scaled to TSP plies)
   - `--dirichlet_epsilon` (default 0.25)
   - `--dirichlet_alpha_factor` (default 10.0; α = factor / N)
@@ -342,8 +420,8 @@ class MCTSCoach:
 **F.2 Smoke battery `src/scripts/smoke_alphazero.py`** (~200 LOC, totaling A1-A6).
 - A1 (Phase B): construct a 5-instance buffer, run `train_step_alphazero` once → finite loss, gradients flow.
 - A2 (Phase C): generate 10 instances with K=20, verify π_t shape + sum.
-- A3 (Phase E): self-play with `temperature_schedule='step50'` produces decaying per-step entropy.
-- A4: visit-count consistency at K=50: `Σ_t Σ_a N[a] ≤ K · N` for one instance.
+- A3 (Phase E): self-play with `temperature_schedule='step30'`. Action-distribution σ_t entropy decays sharply at step ⌈0.3·N⌉=6 (collapses to one-hot thereafter); training-target π_t entropy stays bounded above zero throughout (because π_t is always τ=1 normalized, decoupled from σ_t per spec §4.2 choice B).
+- A4 (tree_reuse=True, production config): legality/support/finiteness checks on `pi_t` at each tour-step — sums to 1, **support(pi_t) ⊆ unvisited(s_t)** (subset; legal-but-unexplored actions may have N=0 → π=0), `argmax` is unvisited, no inf/nan, non-negative. No cumulative-count bound (tree reuse makes `Σ_t Σ_a N(s_t, a)` grow above K·N legitimately). A4-strict (tree_reuse=False, K=50): `Σ_a N(s_t, a) == K` at every step (one increment per simulation, no stored root-node visit).
 - A5: gating no-op when `gate_every > n_iterations` → no `epoch_callback` calls.
 - A6: 3 iterations end-to-end with M=10, K=20 → no NaN, val_avg_cost finite, checkpoint round-trips through `--resume_from`.
 
@@ -384,9 +462,9 @@ class MCTSCoach:
 | **G.1** Leaf eval: `rollout` vs `value_head` | F.4 recipe with `leaf_eval='rollout'` | ~3 h | The defining AlphaGo-Zero choice; head-to-head test |
 | **G.2** Buffer capacity | 50K vs 200K vs 500K | 3× ~2 h | Catastrophic forgetting check |
 | **G.3** Dirichlet ε ∈ {0, 0.15, 0.25, 0.4} | 4 small TSP-20 runs (50 iter) | 4× ~1 h | Optimal exploration mass |
-| **G.4** Temperature: `const` vs `step50` | small TSP-20 runs | 2× ~1 h | Schedule efficacy |
+| **G.4** Temperature schedule + target coupling: `const`, `step30` (default), `step50`; AND **strict-AGZ** (training target π_t uses same τ_t as σ_t — one-hot late targets) vs **decoupled** (π_t always τ=1 — F.4 default, choice B) | small TSP-20 runs | 4× ~1 h | Schedule efficacy + late-game distillation signal richness (TSP-20's deterministic late steps may make strict-AGZ one-hot a wasted signal vs richer τ=1 raw visits) |
 | **G.5** Gating cadence: gate every 1/5/10 | 3 small runs | 3× ~1 h | Interaction with reject-policy |
-| **G.6** Per-step cost-to-go target instead of broadcast z | small TSP-20 run | ~1 h | Value-target shape |
+| **G.6** Best-so-far per-instance value normalization (replaces original "cost-to-go vs broadcast z" — cost-to-go is now the F.4 default) | $z_t = (\text{tour\_cost} − \text{lengths}_t) / \min_\text{seen} \text{tour\_cost}(x)$ | ~1 h | Value-target normalization shape; tracks instance-level best instead of model's `bl_val` |
 | **G.7** Symmetry augmentation at leaf eval | random 2D rotation+flip of coords pre-encoder | ~1 h | AGZ Methods §Search algorithm: dihedral aug at every leaf eval (8-fold). TSP analog is continuous SO(2) × {flip} |
 | **G.8** Optimizer: Adam vs SGD+momentum 0.9 | F.4 recipe with SGD+momentum, lr=1e-3 | ~3 h | AGZ canonical optimizer; checks whether Adam-from-warmstart is leaving signal on the table |
 
@@ -402,13 +480,19 @@ Run only the ablations relevant to the user's interpretation of F.4 results. **G
 
 **TSP-20 main run (Phase F.4):**
 
-1. ✅ **Sample efficiency.** Stage 4 reaches val_avg_cost ≤ 3.83943 (Stage 1 canonical bs=512 final) at fewer total instances than Stage 1 (Stage 1 = 100 epochs × 1.28M = 128M instances). Plot shows the Stage 4 curve crosses Stage 1's final-val line *strictly to the left* of x = 128M.
+1a. ✅ **Marginal improvement (warm-start signal).** Stage 4's final val_avg_cost is strictly better than its starting checkpoint by ≥ 0.001: `val_avg_cost(θ_iter100) ≤ 3.83843` (Stage 1 final 3.83943 minus 0.001 noise band). This is the AGZ-loop-improves-on-REINFORCE test, and is what Stage 4 is designed to demonstrate.
+
+1b. ⚠️ **Strict total sample efficiency** (proposal-headline claim, requires careful interpretation). The combined (Stage 1 + Stage 4) sample-efficiency curve, plotted with x-axis = cumulative training instances seen across both stages, should reach Stage 1's final val_avg_cost (3.83943) at total instances < 128M (Stage 1 alone). Because Stage 4 warm-starts from the Stage 1 endpoint, this is trivially true at x = 128M + 1 (Stage 4 has only added improvements). The *meaningful* form is: at any matched x in the overlap region, Stage 1 + Stage 4 ≤ Stage 1 alone. Headline plot must annotate this clearly. **Strict from-scratch sample efficiency** (Stage 4 starting from random weights, comparing total instances to Stage 1's curve) is a Stage 5 follow-up — current Stage 4 *cannot* claim it.
+
 2. ✅ **Ultimate quality.** Stage 4 final greedy val_avg_cost ≤ 3.8312 (Stage 3 K=400 rollout MCTS) — i.e., Stage 4's network alone (no MCTS at test time) matches Stage 3's search-augmented Stage 1 result. Equivalently, Stage 4 collapses the test-time gap between greedy and MCTS-K=400 rollout to within noise.
+
 3. ✅ **Self-improvement.** val_avg_cost curve over iterations is monotone non-increasing within a ±0.001 noise band.
+
 4. ✅ **Gating fires.** `gating_baseline.epoch_callback` returns `True` at least once over the 20 gating events.
 
 **Reach (Stage 5 stretch):**
 - TSP-20 final greedy val_avg_cost ≤ 3.8298 (= 0.05% gap vs Gurobi optimum 3.8279) — proposal target.
+- Strict from-scratch sample efficiency (criterion 1b at random init) — needs Stage 5 from-scratch run.
 
 ---
 
@@ -468,7 +552,7 @@ These are knobs that the F.3 pilot will surface evidence on. Defaults selected; 
 
 1. **`return_root_visits` C++ marshalling overhead.** At TSP-20 K=100 with 20 steps, that's 20 list-of-≤20 allocs per instance × 1000 instances/iter. Mitigation: return as a flat numpy array `(n_instances, n_steps, n_legal_actions)` of int32 (zero-padded); deserialize once on the Python side. Profile before/after Phase A; expected overhead < 1% of total iter time.
 2. **Replay buffer staleness.** If gating rejects 5+ candidates in a row, the buffer's older slices were drawn under outdated policies. Mitigation: track `gate_fail_streak` in logs; F.3 will surface the worst-case. Stage 5 ablation: window-scaling with size proportional to total instances seen.
-3. **π_t entropy collapse late in tour.** As legal_actions(t) → 1, the visit dist becomes degenerate and the KL `−π·log(p)` is trivially zero (or ill-defined). Mitigation: skip per-step records when `legal_actions == 1`. Confirm in F.3 smoke that the loss is well-formed.
+3. **π_t entropy collapse late in tour.** As legal_actions(t) → 1, the visit dist becomes degenerate (one-hot on the forced action). The CE term `−π_t · log p_θ(·|s_t)` is *not* ill-defined: the AM decoder's legality mask makes `log p_θ(·|s_t)` sharp on the same forced action, so CE is finite and small (essentially zero gradient on the policy at this step). Original plan revision included a "skip records with `legal_actions == 1`" mitigation, but **that conflicts with the dense `capacity_instances * N` ring-buffer layout** (skipping leaves uninitialized slots that sampling could hit, requiring either a `valid_mask` with rejection sampling or a packed `_step_index` with variable per-instance counts — both materially complicate the buffer). **Resolution: keep all N per-step records.** Late-step trivial CE is not a bug; AGZ stores tuples for every step up to termination too (Methods §Self-play). The wasted compute is ~5% of records carrying near-zero gradient — acceptable cost for a clean dense buffer. F.3 smoke confirms the loss stays finite and free of NaN at the trivial steps.
 4. **Off-policy R² collapse on novel states.** Stage 3 E.1 found R²=0.9949 on MCTS-visited states drawn from the *Stage 1* model. If Stage 4 explores meaningfully different regions, value-head accuracy might drop, slowing distillation. Mitigation: log per-iteration value loss (B.3 dict output); if value loss diverges relative to Stage 1's, switch to rollout leaf eval (G.1) or per-step cost-to-go target (G.6).
 5. **Gating false-rejects on small ε signal.** Early iterations may differ from best by < 0.001 — within the t-test's noise floor on val_size=10K. Mitigation: log val_avg_cost every iteration even when gating doesn't run, so the headline curve is monotone-trackable independent of gating cadence. Per scope decision 3, gating rejection does not roll back trainer weights — so false-rejects don't penalize learning, they just delay the "best" pointer update.
 6. **value_head leaf eval exposes a quality gap.** Per Stage 2/3, value_head is worse than rollout for *test-time* MCTS quality. Stage 4 hopes the value head improves under MCTS-distillation pressure. If F.3 shows tour quality regressing, switch to G.1 (rollout) immediately.
