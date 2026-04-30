@@ -2,8 +2,8 @@
 
 **Plan:** `_plans/stage4_plan.md`
 **Started:** 2026-04-29
-**Last updated:** 2026-04-30 — Phases A, B, C, E all complete. Wave 1 (A+B) and Wave 2 (C+E) merged. Wave 3 (D, F, G) unblocked.
-**Status:** **Phases A, B, C, E complete; Phase D (MCTSCoach orchestrator) ready to start. Phases F (TSP-20 pilot/main) and G (ablations) follow.**
+**Last updated:** 2026-04-30 — Phases A, B, C, D, E all complete. Wave 1 (A+B), Wave 2 (C+E), and Wave 3 Phase D merged on this worktree.
+**Status:** **Phases A, B, C, D, E complete; Phase F (TSP-20 pilot/main CLI) and G (ablations) remain.**
 
 ---
 
@@ -67,11 +67,15 @@ KataGo cross-references added to plan's footer: `MAX_TRAIN_PER_DATA=8` cap (we s
 - [x] **C.2** `generate_self_play_batch(model, M, graph_size, cfg, device) -> list[InstanceRecord]` in `coach.py`. Drives `CppBatchMCTSSolver` with `return_root_visits=True`. `bl_val` is computed once via greedy decode under θ★ and frozen across the batch (passed to `solve_batch(bl_vals=...)` so the solver does not silently recompute). cost-to-go targets derived from realized edge costs through Stage 1's `value_targets_from_edges` (V_CURRENT convention; closing edge counted exactly once). Pack matches `MCTSReplayBuffer.push_instance`'s per-step schema verbatim. Helper functions `_compute_edge_costs`, `_mask_from_tour`, `_normalize_visit_dict` (the last one asserts on `total == 0` rather than fabricating a uniform fallback).
 - [x] **C.3** Smoke A2 in `src/scripts/smoke_alphazero.py`: M=10, N=20, K=20, `temperature=0`, `dirichlet_epsilon=0`. Verifies (i) `bl + value_head` accepted by `_validate_config`, (ii) per-step π_t sums to 1 and is non-negative, (iii) zero mass on visited cities, (iv) `argmax(π_t) == tour[t]` (recovered from `visited[t+1] \ visited[t]`), (v) `cost_to_go[0] == tour_cost`. Records also push cleanly into a `MCTSReplayBuffer` confirming end-to-end schema compatibility. Wall-clock: ~2 s for the full A2 case on CPU.
 
-### Phase D — `MCTSCoach.learn` orchestrator (no GPU)
+### Phase D — `MCTSCoach.learn` orchestrator (no GPU) — **COMPLETE 2026-04-30**
 
-- [ ] **D.1** `MCTSCoach` class.
-- [ ] **D.2** Logging extensions in `logging.py` (`iterations.csv`).
-- [ ] **D.3** Checkpoint format + resume.
+- [x] **D.1** `MCTSCoach` class in `src/am_baseline/training/coach.py`. Wires `generate_self_play_batch` → `MCTSReplayBuffer.push_instance` → `train_step_alphazero` → `validate` → `RolloutBaseline.epoch_callback` per plan lines 322-378. Uses `Adam(lr=opts.lr_model, weight_decay=opts.weight_decay)` over the working copy; `best_model = copy.deepcopy(model)` is the self-play / gating reference. **Init-order trap (caught at review)**: `RolloutBaseline.__init__` is constructed *after* `opts.val_size` is captured in opts; verified experimentally that mutating `opts.val_size` later is silently ignored, so the coach must not depend on post-init mutations. Per scope decision 3, no rollback on reject. Buffer add path is the per-record `for r in records: self.buffer.push_instance(r.coords, r.bl_val, r.tour_cost, r.per_step)` loop because Phase B's API is per-instance, not a batched `add(...)`.
+- [x] **D.2** Logging extensions in `src/am_baseline/training/logging.py`. New `iterations.csv` with the columns required by the plan: `iter, total_instances, val_avg_cost, policy_loss_mean, value_loss_mean, mean_entropy_pi, gated, accepted, mcts_wall_s, train_wall_s, buffer_size`. Two new methods: `log_alphazero_step(metrics, iter_idx, step)` accumulates running means within an iteration; `log_iteration(...)` flushes them to CSV + W&B + console. New W&B step axis `iteration` plus a sample-efficiency series (`val_avg_cost_vs_instances`) keyed off `total_instances`. CSV is opened lazily on first call so Stage 1 callers (which don't use `log_iteration`) see no behavioral change. Honors `opts.no_wandb` / `wandb_mode='disabled'` by passing `wandb_project=None`.
+- [x] **D.3** Checkpoint format + resume. `MCTSCoach.save_checkpoint(tag)` writes `{model, best_model, optimizer, iter_idx, total_instances_seen, rng_state}` to `outputs/.../iter-{tag}.pt`; the (large) replay buffer is written separately to `outputs/.../buffer.pt` (overwritten each iteration). `MCTSCoach.load_checkpoint(path)` restores all of the above plus the buffer (best-effort — warns and continues if `buffer.pt` is missing, since the buffer refills in O(1 iter)). The stored `iter_idx` is the LAST COMPLETED iteration; `load_checkpoint` advances it by one so a follow-up `learn(...)` resumes at the next integer.
+- [x] **D smoke** A5 + A6 added in `src/scripts/smoke_alphazero.py`:
+  - **A5**: `gate_every=10, n_iterations=3` — patches `epoch_callback` with a counting stub; asserts call count == 0 + verifies `iterations.csv` reports `gated=0, accepted=''` for all 3 rows.
+  - **A6**: `M=10, K=20, gate_every=2, n_iterations=3` — verifies (i) no NaN in any iterations.csv row, (ii) val_avg_cost is finite, (iii) at least one gating decision logged (iter 1), (iv) checkpoint round-trip restores model + best_model + iter_idx + total_instances_seen to bit-identical state and a follow-up `learn(1)` advances to the next iter cleanly.
+- Wall-clock for the full Phase B + C + D smoke (B0, B1, A1b, A1, A2, A5, A6): ~7 s on CPU.
 
 ### Phase E — Temperature schedule + Dirichlet noise (no GPU)
 

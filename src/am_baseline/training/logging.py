@@ -43,6 +43,18 @@ class MetricsLogger:
             'val_value_loss', 'val_value_residual_mean', 'val_value_mean', 'val_target_mean'
         ])
 
+        # Stage 4: iteration-level CSV (one row per coach iteration). Lazy
+        # — only created when the coach calls log_iteration / log_alphazero_step.
+        self.iter_csv_path = os.path.join(log_dir, 'iterations.csv')
+        self.iter_csv_file = None
+        self.iter_csv_writer = None
+        # Per-iteration accumulators for log_alphazero_step.
+        self._iter_step_accum = None  # dict[str, list[float]] | None
+        self._iter_step_count = 0
+        self._iter_current = None     # iter_idx currently being accumulated
+        # Stage-4 W&B custom-metric registration is gated until first use.
+        self._wandb_iter_axis_defined = False
+
         # Optional TensorBoard
         self.tb_logger = None
         if use_tensorboard:
@@ -249,9 +261,180 @@ class MetricsLogger:
                 payload['val_target_mean'] = vm['target_mean']
             wandb.log(payload)
 
+    # ------------------------------------------------------------------
+    # Stage 4 — iteration-level logging
+    # ------------------------------------------------------------------
+
+    def _ensure_iter_csv(self):
+        """Open `iterations.csv` lazily and write the header row."""
+        if self.iter_csv_writer is not None:
+            return
+        self.iter_csv_file = open(self.iter_csv_path, 'w', newline='')
+        self.iter_csv_writer = csv.writer(self.iter_csv_file)
+        self.iter_csv_writer.writerow([
+            'iter', 'total_instances', 'val_avg_cost',
+            'policy_loss_mean', 'value_loss_mean', 'mean_entropy_pi',
+            'gated', 'accepted', 'mcts_wall_s', 'train_wall_s', 'buffer_size',
+        ])
+        self.iter_csv_file.flush()
+
+    def _ensure_wandb_iter_axis(self):
+        """Define the Stage 4 W&B step axis + sample-efficiency custom plot
+        once, on first iteration logged. No-op when W&B is disabled."""
+        if self._wandb_iter_axis_defined:
+            return
+        if self.wandb_run is None:
+            self._wandb_iter_axis_defined = True
+            return
+        import wandb
+        wandb.define_metric("iteration")
+        wandb.define_metric("total_instances")
+        wandb.define_metric("val_avg_cost_iter", step_metric="iteration")
+        wandb.define_metric("policy_loss_mean", step_metric="iteration")
+        wandb.define_metric("value_loss_mean", step_metric="iteration")
+        wandb.define_metric("mean_entropy_pi", step_metric="iteration")
+        wandb.define_metric("gated", step_metric="iteration")
+        wandb.define_metric("accepted", step_metric="iteration")
+        wandb.define_metric("mcts_wall_s", step_metric="iteration")
+        wandb.define_metric("train_wall_s", step_metric="iteration")
+        wandb.define_metric("buffer_size", step_metric="iteration")
+        # Sample-efficiency custom plot: val cost vs. instances seen.
+        wandb.define_metric("val_avg_cost_vs_instances", step_metric="total_instances")
+        self._wandb_iter_axis_defined = True
+
+    def log_alphazero_step(self, metrics, iter_idx, step):
+        """Stage 4 per-train-step logger. Accumulates into the current
+        iteration's running mean buckets so `log_iteration` can flush them.
+
+        `metrics` is the dict returned by `train_step_alphazero`. Required
+        keys: policy_loss, value_loss, total_loss, mean_entropy_pi.
+        """
+        # Reset accumulators if we've crossed an iteration boundary.
+        if self._iter_current != iter_idx:
+            self._iter_step_accum = {
+                'policy_loss': [],
+                'value_loss': [],
+                'total_loss': [],
+                'mean_entropy_pi': [],
+            }
+            self._iter_step_count = 0
+            self._iter_current = iter_idx
+        for k in self._iter_step_accum:
+            if k in metrics:
+                self._iter_step_accum[k].append(float(metrics[k]))
+        self._iter_step_count += 1
+
+        # W&B per-step (under the iteration axis). Use a unique step axis so
+        # this does not collide with Stage 1's `global_step` series.
+        if self.wandb_run is not None:
+            self._ensure_wandb_iter_axis()
+            import wandb
+            payload = {
+                'iteration': iter_idx,
+                'alphazero_train_step': step,
+                'policy_loss_step': float(metrics.get('policy_loss', 0.0)),
+                'value_loss_step': float(metrics.get('value_loss', 0.0)),
+                'total_loss_step': float(metrics.get('total_loss', 0.0)),
+                'mean_entropy_pi_step': float(metrics.get('mean_entropy_pi', 0.0)),
+            }
+            wandb.log(payload)
+
+    def log_iteration(self, iter, total_instances, val_avg_cost,
+                      gated=False, accepted=None,
+                      mcts_wall_s=0.0, train_wall_s=0.0,
+                      buffer_size=0):
+        """Stage 4 per-iteration logger. Flushes per-step running means from
+        `log_alphazero_step` into one CSV row + one W&B point.
+
+        Args mirror plan §D.2 verbatim. `accepted` may be `None` when the
+        iteration was not gated (wrote as empty string in CSV).
+        """
+        self._ensure_iter_csv()
+        self._ensure_wandb_iter_axis()
+
+        # Flush per-step accumulators into running means.
+        if self._iter_current == iter and self._iter_step_count > 0:
+            acc = self._iter_step_accum or {}
+            policy_loss_mean = (
+                sum(acc.get('policy_loss', [])) / max(1, len(acc.get('policy_loss', [])))
+            )
+            value_loss_mean = (
+                sum(acc.get('value_loss', [])) / max(1, len(acc.get('value_loss', [])))
+            )
+            mean_entropy_pi = (
+                sum(acc.get('mean_entropy_pi', [])) / max(1, len(acc.get('mean_entropy_pi', [])))
+            )
+        else:
+            policy_loss_mean = float('nan')
+            value_loss_mean = float('nan')
+            mean_entropy_pi = float('nan')
+
+        val_cell = float(val_avg_cost) if val_avg_cost is not None else ''
+        gated_cell = int(bool(gated))
+        if accepted is None:
+            accepted_cell = ''
+        else:
+            accepted_cell = int(bool(accepted))
+
+        # CSV
+        self.iter_csv_writer.writerow([
+            iter, int(total_instances), val_cell,
+            policy_loss_mean, value_loss_mean, mean_entropy_pi,
+            gated_cell, accepted_cell,
+            float(mcts_wall_s), float(train_wall_s), int(buffer_size),
+        ])
+        self.iter_csv_file.flush()
+
+        # Console
+        print(
+            'iter={} total_instances={} val_avg_cost={} '
+            'policy_loss={:.4f} value_loss={:.4f} entropy={:.4f} '
+            'gated={} accepted={} mcts_s={:.2f} train_s={:.2f} buf={}'.format(
+                iter, int(total_instances),
+                f'{val_avg_cost:.6f}' if val_avg_cost is not None else 'NA',
+                policy_loss_mean, value_loss_mean, mean_entropy_pi,
+                gated_cell, accepted_cell, mcts_wall_s, train_wall_s, buffer_size,
+            )
+        )
+
+        # TensorBoard
+        if self.tb_logger is not None:
+            if val_avg_cost is not None:
+                self.tb_logger.add_scalar('val_avg_cost_iter', float(val_avg_cost), iter)
+            self.tb_logger.add_scalar('policy_loss_mean', policy_loss_mean, iter)
+            self.tb_logger.add_scalar('value_loss_mean', value_loss_mean, iter)
+            self.tb_logger.add_scalar('mean_entropy_pi', mean_entropy_pi, iter)
+            self.tb_logger.add_scalar('mcts_wall_s', float(mcts_wall_s), iter)
+            self.tb_logger.add_scalar('train_wall_s', float(train_wall_s), iter)
+            self.tb_logger.add_scalar('buffer_size', int(buffer_size), iter)
+
+        # W&B
+        if self.wandb_run is not None:
+            import wandb
+            payload = {
+                'iteration': iter,
+                'total_instances': int(total_instances),
+                'policy_loss_mean': policy_loss_mean,
+                'value_loss_mean': value_loss_mean,
+                'mean_entropy_pi': mean_entropy_pi,
+                'gated': gated_cell,
+                'mcts_wall_s': float(mcts_wall_s),
+                'train_wall_s': float(train_wall_s),
+                'buffer_size': int(buffer_size),
+            }
+            if val_avg_cost is not None:
+                payload['val_avg_cost_iter'] = float(val_avg_cost)
+                # Sample-efficiency series: x = total_instances, y = val cost.
+                payload['val_avg_cost_vs_instances'] = float(val_avg_cost)
+            if accepted is not None:
+                payload['accepted'] = int(bool(accepted))
+            wandb.log(payload)
+
     def close(self):
         self.csv_file.close()
         self.epoch_csv_file.close()
+        if self.iter_csv_file is not None:
+            self.iter_csv_file.close()
         if self.tb_logger is not None:
             self.tb_logger.close()
         if self.wandb_run is not None:

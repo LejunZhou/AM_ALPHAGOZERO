@@ -1,21 +1,14 @@
-"""Stage 4 Phase B smoke harness — replay buffer + distillation training step.
+"""Stage 4 Phase B/C/D smoke harness — replay buffer, distillation, coach loop.
 
-Implements case **A1** from `_plans/stage4_plan.md` line 222:
-  - Construct a 5-instance buffer with hand-crafted records (random pi_t,
-    random z_t).
-  - Run one `train_step_alphazero` call.
-  - Verify: loss is finite, no NaN, gradients flow into encoder + decoder +
-    value_head (non-zero parameter delta after `optimizer.step()`).
-
-Also runs the buffer-only invariants from A1.5 / A1.6:
-  - sample_step(t) returns rows all reporting state_i == t.
-  - sample(B) returns a batch sharing one state_i.
-  - pi has zero mass on visited cities, sums to 1, is non-negative.
-  - save / load round-trip rebuilds `_step_index` to the same set per step.
-
-The records here are SYNTHESIZED — Phase A is exposing real visit dists in
-parallel and Phase C will produce the records for real. Replace this stub
-with `generate_self_play_batch(...)` output as soon as Phase A.4 + C.2 land.
+Cases (cumulative across phases):
+  - **B0**: buffer invariants + sample_step(t) + sample(B) shape rules.
+  - **B1**: save/load round-trip rebuilds `_step_index`.
+  - **A1b**: `reconstruct_state` -> `decode_step` round-trip.
+  - **A1**: one `train_step_alphazero` call with finite loss + grad flow.
+  - **A2**: `generate_self_play_batch` end-to-end with τ=0 invariants.
+  - **A5**: gating no-op when `gate_every > n_iterations` (Phase D).
+  - **A6**: 3-iteration coach loop end-to-end with checkpoint round-trip
+            (Phase D).
 
 Run:
     PYTHONPATH=src python -m scripts.smoke_alphazero
@@ -42,7 +35,9 @@ if _SRC not in sys.path:
 
 from am_baseline.config import Config
 from am_baseline.model.attention_model import AttentionModel
+from am_baseline.problem.tsp import TSP
 from am_baseline.training.coach import (
+    MCTSCoach,
     MCTSReplayBuffer,
     reconstruct_state,
     make_self_play_config,
@@ -422,8 +417,257 @@ def test_self_play_generator(N: int = 20, M: int = 10, K: int = 20) -> None:
     print("  [A2] OK")
 
 
+def _make_tiny_coach_opts(N: int, M: int, K: int, train_steps: int,
+                          gate_every: int, save_dir: str,
+                          val_size: int = 32, batch_size: int = 16):
+    """Build an opts namespace adequate for a tiny CPU smoke MCTSCoach run."""
+    import argparse
+    opts = argparse.Namespace()
+    # Problem
+    opts.graph_size = N
+    # Training
+    opts.lr_model = 1e-3
+    opts.weight_decay = 1e-4
+    opts.batch_size = batch_size
+    opts.max_grad_norm = 1.0
+    opts.lambda_v = 1.0
+    opts.value_target_norm = 'bl'
+    # Coach
+    opts.M_instances = M
+    opts.n_simulations_train = K
+    opts.train_steps_per_iter = train_steps
+    opts.gate_every = gate_every
+    opts.buffer_capacity = max(64, M * 4)
+    opts.mcts_batch_size = 8
+    # Validation / gating
+    opts.val_size = val_size
+    opts.eval_batch_size = max(1, val_size)
+    opts.no_progress_bar = True
+    opts.bl_alpha = 0.05
+    # Device
+    opts.use_cuda = False
+    opts.device = torch.device('cpu')
+    # Logging
+    opts.save_dir = save_dir
+    opts.output_dir = save_dir
+    opts.run_name = 'smoke_d'
+    opts.no_wandb = True
+    opts.wandb_project = None
+    opts.wandb_entity = None
+    opts.wandb_mode = 'disabled'
+    return opts
+
+
+def _build_smoke_model(N: int) -> "AttentionModel":
+    cfg = Config(
+        graph_size=N,
+        embedding_dim=16,
+        n_encode_layers=1,
+        n_heads=2,
+        value_enabled=True,
+        value_hidden_dim=16,
+    )
+    return AttentionModel(cfg).cpu()
+
+
+def test_coach_gate_noop(N: int = 8) -> None:
+    """A5 — gating no-op when `gate_every > n_iterations`.
+
+    Constructs a tiny `MCTSCoach`, runs `learn(3)` with `gate_every=10`, and
+    asserts that `gating_baseline.epoch_callback` was never called. This
+    directly exercises the iter-wise scheduling guard in `MCTSCoach.learn`.
+    """
+    print(f"  [A5] gating no-op (gate_every > n_iterations) ...")
+    torch.manual_seed(0)
+    np.random.seed(0)
+
+    M, K, train_steps = 10, 20, 5
+    n_iterations = 3
+    gate_every = 10  # > n_iterations -> never fires
+
+    with tempfile.TemporaryDirectory() as tmp:
+        opts = _make_tiny_coach_opts(
+            N=N, M=M, K=K, train_steps=train_steps,
+            gate_every=gate_every, save_dir=tmp,
+        )
+        model = _build_smoke_model(N)
+        problem = TSP
+        # Tiny val dataset for `validate(...)` (separate from gating's frozen
+        # one which lives inside RolloutBaseline).
+        val_dataset = TSP.make_dataset(size=N, num_samples=opts.val_size)
+
+        coach = MCTSCoach(
+            model=model, problem=problem, opts=opts,
+            val_dataset=val_dataset, device=torch.device('cpu'),
+        )
+
+        # Patch epoch_callback with a counting stub. We do NOT delegate to
+        # the real callback because A5 only asserts the call count == 0.
+        call_count = {'n': 0}
+        original_cb = coach.gating_baseline.epoch_callback
+        def _counting_cb(model_arg, epoch=0):
+            call_count['n'] += 1
+            return original_cb(model_arg, epoch)
+        coach.gating_baseline.epoch_callback = _counting_cb
+
+        try:
+            coach.learn(n_iterations=n_iterations)
+        finally:
+            coach.close()
+
+        assert call_count['n'] == 0, (
+            f"A5: gating_baseline.epoch_callback was called {call_count['n']} "
+            f"times with gate_every=10 and n_iterations=3 (expected 0)"
+        )
+
+        # Verify the iterations.csv was written with 3 rows + header.
+        iter_csv = os.path.join(opts.save_dir, 'iterations.csv')
+        assert os.path.exists(iter_csv), f"iterations.csv not written at {iter_csv}"
+        with open(iter_csv) as f:
+            lines = [ln for ln in f.read().splitlines() if ln.strip()]
+        assert len(lines) == 1 + n_iterations, (
+            f"A5: expected {1 + n_iterations} CSV lines, got {len(lines)}"
+        )
+        # Header has 'gated' and 'accepted' columns; data rows must show
+        # gated=0 and accepted='' (the latter because no gating ran).
+        header = lines[0].split(',')
+        gi = header.index('gated')
+        ai = header.index('accepted')
+        for row in lines[1:]:
+            cells = row.split(',')
+            assert cells[gi] == '0', f"A5: expected gated=0, got {cells[gi]}"
+            assert cells[ai] == '', (
+                f"A5: expected accepted='' (un-gated), got '{cells[ai]}'"
+            )
+
+    print("  [A5] OK")
+
+
+def test_coach_three_iters(N: int = 8) -> None:
+    """A6 — 3 iterations end-to-end + checkpoint round-trip.
+
+    Exercises MCTSCoach.learn with M=10, K=20, gate_every=2 over 3 iterations.
+    Verifies:
+      (i)   no NaN in any iteration row of `iterations.csv`,
+      (ii)  val_avg_cost is finite,
+      (iii) at least one gating decision (iter 1 — `(iter+1)%2 == 0`) ran,
+      (iv)  load_checkpoint round-trip restores model + best_model + iter_idx
+            to a bit-identical state (parameter equality, deterministic on
+            CPU within float tolerance).
+    """
+    print(f"  [A6] 3-iteration coach loop on N={N}, M=10, K=20 ...")
+    torch.manual_seed(0)
+    np.random.seed(0)
+
+    M, K, train_steps = 10, 20, 5
+    n_iterations = 3
+    gate_every = 2  # gates at iter_idx in {1} -> (1+1)%2 == 0 -> fires once
+
+    with tempfile.TemporaryDirectory() as tmp:
+        opts = _make_tiny_coach_opts(
+            N=N, M=M, K=K, train_steps=train_steps,
+            gate_every=gate_every, save_dir=tmp,
+        )
+        model = _build_smoke_model(N)
+        problem = TSP
+        val_dataset = TSP.make_dataset(size=N, num_samples=opts.val_size)
+
+        coach = MCTSCoach(
+            model=model, problem=problem, opts=opts,
+            val_dataset=val_dataset, device=torch.device('cpu'),
+        )
+        try:
+            coach.learn(n_iterations=n_iterations)
+        finally:
+            coach.close()
+
+        # (i) + (ii) — no NaN in iterations.csv, val cost finite.
+        iter_csv = os.path.join(opts.save_dir, 'iterations.csv')
+        with open(iter_csv) as f:
+            lines = [ln for ln in f.read().splitlines() if ln.strip()]
+        header = lines[0].split(',')
+        v_idx = header.index('val_avg_cost')
+        gi = header.index('gated')
+        ai = header.index('accepted')
+        gated_seen = 0
+        for row in lines[1:]:
+            cells = row.split(',')
+            for c in cells:
+                # Reject literal NaN spellings only; '' is allowed (e.g.
+                # accepted column on un-gated iters).
+                assert c.lower() not in ('nan', '+nan', '-nan'), (
+                    f"A6: NaN cell in iterations.csv row: {row}"
+                )
+            v = float(cells[v_idx])
+            assert math.isfinite(v), f"A6: val_avg_cost not finite: {v}"
+            if cells[gi] == '1':
+                gated_seen += 1
+                # accepted column must be 0 or 1 for gated rows.
+                assert cells[ai] in ('0', '1'), (
+                    f"A6: gated row with non-bool accepted: {cells[ai]}"
+                )
+
+        # (iii) — at least one gating decision was logged.
+        assert gated_seen >= 1, (
+            f"A6: expected ≥1 gated iteration with gate_every=2, n=3; got {gated_seen}"
+        )
+
+        # (iv) — load_checkpoint round-trip on iter-2.pt (the last iter).
+        last_ckpt = os.path.join(opts.save_dir, 'iter-2.pt')
+        assert os.path.exists(last_ckpt), f"A6: missing checkpoint {last_ckpt}"
+
+        # Snapshot working-model params (we'll compare against the restored).
+        pre_state = {k: v.detach().clone() for k, v in coach.model.state_dict().items()}
+        pre_best_state = {k: v.detach().clone() for k, v in coach.best_model.state_dict().items()}
+        pre_iter = coach.iter_idx
+        pre_total = coach.total_instances_seen
+
+        # Build a fresh coach (different RNG-driven init) and load.
+        torch.manual_seed(99)
+        fresh_model = _build_smoke_model(N)
+        coach2 = MCTSCoach(
+            model=fresh_model, problem=problem, opts=opts,
+            val_dataset=val_dataset, device=torch.device('cpu'),
+        )
+        try:
+            coach2.load_checkpoint(last_ckpt)
+
+            # Parameter equality
+            post_state = coach2.model.state_dict()
+            post_best_state = coach2.best_model.state_dict()
+            for k in pre_state:
+                assert torch.equal(pre_state[k], post_state[k]), (
+                    f"A6: model state_dict mismatch after restore at key '{k}'"
+                )
+            for k in pre_best_state:
+                assert torch.equal(pre_best_state[k], post_best_state[k]), (
+                    f"A6: best_model state_dict mismatch after restore at key '{k}'"
+                )
+
+            # iter_idx restored to "next iter to run" (saved+1).
+            assert coach2.iter_idx == pre_iter, (
+                f"A6: iter_idx mismatch after restore — pre={pre_iter} "
+                f"post={coach2.iter_idx}"
+            )
+            assert coach2.total_instances_seen == pre_total, (
+                f"A6: total_instances_seen mismatch — pre={pre_total} "
+                f"post={coach2.total_instances_seen}"
+            )
+
+            # Continue training one more iteration to confirm the resumed
+            # coach can execute (this is what F.1 will exercise).
+            coach2.learn(n_iterations=1)
+            assert coach2.iter_idx == pre_iter + 1, (
+                f"A6: iter_idx after resumed learn(1) wrong: {coach2.iter_idx}"
+            )
+        finally:
+            coach2.close()
+
+    print("  [A6] OK")
+
+
 def main() -> int:
-    print("Stage 4 Phase B + C smoke harness")
+    print("Stage 4 Phase B + C + D smoke harness")
     print("=" * 64)
     try:
         test_buffer_invariants(N=8)
@@ -431,6 +675,8 @@ def main() -> int:
         test_state_reconstruction_roundtrip(N=6)
         test_train_step_alphazero(N=8)
         test_self_play_generator(N=20, M=10, K=20)
+        test_coach_gate_noop(N=8)
+        test_coach_three_iters(N=8)
     except AssertionError as e:
         print(f"FAIL: {e}", file=sys.stderr)
         return 1
@@ -440,7 +686,7 @@ def main() -> int:
         print(f"ERROR: {e}", file=sys.stderr)
         return 2
     print("=" * 64)
-    print("PASS — all Phase B + C smoke checks succeeded.")
+    print("PASS — all Phase B + C + D smoke checks succeeded.")
     return 0
 
 

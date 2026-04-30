@@ -750,3 +750,343 @@ def generate_self_play_batch(
         ))
 
     return records
+
+
+# ---------------------------------------------------------------------------
+# Phase D — MCTSCoach orchestrator
+# ---------------------------------------------------------------------------
+
+
+class MCTSCoach:
+    """Phase D AlphaGo-Zero-style self-improvement orchestrator.
+
+    Per-iteration loop (mirrors `_plans/stage4_plan.md` lines 322-378):
+      1. **Generate** M self-play instances under θ★ (`best_model`) using
+         `make_self_play_config` + `generate_self_play_batch`.
+      2. **Push** each `InstanceRecord` into `MCTSReplayBuffer` via
+         `push_instance(coords, bl_val, tour_cost, per_step)`.
+      3. **Train** the working model for `train_steps_per_iter` minibatches
+         drawn from the buffer's stratified-by-step sampler; each step calls
+         `train_step_alphazero` and accumulates running means in
+         `MetricsLogger.log_alphazero_step`.
+      4. **Validate** the working model on `val_dataset` via Stage 1 `validate`.
+      5. **Gate** every `opts.gate_every` iterations: a paired t-test
+         (`RolloutBaseline.epoch_callback`) decides whether to promote the
+         working model to the new θ★. **No rollback on reject** (scope
+         decision 3 in the plan).
+      6. **Checkpoint** every iteration so a long run can be resumed.
+
+    Init-order trap (caught at review): `RolloutBaseline.__init__` builds and
+    caches its validation dataset using `opts.val_size` *at construction time*.
+    Subsequent `epoch_callback` calls do **not** re-read `opts.val_size`.
+    Therefore `MCTSCoach.__init__` must be called *after* `opts.val_size` has
+    been finalized (typically from CLI) — there is **no** Stage-4-specific
+    `gate_val_size` flag.
+    """
+
+    def __init__(self, model, problem, opts, val_dataset, device=None):
+        # Local imports keep heavy / circular deps deferred.
+        import copy
+        import os
+        import time
+        import torch as _torch
+        from am_baseline.training.logging import MetricsLogger
+        from am_baseline.training.trainer import rollout
+        from am_baseline.baseline.baselines import RolloutBaseline
+
+        self._copy = copy
+        self._os = os
+        self._time = time
+        self._torch = _torch
+
+        self.model = model
+        self.best_model = copy.deepcopy(model)
+        self.problem = problem
+        self.opts = opts
+        self.val_dataset = val_dataset
+        self.device = (
+            device
+            if device is not None
+            else getattr(opts, 'device', _torch.device('cpu'))
+        )
+        if not isinstance(self.device, _torch.device):
+            self.device = _torch.device(self.device)
+
+        # Replay buffer — capacity from opts.buffer_capacity (Phase F default
+        # 50_000 per AGZ-proportional pilot; Phase B default 200_000 if unset).
+        capacity = int(getattr(opts, 'buffer_capacity', 50_000))
+        self.buffer = MCTSReplayBuffer(
+            graph_size=int(opts.graph_size),
+            capacity_instances=capacity,
+            device='cpu',
+        )
+
+        # Optimizer over the WORKING copy (not best_model). Stage 1 default
+        # picks Adam; SGD+momentum is the AGZ-canonical alternative under
+        # plan G.8 ablation.
+        self.optimizer = _torch.optim.Adam(
+            self.model.parameters(),
+            lr=float(getattr(opts, 'lr_model', 1e-4)),
+            weight_decay=float(self._weight_decay()),
+        )
+
+        # Gating — verbatim Stage 1 RolloutBaseline. Construct AFTER
+        # `opts.val_size` is finalized (init-order trap). Note that
+        # `RolloutBaseline.__init__` runs a greedy rollout over `val_size`
+        # samples right here — for a small smoke this is cheap, for the full
+        # pilot it is one-time at startup.
+        self.gating_baseline = RolloutBaseline(
+            self.best_model, problem, opts, rollout_fn=rollout, epoch=0
+        )
+
+        self.iter_idx = 0
+        self.total_instances_seen = 0
+
+        # Logger — under opts.save_dir (Stage 1 convention) so iterations.csv
+        # ends up next to metrics.csv / epochs.csv. Honor opts.no_wandb (or
+        # any of the Stage 1 W&B kill-switch flags) by passing
+        # `wandb_project=None` to the logger.
+        log_dir = getattr(opts, 'save_dir', getattr(opts, 'output_dir', '.'))
+        wandb_project = self._wandb_project()
+        self.logger = MetricsLogger(
+            log_dir=log_dir,
+            use_tensorboard=False,
+            wandb_project=wandb_project,
+            wandb_entity=getattr(opts, 'wandb_entity', None),
+            wandb_name=getattr(opts, 'run_name', None),
+            wandb_mode=getattr(opts, 'wandb_mode', 'online'),
+            track_gpu_memory=getattr(opts, 'use_cuda', False),
+        )
+
+    # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
+
+    def _weight_decay(self) -> float:
+        # AGZ-canonical L2 reg = 1e-4. Allow opts override under either name.
+        if hasattr(self.opts, 'weight_decay'):
+            return float(self.opts.weight_decay)
+        if hasattr(self.opts, 'l2_reg'):
+            return float(self.opts.l2_reg)
+        return 1e-4
+
+    def _wandb_project(self):
+        """Return the W&B project name, honoring the Stage 1 kill-switch
+        `opts.no_wandb` (and the `wandb_mode='disabled'` form)."""
+        if bool(getattr(self.opts, 'no_wandb', False)):
+            return None
+        mode = getattr(self.opts, 'wandb_mode', 'online')
+        if mode == 'disabled':
+            return None
+        return getattr(self.opts, 'wandb_project', None)
+
+    # ------------------------------------------------------------------
+    # Checkpointing
+    # ------------------------------------------------------------------
+
+    def _checkpoint_dir(self) -> str:
+        """Directory where iter-{i}.pt and buffer.pt live."""
+        return getattr(
+            self.opts, 'save_dir',
+            self._os.path.join(getattr(self.opts, 'output_dir', '.'), 'stage4'),
+        )
+
+    def save_checkpoint(self, tag: str) -> str:
+        """Persist the coach state to `save_dir/iter-{tag}.pt` (+ buffer.pt).
+
+        File contents (small):
+            model:      state_dict
+            best_model: state_dict
+            optimizer:  state_dict
+            iter_idx:   int
+            total_instances_seen: int
+            rng_state:  {torch, numpy, python}
+
+        The replay buffer is written separately to `buffer.pt` (overwritten
+        each iter — its slabs are large; checkpoint files stay small).
+        Returns the path written for the iteration checkpoint.
+        """
+        import random as _random
+        import numpy as _np
+
+        ckpt_dir = self._checkpoint_dir()
+        self._os.makedirs(ckpt_dir, exist_ok=True)
+
+        rng_state = {
+            'torch': self._torch.get_rng_state(),
+            'numpy': _np.random.get_state(),
+            'python': _random.getstate(),
+        }
+        if self._torch.cuda.is_available():
+            try:
+                rng_state['cuda'] = self._torch.cuda.get_rng_state_all()
+            except Exception:
+                pass
+
+        payload = {
+            'model': self.model.state_dict(),
+            'best_model': self.best_model.state_dict(),
+            'optimizer': self.optimizer.state_dict(),
+            'iter_idx': int(self.iter_idx),
+            'total_instances_seen': int(self.total_instances_seen),
+            'rng_state': rng_state,
+        }
+        ckpt_path = self._os.path.join(ckpt_dir, f'iter-{tag}.pt')
+        self._torch.save(payload, ckpt_path)
+
+        # Buffer — large; overwrite the single rolling buffer.pt.
+        buf_path = self._os.path.join(ckpt_dir, 'buffer.pt')
+        try:
+            self.buffer.save(buf_path)
+        except Exception as e:
+            print(f'Warning: buffer.save({buf_path}) failed: {e}')
+        return ckpt_path
+
+    # Private alias the plan pseudocode uses.
+    def _save_checkpoint(self, tag: str) -> str:
+        return self.save_checkpoint(tag)
+
+    def load_checkpoint(self, path: str) -> None:
+        """Restore coach state from `path` (an `iter-{i}.pt` file).
+
+        Loads model + best_model + optimizer + iter_idx + total_instances_seen
+        + rng_state. Then loads the sibling `buffer.pt` if present (warns and
+        continues if missing — buffer is recoverable in O(1 iter)).
+        """
+        import random as _random
+        import numpy as _np
+
+        d = self._torch.load(path, map_location='cpu', weights_only=False)
+        self.model.load_state_dict(d['model'])
+        self.best_model.load_state_dict(d['best_model'])
+        self.optimizer.load_state_dict(d['optimizer'])
+        # Stored `iter_idx` is the LAST COMPLETED iteration; advance one so
+        # `learn(...)` resumes at the next integer.
+        self.iter_idx = int(d['iter_idx']) + 1
+        self.total_instances_seen = int(d['total_instances_seen'])
+
+        rng = d.get('rng_state', {})
+        if 'torch' in rng:
+            try:
+                self._torch.set_rng_state(rng['torch'])
+            except Exception as e:
+                print(f'Warning: torch RNG restore failed: {e}')
+        if 'numpy' in rng:
+            try:
+                _np.random.set_state(rng['numpy'])
+            except Exception as e:
+                print(f'Warning: numpy RNG restore failed: {e}')
+        if 'python' in rng:
+            try:
+                _random.setstate(rng['python'])
+            except Exception as e:
+                print(f'Warning: python RNG restore failed: {e}')
+        if 'cuda' in rng and self._torch.cuda.is_available():
+            try:
+                self._torch.cuda.set_rng_state_all(rng['cuda'])
+            except Exception as e:
+                print(f'Warning: cuda RNG restore failed: {e}')
+
+        # Buffer — best-effort.
+        buf_path = self._os.path.join(self._os.path.dirname(path), 'buffer.pt')
+        if self._os.path.exists(buf_path):
+            try:
+                self.buffer.load(buf_path)
+            except Exception as e:
+                print(
+                    f'Warning: buffer.load({buf_path}) failed: {e}. '
+                    f'Continuing — buffer will refill in one iteration.'
+                )
+        else:
+            print(
+                f'Warning: no buffer.pt next to {path}. Continuing — buffer '
+                f'will refill in one iteration.'
+            )
+
+    # ------------------------------------------------------------------
+    # Main loop
+    # ------------------------------------------------------------------
+
+    def learn(self, n_iterations: int) -> None:
+        """Run `n_iterations` of generate → train → (gate) → checkpoint.
+
+        Resume-aware: starts at the current `self.iter_idx` (which
+        `load_checkpoint` restores to the last completed iteration + 1) and
+        runs for `n_iterations` more iterations.
+        """
+        # Local imports avoid circular load (trainer imports from coach).
+        from am_baseline.training.trainer import validate, train_step_alphazero
+
+        opts = self.opts
+        start = int(self.iter_idx)
+        end = start + int(n_iterations)
+        for self.iter_idx in range(start, end):
+            t0 = self._time.time()
+
+            cfg = make_self_play_config(
+                int(opts.graph_size),
+                int(getattr(opts, 'n_simulations_train', 50)),
+            )
+            records = generate_self_play_batch(
+                self.best_model,
+                int(opts.M_instances),
+                int(opts.graph_size),
+                cfg,
+                self.device,
+                mcts_batch_size=int(getattr(opts, 'mcts_batch_size', 64)),
+            )
+            for r in records:
+                self.buffer.push_instance(r.coords, r.bl_val, r.tour_cost, r.per_step)
+            self.total_instances_seen += int(opts.M_instances)
+            t1 = self._time.time()
+
+            # Train. Stratified-by-step sampler ensures every minibatch has a
+            # single scalar `state_i` (decoder requirement).
+            train_steps = int(getattr(opts, 'train_steps_per_iter', 100))
+            batch_size = int(getattr(opts, 'batch_size', 256))
+            for step in range(train_steps):
+                batch = self.buffer.sample(batch_size)
+                metrics = train_step_alphazero(
+                    self.model, self.optimizer, batch, opts
+                )
+                self.logger.log_alphazero_step(metrics, self.iter_idx, step)
+            t2 = self._time.time()
+
+            val_cost_t = validate(self.model, self.val_dataset, opts)
+            val_cost = (
+                float(val_cost_t.item()) if hasattr(val_cost_t, 'item') else float(val_cost_t)
+            )
+
+            gated = False
+            accepted = None
+            gate_every = int(getattr(opts, 'gate_every', 1))
+            if gate_every > 0 and (self.iter_idx + 1) % gate_every == 0:
+                gated = True
+                accepted = self.gating_baseline.epoch_callback(
+                    self.model, epoch=self.iter_idx
+                )
+                if accepted:
+                    self.best_model = self._copy.deepcopy(self.model)
+                    self._save_checkpoint(tag=f'{self.iter_idx}_accepted')
+                # NB: per scope decision 3, NO rollback on reject.
+
+            self.logger.log_iteration(
+                iter=self.iter_idx,
+                total_instances=self.total_instances_seen,
+                val_avg_cost=val_cost,
+                gated=gated,
+                accepted=accepted,
+                mcts_wall_s=t1 - t0,
+                train_wall_s=t2 - t1,
+                buffer_size=int(len(self.buffer)),
+            )
+            self._save_checkpoint(tag=f'{self.iter_idx}')
+
+        # Position iter_idx at the next integer so a follow-up call to
+        # `learn(...)` resumes after the last completed iteration.
+        self.iter_idx = end
+
+    def close(self) -> None:
+        """Flush + close the underlying logger."""
+        if self.logger is not None:
+            self.logger.close()
