@@ -126,24 +126,50 @@ A thin `MCTSCoach` orchestrator (`src/am_baseline/training/coach.py`) drives an 
 - **Eviction:** ring-buffer write head with `inst_idx % capacity_instances`; tuple slots `(inst_idx * N + step) % capacity_tuples`. Drops oldest instance + all its tuples atomically.
 - **Auxiliary index `_step_index: list[np.ndarray]`** (length N). `_step_index[t]` is the array of tuple-slot indices currently filled with step==t. Updated on every push (append the new tuple slot) and on every eviction (drop the oldest tuple slot for that step). Enables O(1) stratified sampling without scanning the whole buffer.
 - **All N per-step records are stored, including the final forced step.** No "skip when `legal_actions == 1`" — that mitigation conflicts with the dense layout (would require a `valid_mask` + rejection sampling or a variable-length `_step_index`). Late-step records carry near-zero policy gradient (CE between two near-identical one-hot distributions is small and finite), but the value-loss MSE is still informative. Matches AGZ Methods §Self-play, which stores tuples for every step up to termination.
-- **Sampling — stratified by step (fixes mixed-step decoder bug).** `sample(batch_size) → (state_i_scalar, coords_batch, visited_batch, first_batch, prev_batch, lengths_batch, pi_batch, z_batch)`:
+- **Sampling — stratified by step (fixes mixed-step decoder bug).** Two methods: `sample(batch_size)` for the training loop (random step) and `sample_step(t, batch_size)` for tests/ablations (deterministic step):
   ```python
-  step = np.random.randint(0, self.N)               # one scalar step per minibatch
-  step_indices = self._step_index[step]             # all tuple slots at this step
-  n_at_step = step_indices.shape[0]
-  if n_at_step < batch_size:
-      idx_within = np.random.randint(0, n_at_step, batch_size)   # with replacement (fresh buffer)
-  else:
-      idx_within = np.random.choice(n_at_step, batch_size, replace=False)
-  idx = step_indices[idx_within]
-  # Fancy-index per-step tensors at idx; per-instance tensors (coords, bl_val) at inst_idx[idx].
-  z_batch = cost_to_go[idx] / bl_val[inst_idx[idx]]
-  return {'state_i': step, 'coords': coords[inst_idx[idx]], ...}   # state_i is a SCALAR
+  def sample_step(self, step: int, batch_size: int) -> dict:
+      """Deterministic-step variant — used by smoke tests and any future
+      step-stratified analysis. Picks `batch_size` records uniformly from
+      records currently filled at step==step.
+      """
+      step_indices = self._step_index[step]
+      n_at_step = step_indices.shape[0]
+      if n_at_step < batch_size:
+          idx_within = np.random.randint(0, n_at_step, batch_size)        # with replacement (fresh buffer)
+      else:
+          idx_within = np.random.choice(n_at_step, batch_size, replace=False)
+      idx = step_indices[idx_within]
+      # Fancy-index per-step tensors at idx; per-instance tensors (coords, bl_val) at inst_idx[idx].
+      z_batch = cost_to_go[idx] / bl_val[inst_idx[idx]]
+      return {'state_i': step, 'coords': coords[inst_idx[idx]], ...}      # state_i is a SCALAR
+
+  def sample(self, batch_size: int) -> dict:
+      """Training-loop variant — picks one step uniformly per minibatch."""
+      step = np.random.randint(0, self.N)
+      return self.sample_step(step, batch_size)
   ```
   **Why stratified.** AM's decoder takes a single scalar `state.i` per `decode_step` call (`state.py:5-19`), with first-step branching that conditions on `state.i == 0` vs `> 0`. A uniform-over-tuples batch can mix step 3, 17, 9 records under one `state.i`, which silently produces wrong `log_p` distributions on the misaligned rows. Stratification picks one step per minibatch — every row's step matches the decoder's scalar `state.i`. Marginal distribution over (instance, step) across many train steps remains uniform; expectation of the gradient is unchanged; only per-batch variance is slightly higher (negligible at J=200 train steps × N=20 steps → ~10× coverage per step per iter). Pattern matches AGZ-style replicas (OpenSpiel, ELF OpenGo).
 - **`z_batch = cost_to_go[idx] / bl_val[inst_idx[idx]]`** — both terms are frozen-at-generation, so the per-instance training target $z_t$ is **stationary across all training steps that draw this record**.
 - **`bl_val` is frozen at instance-push time and never refreshed.** When `generate_self_play_batch(θ★, ...)` produces an instance, it computes `bl_val = cost(greedy_rollout(θ★, x))` once and writes it to the per-instance row alongside `tour_cost`. The owning θ★ may be superseded later by a gate accept; this does not invalidate the stored `bl_val`. Rationale: per-state $z_t$ + frozen `bl_val` makes the training target fully stationary per record, eliminating the moving-target concern (spec §3.5 Concern 1) without an `owner_id`-tagged refresh code path. The only "drift" is buffer-level: newer instances were generated under stronger θ★ and have smaller `bl_val`, so their $z_t$ is on a slightly different scale than older ones — but this is the *correct* mixture of "policy-iteration progress evidence" the loop is designed to learn from, not a bug.
-- **Persistence:** `save(path)` / `load(path)` via `torch.save` of the dict. `n_filled_tuples` and the write head are part of the dict.
+- **Persistence:** `save(path)` writes the tensor dict + `n_filled_tuples` + `write_head_inst` + `write_head_tuple` via `torch.save`. **`_step_index` is NOT saved** — it is a runtime-cached projection of the dense slot layout and is deterministically rebuilt on `load()`. Rebuild logic exploits the locked invariant `tuple_slot = inst_idx * N + step`:
+  ```python
+  def load(self, path):
+      d = torch.load(path)
+      self.<tensor fields>...                      # restore data
+      self.n_filled_tuples = d['n_filled_tuples']
+      self.write_head_inst = d['write_head_inst']
+      self.write_head_tuple = d['write_head_tuple']
+      # Rebuild _step_index from the (slot % N == step) identity.
+      slots = np.arange(self.capacity_tuples)
+      step_per_slot = slots % self.N
+      filled = self._filled_mask()                 # True for currently-valid slots
+      self._step_index = [
+          slots[(step_per_slot == t) & filled].astype(np.int32)
+          for t in range(self.N)
+      ]
+  ```
+  Cost: O(`capacity_tuples`) one-time on load — microseconds at TSP-20 (~4M slots). Rationale for rebuild over persist: eliminates a "saved index out of sync with saved data" failure mode if any future buffer change updates one path but not the other; keeps the save file smaller and schema-stable; makes `_step_index` purely a derived runtime cache. Sampling correctness is order-invariant within each step's index, so the rebuild produces an equivalent (not necessarily identical) index to what was in memory at save time.
 
 **B.2 State-tensor reconstruction utility** in the same file (~50 LOC).
 - Given a buffer record, reconstruct the `StateTSP` named-tuple needed by `model.decoder.decode_step`.
@@ -194,7 +220,8 @@ loss = policy_loss + opts.lambda_v * value_loss
 
 **B.4 Smoke unit test** — `src/scripts/smoke_alphazero.py` (~150 LOC; staged across phases).
 - **A1**: construct a 5-instance buffer manually (random pi_t, random z), run one `train_step_alphazero`, verify loss is finite, gradients flow into encoder + value_head + decoder.
-- **A1.5 (stratification)**: call `buffer.sample(batch_size=8)` repeatedly (≥30 calls); assert every returned batch has all rows aligned to the same scalar `state_i` value (i.e., the per-row reconstruction tensors are internally consistent). Assert that across the 30 calls, every step value 0..N-1 appears at least once (uniform-step coverage). Assert `pi_batch[r, a] == 0` for every visited city `a` per row `r` (correctness invariant — never train on visited-city actions); assert `pi_batch.sum(-1)` is 1 within float tolerance; assert `pi_batch >= 0` everywhere. **Do NOT** assert that every unvisited city has positive `pi_batch` mass — at low K or sharp priors, PUCT can leave legal actions unexplored (N=0 → π=0).
+- **A1.5 (stratification — deterministic per-step coverage).** Loop `for t in range(N): batch = buffer.sample_step(t, batch_size=8)` and assert every returned batch has all rows reporting `state_i == t` (catches wrong-row-routing). Also call `buffer.sample(batch_size=8)` once and assert all rows in that batch share the same `state_i` (the random-step path obeys stratification). Assert `pi_batch[r, a] == 0` for every visited city `a` per row `r` (correctness invariant — never train on visited-city actions); assert `pi_batch.sum(-1)` is 1 within float tolerance; assert `pi_batch >= 0` everywhere. **Do NOT** assert that every unvisited city has positive `pi_batch` mass — at low K or sharp priors, PUCT can leave legal actions unexplored (N=0 → π=0). **Probabilistic coverage of `sample()` over many random calls is intentionally not asserted** — at N=20 with 30 draws the miss probability is ~0.43; with 200 draws it's still nontrivial. Stratification correctness is established by `sample_step(t)` deterministic checks, not by waiting for the random path to enumerate steps.
+- **A1.6 (resume — `_step_index` rebuild on load)**: push 50 instances into a fresh buffer, snapshot `_step_index`, call `buffer.save(tmp_path)` then construct a new buffer and `buffer.load(tmp_path)`. Assert each `_step_index[t]` (as a *set* of slot indices — rebuild order can differ from runtime-append order; sampling is set-uniform so order is irrelevant) equals the snapshot. Then loop `for t in range(N): buffer.sample_step(t, batch_size=4)` on the reloaded buffer and assert each returned batch satisfies the A1.5 invariants (all rows have `state_i == t`, π non-negative + sums-to-one + visited-mass-zero). This catches "save persisted data but not the index, sample crashes / returns garbage" deterministically.
 
 **Code reuse:** value-target normalization machinery from `trainer.py:208-219` (the `bl_val.unsqueeze(-1)` Z pattern); decoder API from `attention_model.py:precompute_decoder, decode_step`.
 
@@ -553,7 +580,7 @@ These are knobs that the F.3 pilot will surface evidence on. Defaults selected; 
 1. **`return_root_visits` C++ marshalling overhead.** At TSP-20 K=100 with 20 steps, that's 20 list-of-≤20 allocs per instance × 1000 instances/iter. Mitigation: return as a flat numpy array `(n_instances, n_steps, n_legal_actions)` of int32 (zero-padded); deserialize once on the Python side. Profile before/after Phase A; expected overhead < 1% of total iter time.
 2. **Replay buffer staleness.** If gating rejects 5+ candidates in a row, the buffer's older slices were drawn under outdated policies. Mitigation: track `gate_fail_streak` in logs; F.3 will surface the worst-case. Stage 5 ablation: window-scaling with size proportional to total instances seen.
 3. **π_t entropy collapse late in tour.** As legal_actions(t) → 1, the visit dist becomes degenerate (one-hot on the forced action). The CE term `−π_t · log p_θ(·|s_t)` is *not* ill-defined: the AM decoder's legality mask makes `log p_θ(·|s_t)` sharp on the same forced action, so CE is finite and small (essentially zero gradient on the policy at this step). Original plan revision included a "skip records with `legal_actions == 1`" mitigation, but **that conflicts with the dense `capacity_instances * N` ring-buffer layout** (skipping leaves uninitialized slots that sampling could hit, requiring either a `valid_mask` with rejection sampling or a packed `_step_index` with variable per-instance counts — both materially complicate the buffer). **Resolution: keep all N per-step records.** Late-step trivial CE is not a bug; AGZ stores tuples for every step up to termination too (Methods §Self-play). The wasted compute is ~5% of records carrying near-zero gradient — acceptable cost for a clean dense buffer. F.3 smoke confirms the loss stays finite and free of NaN at the trivial steps.
-4. **Off-policy R² collapse on novel states.** Stage 3 E.1 found R²=0.9949 on MCTS-visited states drawn from the *Stage 1* model. If Stage 4 explores meaningfully different regions, value-head accuracy might drop, slowing distillation. Mitigation: log per-iteration value loss (B.3 dict output); if value loss diverges relative to Stage 1's, switch to rollout leaf eval (G.1) or per-step cost-to-go target (G.6).
+4. **Off-policy R² collapse on novel states.** Stage 3 E.1 found R²=0.9949 on MCTS-visited states drawn from the *Stage 1* model. If Stage 4 explores meaningfully different regions, value-head accuracy might drop, slowing distillation. Mitigation: log per-iteration value loss (B.3 dict output); if value loss diverges relative to Stage 1's, switch to rollout leaf eval (G.1) or best-so-far per-instance normalization (G.6) — the latter swaps the trainer's `bl_val` for `min_seen tour_cost(x)`, which is stationary across iterations and may stabilize the value target on hard instances. **Per-state cost-to-go is already the F.4 default; do not revive broadcast-z.**
 5. **Gating false-rejects on small ε signal.** Early iterations may differ from best by < 0.001 — within the t-test's noise floor on val_size=10K. Mitigation: log val_avg_cost every iteration even when gating doesn't run, so the headline curve is monotone-trackable independent of gating cadence. Per scope decision 3, gating rejection does not roll back trainer weights — so false-rejects don't penalize learning, they just delay the "best" pointer update.
 6. **value_head leaf eval exposes a quality gap.** Per Stage 2/3, value_head is worse than rollout for *test-time* MCTS quality. Stage 4 hopes the value head improves under MCTS-distillation pressure. If F.3 shows tour quality regressing, switch to G.1 (rollout) immediately.
 7. **C++ tau-per-step plumbing edge cases.** `step50` means τ becomes 0 mid-tour — `_pick_root_action` must handle τ=0 (argmax) cleanly. Mitigation: existing code at `mcts.py:415` already branches on `temperature == 0`; just need to read the per-step value. C++ mirror has the same branch.
@@ -581,7 +608,7 @@ End-to-end test, run in order:
 - **From-scratch training** (canonical "AlphaGo Zero" comparison) — does the Stage 1 warm-start advantage matter at convergence?
 - **Window-scaled replay buffer** à la KataGo (`ref/KataGo-master/SelfplayTraining.md`).
 - **Mixed leaf-eval schedule** — start with rollout, switch to value_head once off-policy R² > 0.99 (Stage 3 E.1 was 0.9949 already, so the threshold may be hit immediately).
-- **Cost-to-go vs broadcast-z value target** ablation (G.6 above) for value-head training shape.
+- **Best-so-far per-instance value normalization** (G.6 above) — $z_t = (\text{tour\_cost} - \text{lengths}_t) / \min_\text{seen}\text{tour\_cost}(x)$, replacing $\text{bl\_val}$ with the per-instance running optimum. Stationary across iterations, no model dependency. (Note: the *broadcast-z vs per-state cost-to-go* question is resolved — per-state V_CURRENT cost-to-go is the F.4 default; broadcast-z would double-count path cost against the existing leaf evaluator. Do not revive.)
 - **Multi-model arena** — pit each gating-accepted model against all prior accepted models (TrueSkill ranking) for an Elo-curve headline matching AlphaGo Zero's published figure.
 
 ---
