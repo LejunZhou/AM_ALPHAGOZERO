@@ -20,6 +20,12 @@ struct Config {
   double virtual_loss_margin = 0.5;
   double c_puct = 0.05;
   double temperature = 0.0;
+  // Per-tour-step temperature schedule (Stage 4 Phase E). Encoding mirrored
+  // by `solver.py` from MCTSConfig.temperature_schedule:
+  //   0 = None / 'const' (constant τ = temperature; Stage 2/3 default)
+  //   1 = 'step30'       (τ = temperature for step < ceil(0.3*N), else 0)
+  //   2 = 'step50'       (τ = temperature for step < ceil(0.5*N), else 0)
+  int temperature_schedule = 0;
   double dirichlet_alpha = 0.3;
   double dirichlet_epsilon = 0.0;
   std::string leaf_eval = "rollout";
@@ -139,6 +145,9 @@ class Solver {
   py::object rollout_evaluator_;
   Counters counters_;
   std::mt19937_64 rng_;
+  // Per-tour-step τ schedule, length N, filled at solve_instance entry per
+  // cfg_.temperature_schedule. Indexed by state.step in pick_root_action.
+  std::vector<double> tau_per_step_;
 };
 
 py::dict solve_instance(py::array coords,

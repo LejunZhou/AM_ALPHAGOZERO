@@ -40,6 +40,14 @@ class MCTSConfig:
     virtual_loss_margin: float = 0.5          # temporary Q penalty per pending edge
     c_puct: float = 0.05                      # routing sweet spot; AlphaGo's 1.0 is wrong here
     temperature: float = 0.0                  # 0 = argmax, >0 = sample from N^(1/τ)
+    # Per-tour-step temperature schedule (Stage 4 Phase E).
+    # Accepts {None, 'const', 'step30', 'step50'}. Semantics:
+    #   None | 'const' : τ = cfg.temperature for all steps (preserves Stage 2/3 behavior).
+    #   'step30'       : τ = cfg.temperature for first ⌈0.3·N⌉ steps, τ = 0 thereafter.
+    #   'step50'       : τ = cfg.temperature for first ⌈0.5·N⌉ steps, τ = 0 thereafter.
+    # Affects ONLY action-selection σ_t at the root; the stored visit dist π_t
+    # (when Phase A is wired) remains raw τ=1.
+    temperature_schedule: Optional[str] = None
     dirichlet_alpha: float = 0.3
     dirichlet_epsilon: float = 0.0            # 0 = noise off (Stage 2 default)
 
@@ -84,6 +92,8 @@ class MCTSSolver:
     VALID_VALUE_NORM = {'bl', 'sqrt_n'}
     VALID_FPU_MODE = {'fallback', 'running_q', 'node_value'}
     VALID_ROOT_SELECT = {'visits', 'q'}
+    # None and 'const' are treated identically (constant τ = cfg.temperature).
+    VALID_TEMPERATURE_SCHEDULE = {None, 'const', 'step30', 'step50'}
 
     def __init__(self,
                  model: AttentionModel,
@@ -140,6 +150,11 @@ class MCTSSolver:
             raise ValueError(f"cfg.fpu_mode={cfg.fpu_mode!r} not in {cls.VALID_FPU_MODE}")
         if cfg.root_select not in cls.VALID_ROOT_SELECT:
             raise ValueError(f"cfg.root_select={cfg.root_select!r} not in {cls.VALID_ROOT_SELECT}")
+        if cfg.temperature_schedule not in cls.VALID_TEMPERATURE_SCHEDULE:
+            raise ValueError(
+                f"cfg.temperature_schedule={cfg.temperature_schedule!r} "
+                f"not in {cls.VALID_TEMPERATURE_SCHEDULE}"
+            )
         if cfg.leaf_eval == 'value_head' and model.value_head is None:
             raise ValueError(
                 "cfg.leaf_eval='value_head' but model has no value_head. "
@@ -410,6 +425,31 @@ class MCTSSolver:
         total_real = float(cur.get_final_cost().view(-1)[0].item())
         return total_real - c_path_start
 
+    @staticmethod
+    def _resolve_tau(cfg: 'MCTSConfig', step: int, n: int) -> float:
+        """Look up the per-tour-step temperature τ under cfg.temperature_schedule.
+
+        Behavior (mirrored exactly in the C++ backend):
+            - None or 'const' : τ = cfg.temperature for all steps (Stage 2/3 default).
+            - 'step30'        : τ = cfg.temperature for step < ⌈0.3·N⌉, else τ = 0.
+            - 'step50'        : τ = cfg.temperature for step < ⌈0.5·N⌉, else τ = 0.
+
+        `step` is the 0-indexed tour-step (state.i at the root); `n` is the graph
+        size. The schedule affects ONLY the σ_t action-selection draw at the root;
+        the raw visit counts N(s_t, ·) used by Phase C as the π_t target are not
+        modified here.
+        """
+        sched = cfg.temperature_schedule
+        if sched is None or sched == 'const':
+            return float(cfg.temperature)
+        if sched == 'step30':
+            cutoff = math.ceil(0.3 * n)
+            return float(cfg.temperature) if step < cutoff else 0.0
+        if sched == 'step50':
+            cutoff = math.ceil(0.5 * n)
+            return float(cfg.temperature) if step < cutoff else 0.0
+        raise ValueError(f"unknown temperature_schedule: {sched!r}")
+
     def _pick_root_action(self, root: MCTSNode) -> int:
         """Final action from the root. If K=0 (no sims), falls back to argmax prior.
 
@@ -419,6 +459,9 @@ class MCTSSolver:
             - cfg.root_select == 'visits' and τ==0  →  argmax N (ties broken by action order).
             - cfg.root_select == 'visits' and τ>0   →  sample ∝ N^(1/τ).
             - cfg.root_select == 'q'                →  argmax Q among visited actions.
+
+        τ is looked up via `_resolve_tau` from `cfg.temperature_schedule`; the
+        scalar `cfg.temperature` is recovered when the schedule is None/'const'.
         """
         if not root.N:
             # No simulation ran — fall back to argmax prior.
@@ -433,11 +476,15 @@ class MCTSSolver:
             return max(root.N.keys(), key=lambda a: root.Q[a])
 
         # 'visits'
+        step = int(root.state.i.view(-1)[0].item())
+        n = int(root.state.loc.size(1))
+        tau = self._resolve_tau(self.cfg, step, n)
+
         actions = sorted(root.N.keys())
         counts = np.array([root.N[a] for a in actions], dtype=np.float64)
-        if self.cfg.temperature == 0.0 or counts.max() == 0:
+        if tau == 0.0 or counts.max() == 0:
             return actions[int(counts.argmax())]
-        counts_pow = counts ** (1.0 / self.cfg.temperature)
+        counts_pow = counts ** (1.0 / tau)
         probs = counts_pow / counts_pow.sum()
         return int(self.rng.choice(actions, p=probs))
 

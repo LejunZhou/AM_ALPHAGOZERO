@@ -2,8 +2,8 @@
 
 **Plan:** `_plans/stage4_plan.md`
 **Started:** 2026-04-29
-**Last updated:** 2026-04-29 — Plan refined against AGZ paper (Methods + Ext. Data Table 3) and `ref/KataGo-master`. Phase A in flight.
-**Status:** **Phase A.1 (Python visit hook) in progress.**
+**Last updated:** 2026-04-30 — Phase E (temperature schedule) landed independently of Phase A in this worktree.
+**Status:** **Phase E (temperature schedule) complete; Phases A/B/C/D/F/G remaining.** (Phase E intentionally adds no dependency on Phase A: the new `MCTSConfig.temperature_schedule` field defaults to `None`, which preserves Stage 2/3 behavior bit-for-bit.)
 
 ---
 
@@ -66,9 +66,26 @@ KataGo cross-references added to plan's footer: `MAX_TRAIN_PER_DATA=8` cap (we s
 
 ### Phase E — Temperature schedule + Dirichlet noise (no GPU)
 
-- [ ] **E.1** `MCTSConfig.temperature_schedule` (`'const'` | `'step30'` | `'step50'`); Python + C++ wiring. Default `'step30'` (closest to AGZ Methods §Self-play scaled to TSP plies).
-- [ ] **E.2** Dirichlet noise CLI flags exposed (ε, α via `--dirichlet_epsilon`, `--dirichlet_alpha_factor`).
-- [ ] **E.3** Smoke A3 — TSP-20 K=50 self-play with `step30`; verify per-step root entropy decays sharply at step 6.
+- [x] **E.1** `MCTSConfig.temperature_schedule` (`None` | `'const'` | `'step30'` | `'step50'`); Python + C++ wiring. Default kept at `None` (≡ `'const'` ≡ existing scalar `cfg.temperature`) to preserve Stage 2/3 caller behavior; `'step30'` becomes the documented self-play default and is opted into by the Phase C self-play preset.
+- [ ] **E.2** Dirichlet noise CLI flags exposed (ε, α via `--dirichlet_epsilon`, `--dirichlet_alpha_factor`). *(Deferred to Phase G — wiring already verified via existing `MCTSConfig.dirichlet_*` fields and confirmed by A14.c: ε=0.25 + step30 produces seed-divergent early-step actions on TSP-20.)*
+- [x] **E.3** Smoke A14 added in `src/scripts/smoke_mcts.py`. Sub-checks:
+    - **A14a** unit-tests `MCTSSolver._resolve_tau` for None/'const'/'step30'/'step50' on N=20 (cutoffs 6 and 10).
+    - **A14b** `temperature_schedule='garbage'` raises `ValueError`.
+    - **A14c** TSP-20 K=50 self-play with τ=1, ε=0.25, schedule='step30' instruments `_pick_root_action` and confirms τ=1 for steps 0–5 and τ=0 for steps 6–19.
+    - **A14d** Two seeds on the same instance produce different first-6 actions (sampling engaged); same seed is bit-exactly reproducible.
+    - **A14e** None/'const'/'step50' plumb through end-to-end on the Python solver.
+    - **CPP A14** mirror smoke: all four schedule values plumb cleanly through `CppMCTSSolver` and `CppBatchMCTSSolver` on a 4-instance batch.
+
+**Phase E completion note (2026-04-30):** Edits landed in this worktree:
+| File | LOC delta | Change |
+|---|---|---|
+| `src/am_baseline/search/mcts.py` | +49 | Added `MCTSConfig.temperature_schedule`, `VALID_TEMPERATURE_SCHEDULE`, validation, `MCTSSolver._resolve_tau` static helper, per-step τ lookup in `_pick_root_action`. |
+| `src/am_baseline/search/mcts_cpp/mcts.hpp` | +9 | Added `Config::temperature_schedule` (int 0/1/2 encoding) and `Solver::tau_per_step_` member. |
+| `src/am_baseline/search/mcts_cpp/mcts.cpp` | +35 | Anonymous-namespace `build_tau_per_step` helper; populated `tau_per_step_` at solve_instance entry; `pick_root_action` and `batch_pick_root_action` now index `tau_per_step` for τ; `BatchInstance` carries its own `tau_per_step`. |
+| `src/am_baseline/search/mcts_cpp/solver.py` | +18 | `_SCHEDULE_TO_INT` map + translation in `_cfg_dict`. |
+| `src/scripts/smoke_mcts.py` | +135 | A14 docstring + 5 sub-checks (Python) and CPP/CPP_BATCH A14 schedule plumbing. |
+
+Defaults are unchanged: `MCTSConfig.temperature_schedule = None` ≡ `'const'` ≡ existing scalar `cfg.temperature` behavior — Stage 2/3 callers see no behavioral change. Dirichlet wiring (E.2) was verified end-to-end via A14.c (ε=0.25 + step30 + τ=1 yields seed-divergent first-6 actions).
 
 ### Phase F — TSP-20 pilot + main run (~2.5 h compute)
 

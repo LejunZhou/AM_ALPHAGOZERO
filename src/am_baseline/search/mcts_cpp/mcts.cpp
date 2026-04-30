@@ -28,6 +28,32 @@ std::vector<double> sequence_to_doubles(py::handle handle) {
   return values;
 }
 
+// Build the per-tour-step τ schedule of length n, mirroring the Python
+// MCTSSolver._resolve_tau helper. Encoding (Config::temperature_schedule):
+//   0 = None / 'const'  → constant τ = cfg.temperature
+//   1 = 'step30'        → τ = cfg.temperature for step < ceil(0.3*n), else 0
+//   2 = 'step50'        → τ = cfg.temperature for step < ceil(0.5*n), else 0
+std::vector<double> build_tau_per_step(const Config& cfg, int n) {
+  std::vector<double> tau(static_cast<std::size_t>(std::max(n, 0)), cfg.temperature);
+  if (cfg.temperature_schedule == 0 || n <= 0) {
+    return tau;
+  }
+  double frac = 0.0;
+  if (cfg.temperature_schedule == 1) {
+    frac = 0.3;
+  } else if (cfg.temperature_schedule == 2) {
+    frac = 0.5;
+  } else {
+    throw std::runtime_error("unknown temperature_schedule encoding");
+  }
+  const int cutoff = static_cast<int>(std::ceil(frac * static_cast<double>(n)));
+  for (int step = 0; step < n; ++step) {
+    tau[static_cast<std::size_t>(step)] =
+        (step < cutoff) ? cfg.temperature : 0.0;
+  }
+  return tau;
+}
+
 std::vector<unsigned char> sequence_to_bools(py::handle handle) {
   py::sequence seq = py::reinterpret_borrow<py::sequence>(handle);
   std::vector<unsigned char> values;
@@ -48,6 +74,7 @@ Config Config::from_python(py::dict cfg) {
   out.virtual_loss_margin = get_or<double>(cfg, "virtual_loss_margin", out.virtual_loss_margin);
   out.c_puct = get_or<double>(cfg, "c_puct", out.c_puct);
   out.temperature = get_or<double>(cfg, "temperature", out.temperature);
+  out.temperature_schedule = get_or<int>(cfg, "temperature_schedule", out.temperature_schedule);
   out.dirichlet_alpha = get_or<double>(cfg, "dirichlet_alpha", out.dirichlet_alpha);
   out.dirichlet_epsilon = get_or<double>(cfg, "dirichlet_epsilon", out.dirichlet_epsilon);
   out.leaf_eval = get_or<std::string>(cfg, "leaf_eval", out.leaf_eval);
@@ -65,6 +92,10 @@ Config Config::from_python(py::dict cfg) {
   }
   if (out.virtual_loss_margin < 0.0) {
     throw std::runtime_error("virtual_loss_margin must be >= 0");
+  }
+  if (out.temperature_schedule < 0 || out.temperature_schedule > 2) {
+    throw std::runtime_error(
+        "temperature_schedule must be 0 (const/None), 1 (step30), or 2 (step50)");
   }
   return out;
 }
@@ -189,6 +220,7 @@ py::dict Solver::solve_instance(std::shared_ptr<const std::vector<double>> coord
                                 int n,
                                 double bl_val) {
   counters_ = Counters{};
+  tau_per_step_ = build_tau_per_step(cfg_, n);
   TspState state = TspState::initial(std::move(coords), n);
   std::unique_ptr<Node> root;
   std::vector<int> tour;
@@ -781,12 +813,19 @@ int Solver::pick_root_action(const Node& root) {
   if (actions.empty()) {
     throw std::runtime_error("root_select='visits' found no visited action");
   }
-  if (cfg_.temperature == 0.0 || max_count == 0) {
+  // Look up τ for this root's tour-step from the precomputed schedule.
+  // Defaults to cfg_.temperature when the schedule is const/None.
+  double tau = cfg_.temperature;
+  const int step = root.state.step;
+  if (step >= 0 && step < static_cast<int>(tau_per_step_.size())) {
+    tau = tau_per_step_[static_cast<std::size_t>(step)];
+  }
+  if (tau == 0.0 || max_count == 0) {
     return actions[static_cast<std::size_t>(
         std::distance(weights.begin(), std::max_element(weights.begin(), weights.end())))];
   }
 
-  const double inv_temp = 1.0 / cfg_.temperature;
+  const double inv_temp = 1.0 / tau;
   for (double& weight : weights) {
     weight = std::pow(weight, inv_temp);
   }
@@ -969,7 +1008,10 @@ void batch_backup(const std::vector<PathEntry>& path, double value_for_backup) {
   }
 }
 
-int batch_pick_root_action(const Node& root, const Config& cfg, std::mt19937_64& rng) {
+int batch_pick_root_action(const Node& root,
+                           const Config& cfg,
+                           const std::vector<double>& tau_per_step,
+                           std::mt19937_64& rng) {
   if (root.total_visits() == 0) {
     int best_action = -1;
     double best_prior = -std::numeric_limits<double>::infinity();
@@ -1027,12 +1069,18 @@ int batch_pick_root_action(const Node& root, const Config& cfg, std::mt19937_64&
   if (actions.empty()) {
     throw std::runtime_error("root_select='visits' found no visited action");
   }
-  if (cfg.temperature == 0.0 || max_count == 0) {
+  // Per-tour-step τ lookup mirrors the sequential Solver::pick_root_action.
+  double tau = cfg.temperature;
+  const int step = root.state.step;
+  if (step >= 0 && step < static_cast<int>(tau_per_step.size())) {
+    tau = tau_per_step[static_cast<std::size_t>(step)];
+  }
+  if (tau == 0.0 || max_count == 0) {
     return actions[static_cast<std::size_t>(
         std::distance(weights.begin(), std::max_element(weights.begin(), weights.end())))];
   }
 
-  const double inv_temp = 1.0 / cfg.temperature;
+  const double inv_temp = 1.0 / tau;
   for (double& weight : weights) {
     weight = std::pow(weight, inv_temp);
   }
@@ -1109,7 +1157,8 @@ struct BatchInstance {
       : cfg(std::move(cfg_)),
         bl_val(bl_val_),
         state(TspState::initial(std::move(coords), n)),
-        rng(cfg.seed) {}
+        rng(cfg.seed),
+        tau_per_step(build_tau_per_step(cfg, n)) {}
 
   py::object collect_request(int slot) {
     if (pending_kind != BatchPendingKind::None) {
@@ -1169,7 +1218,7 @@ struct BatchInstance {
             slot, pending_leaf->state, cfg.leaf_eval == "value_head", cfg.leaf_eval == "rollout");
       }
 
-      const int action = batch_pick_root_action(*root, cfg, rng);
+      const int action = batch_pick_root_action(*root, cfg, tau_per_step, rng);
       tour.push_back(action);
       state.update_in_place(action);
 
@@ -1242,6 +1291,7 @@ struct BatchInstance {
   std::vector<PathEntry> pending_path;
   Counters counters;
   std::mt19937_64 rng;
+  std::vector<double> tau_per_step;
 };
 
 }  // namespace
