@@ -2,8 +2,8 @@
 
 **Plan:** `_plans/stage1_plan.md`
 **Started:** 2026-04-23
-**Last updated:** 2026-04-29 (bs=2048 TSP-20/TSP-50 follow-up finished; reduced-compute TSP-100 AM+value still running)
-**Status:** **Stage 1 COMPLETE.** Phases A–D all closed. Required runs (canonical 100-epoch, λ-sweep, target-norm ablation) all met both success criteria. Optional TSP-50 verification finished 2026-04-24 — both AM-baseline (`apy5m2lf` → 5.8072) and AM+value (`123x2qr5` → 5.7999, R²=0.9957) reproduce / slightly exceed AM paper's TSP-50 reference, and the value head's "no policy degradation" claim holds at the larger graph size. The full-epoch bs=2048 follow-up is finished: TSP-20 nearly matches canonical, but TSP-50 shows a meaningful same-LR large-batch quality regression. Reduced-compute TSP-100 AM+value remains in flight. Stage 2 is consuming Stage 1's TSP-20 (`xg7t2dlb`) and TSP-50 (`123x2qr5`) checkpoints.
+**Last updated:** 2026-04-29 (bs=2048 TSP-20/TSP-50 follow-up finished; reduced-compute TSP-100 AM+value finished)
+**Status:** **Stage 1 COMPLETE.** Phases A–D all closed. Required runs (canonical 100-epoch, λ-sweep, target-norm ablation) all met both success criteria. Optional TSP-50 verification finished 2026-04-24 — both AM-baseline (`apy5m2lf` → 5.8072) and AM+value (`123x2qr5` → 5.7999, R²=0.9957) reproduce / slightly exceed AM paper's TSP-50 reference, and the value head's "no policy degradation" claim holds at the larger graph size. The full-epoch bs=2048 follow-up is finished: TSP-20 nearly matches canonical, but TSP-50 shows a meaningful same-LR large-batch quality regression. Reduced-compute TSP-100 AM+value finished and produced a usable value-head checkpoint (`g7jxkixo`, final `val_avg_cost=8.21043`, final `val_value_r2_overall=0.99337`). Stage 2 is consuming Stage 1's TSP-20 (`xg7t2dlb`) and TSP-50 (`123x2qr5`) checkpoints.
 
 ---
 
@@ -226,18 +226,22 @@ Notes:
 - Against canonical bs=512: TSP-20 `3.84443` vs `xg7t2dlb` `3.8424` is a small +0.0020 regression, so full training almost removes the earlier epoch-29 undertraining gap. TSP-50 `5.81350` vs `123x2qr5` `5.7999` is a clearer +0.0136 regression.
 - Conclusion: same-LR bs=2048 is acceptable as a throughput diagnostic, but not promoted as the canonical training recipe for TSP-50. Keep canonical/highest-quality AM+value checkpoints at bs=512 unless a future large-batch LR retune recovers the gap.
 
-## TSP-100 reduced-compute AM+value — LAUNCHED 2026-04-28
+## TSP-100 reduced-compute AM+value — FINISHED 2026-04-29
 
 Purpose: produce a usable TSP-100 value-head checkpoint faster than canonical AM-equivalent training. This is a reduced-compute run, not directly comparable to AM's 2500-batches/epoch setup. Settings: `batch_size=1024`, `epoch_size=640000`, `n_epochs=100`, `lr_model=1e-4`, `baseline=rollout`, `bl_warmup_epochs=1`, `seed=1234`, `num_workers=4`, `lambda_v=1.0`, `value_target_norm=bl`, `checkpoint_epochs=1`.
 
-| Run name | Modal app | W&B run | Status at launch check |
+| Run name | Modal app | W&B run | Final status |
 |:--|:--|:--|:--|
-| `stage1_tsp100_bs1024_ep640k_with_value` | `ap-yqtUhNFW9YMjgf4WHCY82v` | [`g7jxkixo`](https://wandb.ai/lejun/am-alphagozero/runs/g7jxkixo) | running; logs reached epoch 1 |
+| `stage1_tsp100_bs1024_ep640k_with_value_20260428T233519` | `ap-yqtUhNFW9YMjgf4WHCY82v` | [`g7jxkixo`](https://wandb.ai/lejun/am-alphagozero/runs/g7jxkixo) | finished; reached epoch 99 |
 
 Notes:
 - Intended update count confirmed: `640000 / 1024 = 625` batches per epoch, `62500` total updates over 100 epochs.
-- Initial TSP-100 logs show `gpu_mem_peak ≈ 13806 MB` (61.1% of A10's 22588 MB), safely below the 20 GB watch threshold.
-- Completion analysis should record final `val_avg_cost`, best `val_avg_cost`, final `val_value_r2_overall`, final checkpoint path, wall-clock, and explicitly label the run as reduced-compute.
+- Final `val_avg_cost=8.21043`; best `val_avg_cost=8.20918` at epoch 91.
+- Final value diagnostics: `val_value_r2_overall=0.99337` (`early=0.92407`, `mid=0.96311`, `late=0.96376`), `val_value_loss=0.0005479`, residual mean `+0.00455`.
+- Runtime: W&B `_runtime=45849s` (~12h44m); summed epoch durations `45122.9s`; final epoch duration `451.6s`.
+- GPU memory stayed below the watch threshold: peak `13805.7 MB` (61.1% of A10's `22587.6 MB`).
+- Modal volume artifact check confirmed `epoch-99.pt`, `epochs.csv`, `metrics.csv`, and per-epoch checkpoints under `outputs/tsp_100/stage1_tsp100_bs1024_ep640k_with_value_20260428T233519/`.
+- Checkpoint for Stage 4 / TSP-100 value-head experiments: `outputs/tsp_100/stage1_tsp100_bs1024_ep640k_with_value_20260428T233519/epoch-99.pt`.
 
 ## Per-step value diagnostic — added 2026-04-24
 

@@ -22,7 +22,13 @@ import torch
 from tqdm import tqdm
 
 from am_baseline.problem.tsp import TSP
-from am_baseline.search import CppMCTSSolver, HAVE_CPP_MCTS, MCTSConfig, MCTSSolver
+from am_baseline.search import (
+    CppBatchMCTSSolver,
+    CppMCTSSolver,
+    HAVE_CPP_MCTS,
+    MCTSConfig,
+    MCTSSolver,
+)
 from am_baseline.utils.misc import load_model
 
 
@@ -79,9 +85,13 @@ def main() -> int:
     parser.add_argument('--root_select', choices=['visits', 'q'], default='visits',
                         help="Final action at root: 'visits' (AlphaGo default) or 'q' "
                              "(diagnostic — argmax Q among visited actions).")
-    parser.add_argument('--backend', choices=['python', 'cpp'], default='python',
+    parser.add_argument('--backend', choices=['python', 'cpp', 'cpp_batch'], default='python',
                         help="MCTS implementation backend. 'cpp' uses the optional pybind11 "
-                             "tree-walk extension and keeps model forwards in PyTorch.")
+                             "tree-walk extension and keeps model forwards in PyTorch. "
+                             "'cpp_batch' batches NN requests across independent C++ trees.")
+    parser.add_argument('--mcts_batch_size', type=int, default=32,
+                        help="cpp_batch backend only. Number of independent MCTS trees solved "
+                             "together for cross-instance NN batching.")
     tree_reuse_group = parser.add_mutually_exclusive_group()
     tree_reuse_group.add_argument('--tree_reuse', dest='tree_reuse', action='store_true',
                                   help='Retain the subtree below the chosen action as the next root '
@@ -112,6 +122,13 @@ def main() -> int:
     if args.backend == 'python' and args.simulation_batch_size != 1:
         print(
             "ERROR: --simulation_batch_size > 1 is only supported with --backend cpp.",
+            file=sys.stderr,
+        )
+        return 2
+    if args.backend == 'cpp_batch' and args.simulation_batch_size != 1:
+        print(
+            "ERROR: --backend cpp_batch preserves one pending simulation per tree; "
+            "leave --simulation_batch_size=1.",
             file=sys.stderr,
         )
         return 2
@@ -154,20 +171,25 @@ def main() -> int:
         tree_reuse=args.tree_reuse,
         seed=args.seed,
     )
-    if args.backend == 'cpp':
+    if args.backend in {'cpp', 'cpp_batch'}:
         if not HAVE_CPP_MCTS:
             print(
-                "ERROR: --backend cpp requested, but the C++ extension is not built. "
+                f"ERROR: --backend {args.backend} requested, but the C++ extension is not built. "
                 "Run `pip install -e .` in the AM_AlphaGoZero environment first.",
                 file=sys.stderr,
             )
             return 2
-        solver_cls = CppMCTSSolver
+        solver_cls = CppBatchMCTSSolver if args.backend == 'cpp_batch' else CppMCTSSolver
     else:
         solver_cls = MCTSSolver
-    solver = solver_cls(model, cfg, device=device)
+    if args.backend == 'cpp_batch':
+        solver = solver_cls(model, cfg, device=device, mcts_batch_size=args.mcts_batch_size)
+    else:
+        solver = solver_cls(model, cfg, device=device)
     print(f"MCTSConfig: {cfg}")
     print(f"MCTS backend: {args.backend}")
+    if args.backend == 'cpp_batch':
+        print(f"MCTS cross-instance batch size: {args.mcts_batch_size}")
 
     # Per-instance loop (sequential). We drive it from here so we can show a
     # progress bar and not hide it inside solve_batch. bl_val is still computed
@@ -191,29 +213,47 @@ def main() -> int:
     virtual_collision_count = torch.empty(B, dtype=torch.long)
     max_virtual_visits_remaining = torch.empty(B, dtype=torch.long)
     t0 = time.time()
-    iterator = range(B)
-    if not args.no_progress_bar:
-        iterator = tqdm(iterator, desc="MCTS")
-    for i in iterator:
-        c_i, t_i = solver.solve_instance(
-            inputs[i:i+1].to(device),
-            bl_val=float(bl_vals[i].item()),
-        )
-        costs[i] = c_i.detach().cpu()
-        tours[i] = t_i.detach().cpu()
-        decode_steps[i] = solver.fwd_count_decode
-        rollout_steps[i] = solver.fwd_count_rollout
-        value_calls[i] = solver.fwd_count_value
-        eval_cache_hits[i] = getattr(solver, 'eval_cache_hits', 0)
-        eval_cache_misses[i] = getattr(solver, 'eval_cache_misses', 0)
-        batch_eval_calls[i] = getattr(solver, 'batch_eval_calls', 0)
-        batch_eval_rows[i] = getattr(solver, 'batch_eval_rows', 0)
-        pending_batch_calls[i] = getattr(solver, 'pending_batch_calls', 0)
-        pending_batch_rows[i] = getattr(solver, 'pending_batch_rows', 0)
-        pending_collection_attempts[i] = getattr(solver, 'pending_collection_attempts', 0)
-        pending_collection_successes[i] = getattr(solver, 'pending_collection_successes', 0)
-        virtual_collision_count[i] = getattr(solver, 'virtual_collision_count', 0)
-        max_virtual_visits_remaining[i] = getattr(solver, 'max_virtual_visits_remaining', 0)
+    if args.backend == 'cpp_batch':
+        c_all, t_all = solver.solve_batch(inputs.to(device), bl_vals=bl_vals)
+        costs[:] = c_all.detach().cpu()
+        tours[:] = t_all.detach().cpu()
+        decode_steps[:] = torch.tensor(solver.fwd_count_decode_per_instance, dtype=torch.long)
+        rollout_steps[:] = torch.tensor(solver.fwd_count_rollout_per_instance, dtype=torch.long)
+        value_calls[:] = torch.tensor(solver.fwd_count_value_per_instance, dtype=torch.long)
+        eval_cache_hits[:] = torch.tensor(solver.eval_cache_hits_per_instance, dtype=torch.long)
+        eval_cache_misses[:] = torch.tensor(solver.eval_cache_misses_per_instance, dtype=torch.long)
+        batch_eval_calls.zero_()
+        batch_eval_rows.zero_()
+        pending_batch_calls.zero_()
+        pending_batch_rows.zero_()
+        pending_collection_attempts.zero_()
+        pending_collection_successes.zero_()
+        virtual_collision_count.zero_()
+        max_virtual_visits_remaining.zero_()
+    else:
+        iterator = range(B)
+        if not args.no_progress_bar:
+            iterator = tqdm(iterator, desc="MCTS")
+        for i in iterator:
+            c_i, t_i = solver.solve_instance(
+                inputs[i:i+1].to(device),
+                bl_val=float(bl_vals[i].item()),
+            )
+            costs[i] = c_i.detach().cpu()
+            tours[i] = t_i.detach().cpu()
+            decode_steps[i] = solver.fwd_count_decode
+            rollout_steps[i] = solver.fwd_count_rollout
+            value_calls[i] = solver.fwd_count_value
+            eval_cache_hits[i] = getattr(solver, 'eval_cache_hits', 0)
+            eval_cache_misses[i] = getattr(solver, 'eval_cache_misses', 0)
+            batch_eval_calls[i] = getattr(solver, 'batch_eval_calls', 0)
+            batch_eval_rows[i] = getattr(solver, 'batch_eval_rows', 0)
+            pending_batch_calls[i] = getattr(solver, 'pending_batch_calls', 0)
+            pending_batch_rows[i] = getattr(solver, 'pending_batch_rows', 0)
+            pending_collection_attempts[i] = getattr(solver, 'pending_collection_attempts', 0)
+            pending_collection_successes[i] = getattr(solver, 'pending_collection_successes', 0)
+            virtual_collision_count[i] = getattr(solver, 'virtual_collision_count', 0)
+            max_virtual_visits_remaining[i] = getattr(solver, 'max_virtual_visits_remaining', 0)
     elapsed = time.time() - t0
 
     # --- Report ---
@@ -236,6 +276,9 @@ def main() -> int:
           f"value_head calls mean={value_calls.float().mean().item():.1f})")
     total_batch_calls = int(batch_eval_calls.sum().item())
     total_batch_rows = int(batch_eval_rows.sum().item())
+    if args.backend == 'cpp_batch':
+        total_batch_calls = int(getattr(solver, 'batch_eval_calls', 0))
+        total_batch_rows = int(getattr(solver, 'batch_eval_rows', 0))
     if total_batch_calls or total_batch_rows:
         realized_batch = total_batch_rows / max(total_batch_calls, 1)
         print(f"  batch eval : calls={total_batch_calls} rows={total_batch_rows} "

@@ -557,3 +557,372 @@ class CppMCTSSolver:
             glimpse_val=fixed.glimpse_val.expand(-1, batch_size, -1, -1, -1),
             logit_key=fixed.logit_key.expand(batch_size, -1, -1, -1),
         )
+
+
+class CppBatchMCTSSolver(CppMCTSSolver):
+    """Cross-instance batched C++ MCTS scheduler.
+
+    C++ still owns each tree's state, PUCT selection, and backup. Python keeps a
+    pool of independent trees active and batches their NN evaluator requests.
+    Each tree has at most one pending request, so per-tree search order matches
+    the sequential C++ backend.
+    """
+
+    def __init__(
+        self,
+        model: AttentionModel,
+        cfg: MCTSConfig,
+        device: Optional[torch.device] = None,
+        mcts_batch_size: int = 32,
+    ):
+        super().__init__(model, cfg, device)
+        if cfg.simulation_batch_size != 1:
+            raise ValueError(
+                "CppBatchMCTSSolver preserves one pending simulation per tree; "
+                "use simulation_batch_size=1."
+            )
+        if mcts_batch_size < 1:
+            raise ValueError("mcts_batch_size must be >= 1")
+        self.mcts_batch_size = int(mcts_batch_size)
+
+        self.fwd_count_decode_per_instance = []
+        self.fwd_count_rollout_per_instance = []
+        self.fwd_count_value_per_instance = []
+        self.eval_cache_hits_per_instance = []
+        self.eval_cache_misses_per_instance = []
+
+    @torch.no_grad()
+    def solve_instance(
+        self,
+        input_1: torch.Tensor,
+        bl_val: Optional[float] = None,
+        enable_r2_log: bool = False,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        if enable_r2_log:
+            raise ValueError("enable_r2_log is only supported by the sequential C++ backend")
+        bl_vals = None
+        if bl_val is not None:
+            bl_vals = torch.tensor([float(bl_val)], device=self.device)
+        costs, tours = self.solve_batch(input_1, bl_vals=bl_vals)
+        return costs[0], tours[0]
+
+    @torch.no_grad()
+    def solve_batch(
+        self,
+        inputs: torch.Tensor,
+        bl_vals: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        inputs = inputs.to(self.device)
+        bsz, n_nodes, _ = inputs.shape
+        if bl_vals is None:
+            bl_vals = self._compute_bl_val_batch(inputs)
+        else:
+            bl_vals = bl_vals.to(self.device)
+
+        costs = torch.empty(bsz, device=self.device)
+        tours = torch.empty(bsz, n_nodes, dtype=torch.long, device=self.device)
+
+        self.fwd_count_decode_per_instance = []
+        self.fwd_count_rollout_per_instance = []
+        self.fwd_count_value_per_instance = []
+        self.eval_cache_hits_per_instance = []
+        self.eval_cache_misses_per_instance = []
+        self.batch_eval_calls = 0
+        self.batch_eval_rows = 0
+
+        for start in range(0, bsz, self.mcts_batch_size):
+            end = min(start + self.mcts_batch_size, bsz)
+            chunk_costs, chunk_tours, chunk_stats = self._solve_chunk(
+                inputs[start:end],
+                bl_vals[start:end],
+            )
+            costs[start:end] = chunk_costs
+            tours[start:end] = chunk_tours
+            self.fwd_count_decode_per_instance.extend(chunk_stats["decode_steps"])
+            self.fwd_count_rollout_per_instance.extend(chunk_stats["rollout_steps"])
+            self.fwd_count_value_per_instance.extend(chunk_stats["value_calls"])
+            self.eval_cache_hits_per_instance.extend(chunk_stats["cache_hits"])
+            self.eval_cache_misses_per_instance.extend(chunk_stats["cache_misses"])
+            self.batch_eval_calls += chunk_stats["batch_eval_calls"]
+            self.batch_eval_rows += chunk_stats["batch_eval_rows"]
+
+        self.fwd_count_decode = int(sum(self.fwd_count_decode_per_instance))
+        self.fwd_count_rollout = int(sum(self.fwd_count_rollout_per_instance))
+        self.fwd_count_value = int(sum(self.fwd_count_value_per_instance))
+        self.eval_cache_hits = int(sum(self.eval_cache_hits_per_instance))
+        self.eval_cache_misses = int(sum(self.eval_cache_misses_per_instance))
+        return costs, tours
+
+    def _solve_chunk(self, input_b: torch.Tensor, bl_vals_b: torch.Tensor):
+        bsz, n_nodes, _ = input_b.shape
+        dtype = input_b.dtype
+        device = self.device
+
+        embeddings = self.model.encode(input_b)
+        fixed = self.model.precompute_decoder(embeddings)
+        dist_b = (input_b[:, :, None, :] - input_b[:, None, :, :]).norm(p=2, dim=-1)
+        coords = input_b.detach().cpu().double().numpy()
+        dist_table = np.linalg.norm(coords[:, :, None, :] - coords[:, None, :, :], axis=-1)
+
+        engine = _mcts_cpp.BatchSearch(
+            coords,
+            self._cfg_dict(),
+            [float(v.item()) for v in bl_vals_b],
+        )
+
+        eval_cache = {}
+        cache_hits = [0 for _ in range(bsz)]
+        cache_misses = [0 for _ in range(bsz)]
+        batch_eval_calls = 0
+        batch_eval_rows = 0
+
+        def cache_key(item, need_value: bool):
+            snap = item["snapshot"]
+            visited_key = tuple(bool(v) for v in snap["visited"])
+            return (
+                int(item["slot"]),
+                bool(need_value),
+                int(snap["step"]),
+                int(snap["first"]),
+                int(snap["prev"]),
+                visited_key,
+            )
+
+        def state_batch_from_items(items):
+            if not items:
+                raise ValueError("state_batch_from_items requires at least one item")
+            step = int(items[0]["snapshot"]["step"])
+            slots = []
+            first_vals = []
+            prev_vals = []
+            lengths = []
+            visited_rows = []
+            for item in items:
+                snap = item["snapshot"]
+                if int(snap["step"]) != step:
+                    raise ValueError("batched cross-instance decoder requests must share step")
+                slot = int(item["slot"])
+                first = int(snap["first"])
+                prev = int(snap["prev"])
+                if step == 0:
+                    first = 0
+                    prev = 0
+                visited = [bool(v) for v in snap["visited"]]
+                if len(visited) != n_nodes:
+                    raise ValueError("snapshot visited mask has wrong graph size")
+                slots.append(slot)
+                first_vals.append(first)
+                prev_vals.append(prev)
+                lengths.append(float(snap["length"]))
+                visited_rows.append(visited)
+
+            slot_t = torch.tensor(slots, dtype=torch.long, device=device)
+            loc = input_b.index_select(0, slot_t)
+            dist = dist_b.index_select(0, slot_t)
+            row_ids = torch.arange(len(items), dtype=torch.long, device=device)[:, None]
+            first_a = torch.tensor(first_vals, dtype=torch.long, device=device).view(len(items), 1)
+            prev_a = torch.tensor(prev_vals, dtype=torch.long, device=device).view(len(items), 1)
+            visited_t = torch.tensor(
+                visited_rows, dtype=torch.bool, device=device
+            ).view(len(items), 1, n_nodes)
+            lengths_t = torch.tensor(lengths, dtype=dtype, device=device).view(len(items), 1)
+            cur_coord = None if step == 0 else loc[row_ids, prev_a]
+            i = torch.tensor([step], dtype=torch.long, device=device)
+            state = StateTSP(
+                loc=loc,
+                dist=dist,
+                ids=row_ids,
+                first_a=first_a,
+                prev_a=prev_a,
+                visited_=visited_t,
+                lengths=lengths_t,
+                cur_coord=cur_coord,
+                i=i,
+            )
+            return state, slot_t
+
+        def eval_many(items, need_value: bool):
+            nonlocal batch_eval_calls, batch_eval_rows
+            items = list(items)
+            results = [None] * len(items)
+            misses_by_step = defaultdict(list)
+
+            for row, item in enumerate(items):
+                slot = int(item["slot"])
+                key = cache_key(item, need_value)
+                cached = eval_cache.get(key)
+                if cached is not None:
+                    cache_hits[slot] += 1
+                    results[row] = cached
+                else:
+                    cache_misses[slot] += 1
+                    misses_by_step[int(item["snapshot"]["step"])].append((row, item, key))
+
+            for _step, rows in misses_by_step.items():
+                row_items = [item for _row, item, _key in rows]
+                state, slot_t = state_batch_from_items(row_items)
+                fixed_b = fixed[slot_t]
+                batch_eval_calls += 1
+                batch_eval_rows += len(row_items)
+
+                if need_value:
+                    log_p, mask, glimpse = self.model.decoder.decode_step(
+                        fixed_b, state, return_glimpse=True
+                    )
+                    values = self.model.value_head(glimpse).view(-1)
+                else:
+                    log_p, mask = self.model.decoder.decode_step(
+                        fixed_b, state, return_glimpse=False
+                    )
+                    values = None
+
+                probs_b = log_p.exp().detach().cpu().double()
+                mask_b = mask.detach().cpu().bool()
+                values_b = values.detach().cpu().double() if values is not None else None
+
+                for local_row, (global_row, _item, key) in enumerate(rows):
+                    probs = probs_b[local_row].view(-1).tolist()
+                    mask_list = mask_b[local_row].view(-1).tolist()
+                    value = float(values_b[local_row].item()) if values_b is not None else 0.0
+                    result = (probs, mask_list, value)
+                    eval_cache[key] = result
+                    results[global_row] = result
+
+            return results
+
+        def rollout_many(requests):
+            rollouts = []
+            for request in requests:
+                snap = request["snapshot"]
+                rollouts.append({
+                    "slot": int(request["slot"]),
+                    "start_length": float(snap["length"]),
+                    "step": int(snap["step"]),
+                    "first": int(snap["first"]),
+                    "prev": int(snap["prev"]),
+                    "length": float(snap["length"]),
+                    "visited": [bool(v) for v in snap["visited"]],
+                    "done": False,
+                    "remaining_cost": None,
+                })
+
+            while True:
+                active = [
+                    (idx, ro)
+                    for idx, ro in enumerate(rollouts)
+                    if not ro["done"] and ro["step"] < n_nodes
+                ]
+                if not active:
+                    break
+
+                by_step = defaultdict(list)
+                for idx, ro in active:
+                    by_step[int(ro["step"])].append((idx, ro))
+
+                for _step, group in by_step.items():
+                    eval_items = []
+                    for _idx, ro in group:
+                        eval_items.append({
+                            "slot": ro["slot"],
+                            "snapshot": {
+                                "step": ro["step"],
+                                "first": ro["first"],
+                                "prev": ro["prev"],
+                                "length": ro["length"],
+                                "visited": ro["visited"],
+                            },
+                        })
+                    evals = eval_many(eval_items, False)
+
+                    for (_idx, ro), (probs, mask, _value) in zip(group, evals):
+                        best_action = -1
+                        best_prob = -math.inf
+                        for action, (prob, is_masked) in enumerate(zip(probs, mask)):
+                            if is_masked:
+                                continue
+                            if prob > best_prob:
+                                best_prob = prob
+                                best_action = action
+                        if best_action < 0:
+                            raise RuntimeError("cross-instance rollout found no legal action")
+
+                        slot = int(ro["slot"])
+                        if ro["step"] > 0:
+                            ro["length"] += dist_table[slot][ro["prev"]][best_action]
+                        else:
+                            ro["first"] = best_action
+                        ro["prev"] = best_action
+                        ro["visited"][best_action] = True
+                        ro["step"] += 1
+
+                        if ro["step"] >= n_nodes:
+                            final_cost = ro["length"]
+                            if n_nodes > 1:
+                                final_cost += dist_table[slot][ro["prev"]][ro["first"]]
+                            ro["remaining_cost"] = final_cost - ro["start_length"]
+                            ro["done"] = True
+
+            return [float(ro["remaining_cost"]) for ro in rollouts]
+
+        def evaluate_requests(requests):
+            requests = list(requests)
+            results = [None] * len(requests)
+
+            by_need = defaultdict(list)
+            for row, request in enumerate(requests):
+                by_need[bool(request["need_value"])].append((row, request))
+            for need_value, rows in by_need.items():
+                evals = eval_many([request for _row, request in rows], need_value)
+                for (row, _request), eval_result in zip(rows, evals):
+                    results[row] = eval_result
+
+            rollout_rows = [
+                (row, request)
+                for row, request in enumerate(requests)
+                if bool(request["need_rollout"])
+            ]
+            rollout_remaining = {}
+            if rollout_rows:
+                remaining = rollout_many([request for _row, request in rollout_rows])
+                for (row, _request), value in zip(rollout_rows, remaining):
+                    rollout_remaining[row] = value
+
+            out = []
+            for row, request in enumerate(requests):
+                probs, mask, value = results[row]
+                result = {
+                    "slot": int(request["slot"]),
+                    "probs": probs,
+                    "mask": mask,
+                    "value": float(value),
+                }
+                if row in rollout_remaining:
+                    result["rollout_remaining"] = float(rollout_remaining[row])
+                out.append(result)
+            return out
+
+        while not engine.is_done():
+            requests = list(engine.collect_requests())
+            if not requests:
+                if engine.is_done():
+                    break
+                raise RuntimeError("BatchSearch made no progress but is not done")
+            engine.apply_results(evaluate_requests(requests))
+
+        raw = engine.results()
+        costs = torch.tensor(list(raw["costs"]), dtype=dtype, device=device)
+        tours = torch.tensor(
+            [list(row) for row in raw["tours"]],
+            dtype=torch.long,
+            device=device,
+        )
+        stats = {
+            "decode_steps": [int(v) for v in raw["decode_steps"]],
+            "rollout_steps": [int(v) for v in raw["rollout_steps"]],
+            "value_calls": [int(v) for v in raw["value_calls"]],
+            "cache_hits": cache_hits,
+            "cache_misses": cache_misses,
+            "batch_eval_calls": batch_eval_calls,
+            "batch_eval_rows": batch_eval_rows,
+        }
+        return costs, tours, stats

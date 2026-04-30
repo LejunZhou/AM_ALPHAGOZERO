@@ -147,4 +147,19 @@ py::dict solve_instance(py::array coords,
                         double bl_val,
                         py::object rollout_evaluator = py::none());
 
+class BatchSearch {
+ public:
+  BatchSearch(py::array coords, py::dict cfg, py::object bl_vals);
+  ~BatchSearch();
+
+  py::list collect_requests();
+  void apply_results(py::sequence results);
+  bool is_done() const;
+  py::dict results() const;
+
+ private:
+  struct Impl;
+  std::unique_ptr<Impl> impl_;
+};
+
 }  // namespace am_mcts_cpp

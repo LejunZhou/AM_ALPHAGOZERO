@@ -173,12 +173,87 @@ def _run_cpp_smoke() -> int:
     return 0
 
 
+def _run_cpp_batch_smoke() -> int:
+    from am_baseline.search import CppBatchMCTSSolver, CppMCTSSolver, HAVE_CPP_MCTS
+
+    if not HAVE_CPP_MCTS:
+        print(
+            "ERROR: --backend cpp_batch requested, but the C++ extension is not built. "
+            "Run `pip install -e .` first.",
+            file=sys.stderr,
+        )
+        return 2
+
+    torch.manual_seed(1234)
+    N = 20
+    B = 8
+
+    cfg = Config(graph_size=N, batch_size=32, epoch_size=32)
+    model = AttentionModel(cfg).cpu().eval()
+
+    rng = torch.Generator().manual_seed(1234)
+    inputs = torch.rand(B, N, 2, generator=rng)
+
+    model.set_decode_type('greedy')
+    with torch.no_grad():
+        greedy_cost, _, greedy_pi = model(inputs, return_pi=True)
+
+    solver0 = CppBatchMCTSSolver(
+        model,
+        MCTSConfig(n_simulations=0, c_puct=0.05, temperature=0.0,
+                   leaf_eval='rollout', fpu_mode='running_q',
+                   fpu_fallback=-1.0, seed=1234),
+        device=torch.device('cpu'),
+        mcts_batch_size=4,
+    )
+    mcts0_costs, mcts0_tours = solver0.solve_batch(inputs)
+    for i in range(B):
+        _check_valid_tour(mcts0_tours[i], N)
+        assert torch.equal(mcts0_tours[i], greedy_pi[i].long()), (
+            f"[CPP_BATCH A1] instance {i}: MCTS(K=0) tour {mcts0_tours[i].tolist()} "
+            f"!= greedy {greedy_pi[i].tolist()}"
+        )
+        assert torch.isclose(mcts0_costs[i], greedy_cost[i], atol=1e-5), (
+            f"[CPP_BATCH A1] instance {i}: MCTS(K=0) cost {mcts0_costs[i].item()} "
+            f"!= greedy {greedy_cost[i].item()}"
+        )
+    print("[CPP_BATCH A1 OK] K=0 matches greedy exactly")
+
+    check_cfg = MCTSConfig(n_simulations=4, c_puct=0.05, temperature=0.0,
+                           leaf_eval='rollout', fpu_mode='running_q',
+                           fpu_fallback=-1.0, tree_reuse=True, seed=1234)
+    seq_costs, seq_tours = CppMCTSSolver(model, check_cfg, torch.device('cpu')).solve_batch(inputs)
+    batched = CppBatchMCTSSolver(
+        model, check_cfg, torch.device('cpu'), mcts_batch_size=4
+    )
+    batch_costs, batch_tours = batched.solve_batch(inputs)
+    for i in range(B):
+        _check_valid_tour(batch_tours[i], N)
+        assert torch.isclose(batch_costs[i], seq_costs[i], atol=1e-5), (
+            f"[CPP_BATCH A2] instance {i}: batch cost {batch_costs[i].item()} "
+            f"!= sequential cpp {seq_costs[i].item()}"
+        )
+        assert torch.equal(batch_tours[i], seq_tours[i]), (
+            f"[CPP_BATCH A2] instance {i}: batch tour {batch_tours[i].tolist()} "
+            f"!= sequential cpp {seq_tours[i].tolist()}"
+        )
+    assert batched.batch_eval_calls > 0
+    assert batched.batch_eval_rows >= batched.batch_eval_calls
+    print(f"[CPP_BATCH A2 OK] K=4 matches sequential cpp; "
+          f"batch_calls={batched.batch_eval_calls}, rows={batched.batch_eval_rows}")
+
+    print("[OK] Cross-instance C++ batch MCTS smoke PASSED")
+    return 0
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Smoke tests for Python or C++ MCTS backends")
-    parser.add_argument('--backend', choices=['python', 'cpp'], default='python')
+    parser.add_argument('--backend', choices=['python', 'cpp', 'cpp_batch'], default='python')
     args = parser.parse_args()
     if args.backend == 'cpp':
         return _run_cpp_smoke()
+    if args.backend == 'cpp_batch':
+        return _run_cpp_batch_smoke()
 
     torch.manual_seed(1234)
     N = 20

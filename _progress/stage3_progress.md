@@ -2,14 +2,23 @@
 
 **Plan:** `_plans/stage3_plan.md`
 **Started:** 2026-04-27
-**Last updated:** 2026-04-29 — **Phase E (Stage 2 cleanup) CLOSED.** E.1 off-policy R² probe: TSP-20 K=400 rollout cpp on 1000 instances logged 40,160 leaf rows; off-policy R² = **0.9949 vs Stage 1 in-distribution 0.9965** (delta −0.0016 — value head is essentially in-distribution-accurate on MCTS-visited states). E.2 sqrt_n ablation: `sqrt_n` uniformly slightly worse than `bl` at TSP-20 K=200 rollout (mean 3.8321 vs 3.8319; gap-red 63.5% vs 65.2%; win 0.388 vs 0.439). **`bl` stays canonical**; per-instance greedy `bl_val` pass remains in Stage 4 critical path. Phase F bs=2048 TSP-20/TSP-50 follow-up finished. TSP-100 reduced-compute AM+value remains in flight. Current MCTS canonical remains sequential C++ (`simulation_batch_size=1`).
-**Status:** **Phases A, B, C (TSP-50), D (TSP-100 K∈{20,50} — D.3 STRICT PASS), E (Stage 2 cleanup) all closed via cpp; Phase F preflight + TSP-20/TSP-50 bs=2048 follow-up complete; TSP-100 reduced-compute training in flight; Phase G C++ backend extended and benchmarked through virtual visits + virtual loss; canonical remains sequential C++ MCTS.**
+**Last updated:** 2026-04-29 — **Phase E (Stage 2 cleanup) CLOSED.** E.1 off-policy R² probe: TSP-20 K=400 rollout cpp on 1000 instances logged 40,160 leaf rows; off-policy R² = **0.9949 vs Stage 1 in-distribution 0.9965** (delta −0.0016 — value head is essentially in-distribution-accurate on MCTS-visited states). E.2 sqrt_n ablation: `sqrt_n` uniformly slightly worse than `bl` at TSP-20 K=200 rollout (mean 3.8321 vs 3.8319; gap-red 63.5% vs 65.2%; win 0.388 vs 0.439). **`bl` stays canonical**; per-instance greedy `bl_val` pass remains in Stage 4 critical path. Phase F bs=2048 TSP-20/TSP-50 follow-up finished; TSP-100 reduced-compute AM+value finished and produced a usable value-head checkpoint. Current MCTS canonical remains sequential C++ (`simulation_batch_size=1`).
+**Status:** **Phases A, B, C (TSP-50), D (TSP-100 K∈{20,50} — D.3 STRICT PASS), E (Stage 2 cleanup), and F.1 (Stage 1 TSP-100 reduced-compute AM+value) all closed; Phase G C++ backend extended and benchmarked through virtual visits + virtual loss; canonical remains sequential C++ MCTS.**
 **Phase G update:** 2026-04-27 - C++ backend implemented, built, smoke-tested, benchmarked, and closed through G.7 with a logic-preserving decoder cache plus whole-rollout leaf callback.
 **Phase G hygiene update:** 2026-04-28 — `src/am_baseline/search/mcts_cpp/solver.py` cleanup (single-source per-instance dist matrix via `np.linalg.norm`; cache-key comment expanded for `first=-1` invariant). Smoke A1..A11 cpp passes; 100-inst TSP-20 K=20 rollout cpp byte-identical to canonical CSV (max diff 0.0). Plan: `~/.claude/plans/can-you-check-the-wise-brook.md`.
 **Phase G.8 update:** 2026-04-28 — implemented opt-in batched virtual-visit C++ MCTS (`simulation_batch_size>1`) plus batched Python/PyTorch evaluator and batched greedy rollout callback. Validation: `python -m scripts.smoke_mcts --backend cpp` passes including new A12 batch checks (`simulation_batch_size=4` value_head/rollout, no virtual-visit leaks); `python -m scripts.smoke_mcts --backend python` passes and rejects Python-backend batched MCTS. Small comparison sweeps completed at TSP-100 K=20/val100 and TSP-50 K=20/val100. Diagnosis: virtual visits only increase effective visit counts and leave Q unchanged, so with sharp AM priors and `c_puct=0.05`, collection repeatedly returns to the same pending leaf; collision overhead dominates.
 **Phase G.9 update:** 2026-04-28 — implemented KataGo-style virtual loss for batched C++ MCTS (`virtual_loss_weight`, `virtual_loss_margin`) and ran the first smoke benchmark on TSP-50 K=20 val_size=100. Result: not promoted. Virtual loss produced real pending batches but made low-K search far too broad; time and optimality gap both failed the promotion gate. Keep `simulation_batch_size=1` canonical.
 
 ---
+
+## Cross-Instance Batching Pilot (2026-04-29)
+
+- Implemented separate `cpp_batch` backend for behavior-preserving cross-instance NN batching.
+- Scope: TSP-20/TSP-50, K=20, rollout, val_size=1000.
+- Correctness passed against sequential `cpp` references with max CSV cost diff 0 for all `mcts_batch_size={16,32,64}`.
+- CPU-local wall-clock: TSP-20 32.5/28.8/26.2 s for 16/32/64; TSP-50 200.5/258.2/191.7 s.
+- CUDA recheck on RTX 4060: TSP-20 sequential `cpp` 25.0 s vs `cpp_batch` bs64 8.1 s (3.09x); TSP-50 sequential `cpp` 323.5 s vs bs16/bs32/bs64 369.9/180.2/147.1 s. bs64 passes the promotion gate with exact cost preservation and 2.20x speedup on TSP-50.
+- Details are tracked inside Stage 3 Phase G.10 below; no standalone plan/progress file is kept.
 
 ## Implementation Progress
 
@@ -88,7 +97,7 @@ The plan locked "Skip K=400 rollout at TSP-50 — curve caps at K=200" based on 
 ### Phase D extension (deferred) — TSP-100 K=100 rollout + value-head curves
 
 - [ ] **D.6** Rollout MCTS TSP-100 K=100 cpp (~25 min ETA). Optional — D.3 already passes at K=50; useful only to extend the curve and finalize criterion 3. Re-run if Lejun wants the strongest possible headline figure.
-- [ ] **D.7** Value-head MCTS curves at TSP-100 — **blocked on Phase F**. Released AM TSP-100 checkpoint has no value head, so `leaf_eval='value_head'` is unavailable. Resumes after F.1 lands the value-head'd Stage 1 TSP-100 checkpoint.
+- [ ] **D.7** Value-head MCTS curves at TSP-100 — **unblocked by Phase F**. Released AM TSP-100 checkpoint has no value head, but the reduced-compute Stage 1 checkpoint is now available at `outputs/tsp_100/stage1_tsp100_bs1024_ep640k_with_value_20260428T233519/epoch-99.pt`. Run later only if the TSP-100 value-head curve is needed.
 
 ### Phase E — Stage 2 cleanup (CLOSED 2026-04-29)
 
@@ -113,13 +122,13 @@ The plan locked "Skip K=400 rollout at TSP-50 — curve caps at K=200" based on 
 
 ### Phase F — Stage 1 TSP-100 training (parallel, off critical path)
 
-- [ ] **F.1** Train Stage 1 TSP-100 with value head; output `outputs/tsp_100/stage1_tsp100_with_value_<timestamp>/epoch-99.pt`. ~24-36 h.
+- [x] **F.1** Train Stage 1 TSP-100 with value head; output `outputs/tsp_100/stage1_tsp100_bs1024_ep640k_with_value_20260428T233519/epoch-99.pt`. Finished 2026-04-29.
   - [x] **Preflight recheck (2026-04-28):** `src/scripts/train.py`, `src/am_baseline/training/trainer.py`, `src/am_baseline/config.py`, `src/am_baseline/model/attention_model.py`, `src/am_baseline/model/decoder.py`, `src/am_baseline/model/value_head.py`, and `src/am_baseline/utils/tensor_ops.py` still match the Stage 1 design: policy uses unchanged REINFORCE with rollout baseline; value head uses `lambda_v * MSE(values, value_targets_from_edges(edge_costs) / Z)`; `Z=bl_val` when per-instance rollout baseline values are available.
   - [x] **CPU smoke (2026-04-28):** ran an inline TSP-100 one-batch train path under `conda run -n AM_AlphaGoZero` with `batch_size=2`, `epoch_size=4`, `val_size=4`, `num_workers=0`, `no_cuda=True`, `lambda_v=1.0`, `value_target_norm=bl`. Verified `pi.shape == (2, 100)`, `values.shape == (2, 100)`, `get_edge_costs(...).sum == cost`, and V_CURRENT target alignment (`target[:,0] == target[:,1] == cost`).
   - [x] **Launch setup check (2026-04-28):** attempted to raise `src/scripts/modal_run_train.py` timeout above 24 h, but Modal rejected it (`Timeout must be between 10s and 86400s`). Set wrapper timeout to the Modal max of 24 h. This is sufficient for the bs=2048 TSP-20/TSP-50 experiment, but full TSP-100 may require resume/chunking.
   - [x] **Batch-size follow-up finished (2026-04-29):** full 100-epoch AM+value bs=2048 runs for TSP-20 and TSP-50 both reached epoch 99. TSP-20: Modal `ap-AhoMWtyvqPBc0xJ9Nh800i`, W&B [`xlvmpbez`](https://wandb.ai/lejun/am-alphagozero/runs/xlvmpbez), final/best `val_avg_cost=3.84443`, `val_value_r2_overall=0.99624`, wall-clock `10285s`, checkpoint `outputs/tsp_20/stage1_tsp20_bs2048_with_value_20260428T225424/epoch-99.pt`. TSP-50: Modal `ap-UieLJ9tjzHoxCbNcXwjXzY`, W&B [`9rfnufk5`](https://wandb.ai/lejun/am-alphagozero/runs/9rfnufk5), final/best `val_avg_cost=5.81350`, `val_value_r2_overall=0.99498`, wall-clock `29904s`, checkpoint `outputs/tsp_50/stage1_tsp50_bs2048_with_value_20260428T225947/epoch-99.pt`. Conclusion: full training largely removes the TSP-20 ep29 undertraining gap (`+0.0020` vs canonical bs=512), but TSP-50 still regresses (`+0.0136` vs canonical bs=512), so same-LR bs=2048 is not promoted for canonical TSP-50 training.
-  - [x] **TSP-100 reduced-compute launch (2026-04-28):** started AM+value TSP-100 with `batch_size=1024`, `epoch_size=640000`, `n_epochs=100` (625 batches/epoch, 62500 total updates). Modal `ap-yqtUhNFW9YMjgf4WHCY82v`, W&B [`g7jxkixo`](https://wandb.ai/lejun/am-alphagozero/runs/g7jxkixo). Initial logs reached epoch 1 and show `gpu_mem_peak≈13806 MB` (61.1% A10), below the 20 GB watch threshold.
-- [ ] **F.2** (Stage 5 stretch) Re-run Phase D rollout sweep on value-head'd checkpoint.
+  - [x] **TSP-100 reduced-compute finished (2026-04-29):** AM+value TSP-100 with `batch_size=1024`, `epoch_size=640000`, `n_epochs=100` (625 batches/epoch, 62500 total updates) reached epoch 99 cleanly. Modal `ap-yqtUhNFW9YMjgf4WHCY82v`, W&B [`g7jxkixo`](https://wandb.ai/lejun/am-alphagozero/runs/g7jxkixo), run name `stage1_tsp100_bs1024_ep640k_with_value_20260428T233519`. Final `val_avg_cost=8.21043`, best `val_avg_cost=8.20918` at epoch 91, final `val_value_r2_overall=0.99337` (`early=0.92407`, `mid=0.96311`, `late=0.96376`), final `val_value_loss=0.0005479`, residual mean `+0.00455`. Wall-clock `_runtime=45849s` (~12h44m); summed epoch durations `45122.9s`; peak GPU memory `13805.7 MB` (61.1% of A10). Modal volume contains `epoch-99.pt`, `epochs.csv`, `metrics.csv`, and all per-epoch checkpoints under `outputs/tsp_100/stage1_tsp100_bs1024_ep640k_with_value_20260428T233519/`.
+- [ ] **F.2** (Stage 5 stretch) Run TSP-100 value-head MCTS curves on the new checkpoint.
 
 ### Phase G — C++ MCTS port (parallel engineering track; Stage 4 enabler)
 
@@ -191,6 +200,28 @@ The plan locked "Skip K=400 rollout at TSP-50 — curve caps at K=200" based on 
     - `bs=16`: wall `223.8s`, mean cost `5.866113`, mean gap-to-Gurobi `2.9439%`, gap reduction `-51.41%`, pending batch `10.00`.
     - `bs=32`: wall `196.0s`, mean cost `18.422830`, mean gap-to-Gurobi `223.3193%`, pending batch `18.35`.
     - Interpretation: virtual loss fixes duplicate pending-leaf collisions, but at low `K=20` it makes root-step search too broad before backups arrive. It also destroys the eval cache advantage (hit rate drops from `96.3%` to `75.2%/71.0%/42.9%`), causing large wall-clock regression. No batched candidate passes the time or quality gate.
+- [x] **G.10** Cross-instance batched C++ MCTS pilot (behavior-preserving; 2026-04-29).
+  - Added separate `cpp_batch` backend. Existing sequential `cpp` remains the correctness reference.
+  - Added C++ `BatchSearch` for stateful cross-instance tree scheduling and Python `CppBatchMCTSSolver` for pooling up to `mcts_batch_size` independent trees.
+  - Added CLI wiring: `src/scripts/run_mcts.py --backend cpp_batch --mcts_batch_size {16,32,64}`.
+  - Semantics preserved: one pending simulation per tree, immediate backup after evaluator result, no within-tree virtual loss, no delayed multi-simulation backup.
+  - Validation:
+    - `conda run -n AM_AlphaGoZero python -m py_compile src/am_baseline/search/mcts_cpp/solver.py src/am_baseline/search/mcts_cpp/__init__.py src/am_baseline/search/__init__.py src/scripts/run_mcts.py src/scripts/smoke_mcts.py`
+    - `conda run -n AM_AlphaGoZero python -m scripts.smoke_mcts --backend cpp_batch` passes: K=0 matches greedy exactly; K=4 rollout matches sequential `cpp`; realized NN batch rows/calls = `1207/724`.
+    - Regression smokes still pass for `--backend cpp` and `--backend python`.
+    - Small CPU slices (`val_size=20`, `K=20`, rollout) matched sequential `cpp` exactly: TSP-20/TSP-50 max cost diff `0`, max decode diff `0`.
+  - Full CPU pilot (`--no_cuda`, val_size=1000, K=20, rollout):
+    - TSP-20 bs16/32/64: mean cost `3.8346`, wall `32.5/28.8/26.2s`, realized NN batch `3.24/3.63/4.12`, max cost diff vs sequential `cpp` = `0`.
+    - TSP-50 bs16/32/64: mean cost `5.7520`, wall `200.5/258.2/191.7s`, realized NN batch `1.49/1.56/1.63`, max cost diff vs sequential `cpp` = `0`.
+  - CUDA recheck on RTX 4060 Laptop GPU:
+    - TSP-20 sequential `cpp`: mean `3.8346`, wall `25.0s`; `cpp_batch` bs64: mean `3.8346`, wall `8.1s`, speedup `3.09x`, max cost diff `0`.
+    - TSP-50 sequential `cpp`: mean `5.7520`, wall `323.5s`; `cpp_batch` bs16/32/64: mean `5.7520`, wall `369.9/180.2/147.1s`, speedup `0.87x/1.80x/2.20x`, max cost diff `0`.
+  - Outputs:
+    - `outputs/stage3/tsp20_K20_rollout_cpp_batch_bs{16,32,64}.csv`
+    - `outputs/stage3/tsp50_K20_rollout_cpp_batch_bs{16,32,64}.csv`
+    - `outputs/stage3/tsp20_K20_rollout_cpp_batch_bs64_cuda_current.csv`
+    - `outputs/stage3/tsp50_K20_rollout_cpp_batch_bs{16,32,64}_cuda_current.csv`
+  - Verdict: promotion gate passes for `mcts_batch_size=64` on CUDA. Cost preservation is exact at CSV precision and TSP-50 K=20 gets a meaningful `2.20x` wall-clock speedup.
 
 ---
 

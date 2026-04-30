@@ -1,7 +1,7 @@
 from am_baseline.search.tree import MCTSNode
 from am_baseline.search.puct import select_action
 from am_baseline.search.mcts import MCTSConfig, MCTSSolver
-from am_baseline.search.mcts_cpp import CppMCTSSolver, HAVE_CPP_MCTS
+from am_baseline.search.mcts_cpp import CppBatchMCTSSolver, CppMCTSSolver, HAVE_CPP_MCTS
 
 __all__ = [
     "MCTSNode",
@@ -9,5 +9,6 @@ __all__ = [
     "MCTSConfig",
     "MCTSSolver",
     "CppMCTSSolver",
+    "CppBatchMCTSSolver",
     "HAVE_CPP_MCTS",
 ]

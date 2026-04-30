@@ -843,6 +843,524 @@ void Solver::apply_dirichlet(Node& root) {
   }
 }
 
+namespace {
+
+enum class BatchPendingKind {
+  None,
+  PopulateRoot,
+  ExpandLeaf,
+};
+
+void batch_fill_priors(Node& node, const EvalResult& eval) {
+  std::fill(node.prior.begin(), node.prior.end(), 0.0);
+  std::fill(node.has_prior.begin(), node.has_prior.end(), 0);
+
+  std::vector<int> legal;
+  std::vector<double> raw;
+  legal.reserve(static_cast<std::size_t>(node.state.n));
+  raw.reserve(static_cast<std::size_t>(node.state.n));
+
+  for (int action = 0; action < node.state.n; ++action) {
+    if (eval.mask[static_cast<std::size_t>(action)] == 0) {
+      double p = eval.probs[static_cast<std::size_t>(action)];
+      if (!std::isfinite(p) || p < 0.0) {
+        p = 0.0;
+      }
+      legal.push_back(action);
+      raw.push_back(p);
+    }
+  }
+
+  if (legal.empty()) {
+    throw std::runtime_error("batch prior fill found no legal action at a non-terminal node");
+  }
+
+  const double total = std::accumulate(raw.begin(), raw.end(), 0.0);
+  if (total > 0.0 && std::isfinite(total)) {
+    for (std::size_t i = 0; i < legal.size(); ++i) {
+      const int action = legal[i];
+      node.prior[static_cast<std::size_t>(action)] = raw[i] / total;
+      node.has_prior[static_cast<std::size_t>(action)] = 1;
+    }
+  } else {
+    const double uniform = 1.0 / static_cast<double>(legal.size());
+    for (int action : legal) {
+      node.prior[static_cast<std::size_t>(action)] = uniform;
+      node.has_prior[static_cast<std::size_t>(action)] = 1;
+    }
+  }
+}
+
+double batch_total_effective_visits(const Node& node, const Config& cfg) {
+  const double pending_weight = cfg.virtual_loss_weight > 0.0 ? cfg.virtual_loss_weight : 1.0;
+  double total = 0.0;
+  for (std::size_t i = 0; i < node.n_visits.size(); ++i) {
+    total += static_cast<double>(node.n_visits[i]) +
+             static_cast<double>(node.virtual_n[i]) * pending_weight;
+  }
+  return total;
+}
+
+double batch_fpu_value_for(const Node& node, const Config& cfg, double bl_val) {
+  if (cfg.fpu_mode == "fallback") {
+    return cfg.fpu_fallback;
+  }
+  if (cfg.fpu_mode == "running_q") {
+    const int total_n = node.total_visits();
+    if (total_n > 0) {
+      return node.sum_w() / static_cast<double>(total_n);
+    }
+    return cfg.fpu_fallback;
+  }
+  if (cfg.fpu_mode == "node_value") {
+    if (std::isfinite(node.v_estimate)) {
+      return -(node.state.length / bl_val + node.v_estimate);
+    }
+    return cfg.fpu_fallback;
+  }
+  throw std::runtime_error("unknown fpu_mode: " + cfg.fpu_mode);
+}
+
+int batch_select_action(const Node& node, const Config& cfg, double fpu_value) {
+  const double total_n = batch_total_effective_visits(node, cfg);
+  const double sqrt_total = std::sqrt(std::max(total_n, 1.0));
+  const double pending_weight = cfg.virtual_loss_weight > 0.0 ? cfg.virtual_loss_weight : 1.0;
+
+  int best_action = -1;
+  double best_score = -std::numeric_limits<double>::infinity();
+  for (int action = 0; action < node.state.n; ++action) {
+    const std::size_t idx = static_cast<std::size_t>(action);
+    if (node.has_prior[idx] == 0) {
+      continue;
+    }
+    const int n_sa = node.n_visits[idx];
+    const int pending = node.virtual_n[idx];
+    const double effective_n_sa = static_cast<double>(n_sa) +
+                                  static_cast<double>(pending) * pending_weight;
+    double q_sa = n_sa > 0 ? node.q_value[idx] : fpu_value;
+    if (pending > 0 && cfg.virtual_loss_weight > 0.0 && cfg.virtual_loss_margin > 0.0) {
+      const double real_weight = std::max(0.25, static_cast<double>(n_sa));
+      const double loss_weight = static_cast<double>(pending) * cfg.virtual_loss_weight;
+      const double loss_q = q_sa - cfg.virtual_loss_margin;
+      q_sa = (q_sa * real_weight + loss_q * loss_weight) / (real_weight + loss_weight);
+    }
+    const double u_sa =
+        cfg.c_puct * node.prior[idx] * sqrt_total / (1.0 + effective_n_sa);
+    const double score = q_sa + u_sa;
+    if (score > best_score) {
+      best_score = score;
+      best_action = action;
+    }
+  }
+  if (best_action < 0) {
+    throw std::runtime_error("PUCT found no legal action");
+  }
+  return best_action;
+}
+
+void batch_backup(const std::vector<PathEntry>& path, double value_for_backup) {
+  for (const PathEntry& entry : path) {
+    Node* parent = entry.parent;
+    const int action = entry.action;
+    const std::size_t idx = static_cast<std::size_t>(action);
+    parent->n_visits[idx] += 1;
+    parent->w_total[idx] += value_for_backup;
+    parent->q_value[idx] = parent->w_total[idx] / static_cast<double>(parent->n_visits[idx]);
+  }
+}
+
+int batch_pick_root_action(const Node& root, const Config& cfg, std::mt19937_64& rng) {
+  if (root.total_visits() == 0) {
+    int best_action = -1;
+    double best_prior = -std::numeric_limits<double>::infinity();
+    for (int action = 0; action < root.state.n; ++action) {
+      const std::size_t idx = static_cast<std::size_t>(action);
+      if (root.has_prior[idx] == 0) {
+        continue;
+      }
+      if (root.prior[idx] > best_prior) {
+        best_prior = root.prior[idx];
+        best_action = action;
+      }
+    }
+    if (best_action < 0) {
+      throw std::runtime_error("root has no prior legal action");
+    }
+    return best_action;
+  }
+
+  if (cfg.root_select == "q") {
+    int best_action = -1;
+    double best_q = -std::numeric_limits<double>::infinity();
+    for (int action = 0; action < root.state.n; ++action) {
+      const std::size_t idx = static_cast<std::size_t>(action);
+      if (root.n_visits[idx] <= 0) {
+        continue;
+      }
+      if (root.q_value[idx] > best_q) {
+        best_q = root.q_value[idx];
+        best_action = action;
+      }
+    }
+    if (best_action < 0) {
+      throw std::runtime_error("root_select='q' found no visited action");
+    }
+    return best_action;
+  }
+
+  if (cfg.root_select != "visits") {
+    throw std::runtime_error("unknown root_select: " + cfg.root_select);
+  }
+
+  std::vector<int> actions;
+  std::vector<double> weights;
+  int max_count = 0;
+  for (int action = 0; action < root.state.n; ++action) {
+    const int count = root.n_visits[static_cast<std::size_t>(action)];
+    if (count <= 0) {
+      continue;
+    }
+    actions.push_back(action);
+    weights.push_back(static_cast<double>(count));
+    max_count = std::max(max_count, count);
+  }
+  if (actions.empty()) {
+    throw std::runtime_error("root_select='visits' found no visited action");
+  }
+  if (cfg.temperature == 0.0 || max_count == 0) {
+    return actions[static_cast<std::size_t>(
+        std::distance(weights.begin(), std::max_element(weights.begin(), weights.end())))];
+  }
+
+  const double inv_temp = 1.0 / cfg.temperature;
+  for (double& weight : weights) {
+    weight = std::pow(weight, inv_temp);
+  }
+  std::discrete_distribution<int> dist(weights.begin(), weights.end());
+  return actions[static_cast<std::size_t>(dist(rng))];
+}
+
+void batch_apply_dirichlet(Node& root, const Config& cfg, std::mt19937_64& rng) {
+  std::vector<int> actions;
+  for (int action = 0; action < root.state.n; ++action) {
+    if (root.has_prior[static_cast<std::size_t>(action)] != 0) {
+      actions.push_back(action);
+    }
+  }
+  if (actions.empty()) {
+    return;
+  }
+
+  std::gamma_distribution<double> gamma(cfg.dirichlet_alpha, 1.0);
+  std::vector<double> noise(actions.size(), 0.0);
+  double noise_sum = 0.0;
+  for (double& eta : noise) {
+    eta = gamma(rng);
+    noise_sum += eta;
+  }
+
+  if (!(noise_sum > 0.0) || !std::isfinite(noise_sum)) {
+    const double uniform = 1.0 / static_cast<double>(actions.size());
+    for (int action : actions) {
+      root.prior[static_cast<std::size_t>(action)] = uniform;
+    }
+    return;
+  }
+
+  double mixed_sum = 0.0;
+  for (std::size_t i = 0; i < actions.size(); ++i) {
+    const int action = actions[i];
+    const std::size_t idx = static_cast<std::size_t>(action);
+    const double eta = noise[i] / noise_sum;
+    root.prior[idx] = (1.0 - cfg.dirichlet_epsilon) * root.prior[idx] +
+                      cfg.dirichlet_epsilon * eta;
+    mixed_sum += root.prior[idx];
+  }
+
+  if (mixed_sum > 0.0 && std::isfinite(mixed_sum)) {
+    for (int action : actions) {
+      root.prior[static_cast<std::size_t>(action)] /= mixed_sum;
+    }
+  } else {
+    const double uniform = 1.0 / static_cast<double>(actions.size());
+    for (int action : actions) {
+      root.prior[static_cast<std::size_t>(action)] = uniform;
+    }
+  }
+}
+
+py::dict batch_make_request(int slot,
+                            const TspState& state,
+                            bool need_value,
+                            bool need_rollout) {
+  py::dict request;
+  request["slot"] = slot;
+  request["snapshot"] = state.to_python();
+  request["need_value"] = need_value;
+  request["need_rollout"] = need_rollout;
+  return request;
+}
+
+struct BatchInstance {
+  BatchInstance(Config cfg_,
+                std::shared_ptr<const std::vector<double>> coords,
+                int n,
+                double bl_val_)
+      : cfg(std::move(cfg_)),
+        bl_val(bl_val_),
+        state(TspState::initial(std::move(coords), n)),
+        rng(cfg.seed) {}
+
+  py::object collect_request(int slot) {
+    if (pending_kind != BatchPendingKind::None) {
+      return py::none();
+    }
+
+    while (!state.all_finished()) {
+      if (!root) {
+        root = std::make_unique<Node>(state);
+        simulations_done = 0;
+        dirichlet_applied = false;
+      }
+
+      if (!root->is_expanded() && !root->is_terminal()) {
+        pending_kind = BatchPendingKind::PopulateRoot;
+        pending_leaf = root.get();
+        pending_path.clear();
+        return batch_make_request(
+            slot, pending_leaf->state, cfg.leaf_eval == "value_head", cfg.leaf_eval == "rollout");
+      }
+
+      if (!dirichlet_applied) {
+        if (cfg.dirichlet_epsilon > 0.0 && !root->is_terminal()) {
+          batch_apply_dirichlet(*root, cfg, rng);
+        }
+        dirichlet_applied = true;
+      }
+
+      while (simulations_done < cfg.n_simulations) {
+        std::vector<PathEntry> path;
+        Node* node = root.get();
+
+        while (node->is_expanded() && !node->is_terminal()) {
+          const double fpu = batch_fpu_value_for(*node, cfg, bl_val);
+          const int action = batch_select_action(*node, cfg, fpu);
+          path.push_back(PathEntry{node, action});
+
+          std::unique_ptr<Node>& child = node->children[static_cast<std::size_t>(action)];
+          if (!child) {
+            child = std::make_unique<Node>(node->state.updated(action));
+          }
+          node = child.get();
+        }
+
+        if (node->is_terminal()) {
+          const double total_norm = node->state.final_cost() / bl_val;
+          node->v_estimate = 0.0;
+          batch_backup(path, -total_norm);
+          simulations_done += 1;
+          continue;
+        }
+
+        pending_kind = BatchPendingKind::ExpandLeaf;
+        pending_leaf = node;
+        pending_path = std::move(path);
+        return batch_make_request(
+            slot, pending_leaf->state, cfg.leaf_eval == "value_head", cfg.leaf_eval == "rollout");
+      }
+
+      const int action = batch_pick_root_action(*root, cfg, rng);
+      tour.push_back(action);
+      state.update_in_place(action);
+
+      if (cfg.tree_reuse && root->children[static_cast<std::size_t>(action)]) {
+        root = std::move(root->children[static_cast<std::size_t>(action)]);
+      } else {
+        root.reset();
+      }
+      simulations_done = 0;
+      dirichlet_applied = false;
+    }
+
+    return py::none();
+  }
+
+  void apply_result(const EvalResult& eval, double rollout_remaining) {
+    if (pending_kind == BatchPendingKind::None || pending_leaf == nullptr) {
+      throw std::runtime_error("batch result applied to an instance with no pending request");
+    }
+    if (pending_leaf->is_terminal()) {
+      throw std::runtime_error("batch result applied to a terminal leaf");
+    }
+
+    counters.decode += 1;
+    if (cfg.leaf_eval == "value_head") {
+      counters.value += 1;
+    } else if (cfg.leaf_eval == "rollout") {
+      const long long rollout_steps =
+          static_cast<long long>(pending_leaf->state.n - pending_leaf->state.step);
+      counters.decode += rollout_steps;
+      counters.rollout += rollout_steps;
+    } else {
+      throw std::runtime_error("unknown leaf_eval: " + cfg.leaf_eval);
+    }
+
+    batch_fill_priors(*pending_leaf, eval);
+
+    double v_remaining_norm = 0.0;
+    if (cfg.leaf_eval == "value_head") {
+      v_remaining_norm = eval.value;
+    } else {
+      v_remaining_norm = rollout_remaining / bl_val;
+    }
+    pending_leaf->v_estimate = v_remaining_norm;
+
+    if (pending_kind == BatchPendingKind::ExpandLeaf) {
+      const double total_norm = pending_leaf->state.length / bl_val + v_remaining_norm;
+      batch_backup(pending_path, -total_norm);
+      simulations_done += 1;
+    }
+
+    pending_kind = BatchPendingKind::None;
+    pending_leaf = nullptr;
+    pending_path.clear();
+  }
+
+  bool done() const {
+    return state.all_finished() && pending_kind == BatchPendingKind::None;
+  }
+
+  Config cfg;
+  double bl_val;
+  TspState state;
+  std::unique_ptr<Node> root;
+  std::vector<int> tour;
+  int simulations_done = 0;
+  bool dirichlet_applied = false;
+  BatchPendingKind pending_kind = BatchPendingKind::None;
+  Node* pending_leaf = nullptr;
+  std::vector<PathEntry> pending_path;
+  Counters counters;
+  std::mt19937_64 rng;
+};
+
+}  // namespace
+
+struct BatchSearch::Impl {
+  std::vector<BatchInstance> instances;
+};
+
+BatchSearch::BatchSearch(py::array coords, py::dict cfg, py::object bl_vals)
+    : impl_(std::make_unique<Impl>()) {
+  Config parsed_cfg = Config::from_python(cfg);
+  if (parsed_cfg.simulation_batch_size != 1) {
+    throw std::runtime_error("BatchSearch preserves sequential per-tree semantics; simulation_batch_size must be 1");
+  }
+
+  py::array_t<double, py::array::c_style | py::array::forcecast> coords64(coords);
+  py::buffer_info info = coords64.request();
+  if (info.ndim != 3 || info.shape[2] != 2) {
+    throw std::runtime_error("batch coords must have shape (B, N, 2)");
+  }
+  const int bsz = static_cast<int>(info.shape[0]);
+  const int n = static_cast<int>(info.shape[1]);
+
+  py::sequence bl_seq = py::reinterpret_borrow<py::sequence>(bl_vals);
+  if (static_cast<int>(py::len(bl_seq)) != bsz) {
+    throw std::runtime_error("bl_vals length must match coords batch size");
+  }
+
+  const double* ptr = static_cast<const double*>(info.ptr);
+  impl_->instances.reserve(static_cast<std::size_t>(bsz));
+  for (int row = 0; row < bsz; ++row) {
+    const double* start = ptr + static_cast<std::ptrdiff_t>(row * n * 2);
+    auto storage = std::make_shared<const std::vector<double>>(
+        start, start + static_cast<std::ptrdiff_t>(n * 2));
+    const double bl_val = py::cast<double>(bl_seq[static_cast<py::ssize_t>(row)]);
+    impl_->instances.emplace_back(parsed_cfg, std::move(storage), n, bl_val);
+  }
+}
+
+BatchSearch::~BatchSearch() = default;
+
+py::list BatchSearch::collect_requests() {
+  py::list requests;
+  for (std::size_t slot = 0; slot < impl_->instances.size(); ++slot) {
+    py::object request = impl_->instances[slot].collect_request(static_cast<int>(slot));
+    if (!request.is_none()) {
+      requests.append(request);
+    }
+  }
+  return requests;
+}
+
+void BatchSearch::apply_results(py::sequence results) {
+  for (py::handle item : results) {
+    py::dict row = py::reinterpret_borrow<py::dict>(item);
+    const int slot = py::cast<int>(row[py::str("slot")]);
+    if (slot < 0 || slot >= static_cast<int>(impl_->instances.size())) {
+      throw std::runtime_error("batch result slot out of range");
+    }
+
+    EvalResult eval;
+    eval.probs = sequence_to_doubles(row[py::str("probs")]);
+    eval.mask = sequence_to_bools(row[py::str("mask")]);
+    eval.value = py::cast<double>(row[py::str("value")]);
+
+    if (static_cast<int>(eval.probs.size()) != impl_->instances[static_cast<std::size_t>(slot)].state.n ||
+        static_cast<int>(eval.mask.size()) != impl_->instances[static_cast<std::size_t>(slot)].state.n) {
+      throw std::runtime_error("batch result vectors have wrong graph size");
+    }
+
+    double rollout_remaining = 0.0;
+    if (row.contains(py::str("rollout_remaining"))) {
+      rollout_remaining = py::cast<double>(row[py::str("rollout_remaining")]);
+    }
+    impl_->instances[static_cast<std::size_t>(slot)].apply_result(eval, rollout_remaining);
+  }
+}
+
+bool BatchSearch::is_done() const {
+  for (const BatchInstance& instance : impl_->instances) {
+    if (!instance.done()) {
+      return false;
+    }
+  }
+  return true;
+}
+
+py::dict BatchSearch::results() const {
+  py::list costs;
+  py::list tours;
+  py::list decode_steps;
+  py::list rollout_steps;
+  py::list value_calls;
+
+  for (const BatchInstance& instance : impl_->instances) {
+    if (!instance.state.all_finished()) {
+      throw std::runtime_error("results called before all batch instances finished");
+    }
+    costs.append(instance.state.final_cost());
+
+    py::list tour;
+    for (int action : instance.tour) {
+      tour.append(action);
+    }
+    tours.append(tour);
+    decode_steps.append(instance.counters.decode);
+    rollout_steps.append(instance.counters.rollout);
+    value_calls.append(instance.counters.value);
+  }
+
+  py::dict out;
+  out["costs"] = costs;
+  out["tours"] = tours;
+  out["decode_steps"] = decode_steps;
+  out["rollout_steps"] = rollout_steps;
+  out["value_calls"] = value_calls;
+  return out;
+}
+
 py::dict solve_instance(py::array coords,
                         py::function evaluator,
                         py::dict cfg,

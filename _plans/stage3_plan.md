@@ -179,6 +179,14 @@ Plot footnote: "Forward-pass = `decode_step` calls per instance; encoder pass an
 - Smoke result on TSP-50 K=20 val_size=100: virtual loss creates real pending batches (`6.67–18.35`) but badly fails the objective: wall-clock is ~12–14× slower and optimality gap regresses. It over-diversifies low-K search before backups arrive and destroys the decoder-cache advantage.
 - Keep `simulation_batch_size=1` as canonical. If batching is revisited, prefer cross-instance/tree batching or a much more conservative selection-diversification rule rather than aggressive within-tree virtual loss.
 
+**G.10 (Post-G.9 extension)** Cross-instance batched C++ MCTS.
+- Add a separate `cpp_batch` backend that batches neural-network evaluator calls across independent C++ MCTS trees while leaving sequential `cpp` untouched as the correctness reference.
+- Add a stateful C++ `BatchSearch` interface plus Python `CppBatchMCTSSolver`. The scheduler keeps up to `mcts_batch_size` active instances, collects one pending evaluator request per tree, batches compatible decoder calls by step, and returns results to C++ immediately.
+- Preserve per-tree semantics: one pending simulation per tree, immediate backup, no within-tree virtual loss, no delayed multi-simulation backup. Keep decoder cache per instance because graph embeddings differ.
+- Add CLI flags `--backend cpp_batch` and `--mcts_batch_size` (default `32`).
+- Pilot scope: TSP-20 and TSP-50 only, `val_size=1000`, `K=20`, rollout leaf evaluation, `tree_reuse=True`; sweep `mcts_batch_size={16,32,64}` after smoke validation.
+- Acceptance: K=0 smoke matches greedy exactly; small TSP-20/TSP-50 slices match sequential `cpp` within `1e-5`; full TSP-20/TSP-50 pilot runs produce valid tours and match sequential `cpp` mean cost within CSV precision; promote only if TSP-50 K=20 wall-clock improves meaningfully without mean-cost regression above `1e-5`.
+
 **Effort estimate.** ~3-5 days of focused engineering for G.1-G.6. Independent of Phases A-F GPU compute — runs in parallel with Stage 3 experiments.
 
 **Critical-path implications.** None for Stage 3 (Python MCTS is sufficient for the headline plot). For Stage 4 the C++ port is effectively a hard prerequisite — self-play wall-clock at Python speeds would put Stage 4 well outside laptop-feasible compute. Including Phase G in Stage 3 lets Stage 4 start unencumbered.
