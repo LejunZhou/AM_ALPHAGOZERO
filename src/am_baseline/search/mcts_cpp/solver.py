@@ -198,10 +198,28 @@ class CppMCTSSolver:
         tour = torch.tensor(list(result["tour"]), device=self.device, dtype=torch.long)
         return cost, tour
 
+    # Mapping for the temperature_schedule field. Mirrors the C++ encoding
+    # in mcts.hpp (Config::temperature_schedule). None and 'const' both map
+    # to 0 (constant τ = cfg.temperature) so default behavior is unchanged.
+    _SCHEDULE_TO_INT = {
+        None: 0,
+        "const": 0,
+        "step30": 1,
+        "step50": 2,
+    }
+
     def _cfg_dict(self) -> dict:
         cfg = asdict(self.cfg)
         if cfg.get("seed") is None:
             cfg["seed"] = 0
+        # Translate the Python-side string schedule into the int the C++
+        # Config struct expects. Validation already ran in MCTSSolver._validate_config.
+        sched = cfg.get("temperature_schedule")
+        if sched not in self._SCHEDULE_TO_INT:
+            raise ValueError(
+                f"unsupported temperature_schedule for C++ backend: {sched!r}"
+            )
+        cfg["temperature_schedule"] = self._SCHEDULE_TO_INT[sched]
         return cfg
 
     def _make_evaluators(

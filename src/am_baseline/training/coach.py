@@ -530,17 +530,14 @@ def make_self_play_config(graph_size: int, n_simulations: int):
       - `leaf_eval='value_head'` (canonical AGZ; Stage 3 E.2 explicitly allows
         this with `value_norm='bl'`).
       - `c_puct=0.05` (Stage 2 routing sweet spot for TSP-20).
-      - `temperature=1.0` base τ; switch to greedy after step 30 lives in
-        Phase E (`temperature_schedule` field not yet on MCTSConfig).
+      - `temperature=1.0` base τ with `temperature_schedule='step30'` (Phase E):
+        τ=1 for first ⌈0.3·N⌉ steps, τ=0 thereafter — closest analogue of
+        AGZ's "first 30 of ~250 plies ≈ 12%" scaled to TSP's much shorter
+        N-step games.
       - Dirichlet root noise (`alpha = 10/N`, `epsilon = 0.25`) — AGZ default.
       - `tree_reuse=True` (Stage 2 default; Pareto-better on TSP-20).
       - `return_root_visits=True` so the generator can read per-step root
         visit dicts off `solver.root_visit_dists_per_instance`.
-
-    Phase E is in flight in a sibling worktree and will add
-    `MCTSConfig.temperature_schedule`. Until then we leave a TODO: the smoke
-    case A2 bypasses this with `temperature=0`, and Phase D's coach will set
-    a temperature schedule directly when E lands.
     """
     # Local import to avoid circular import at module load.
     from am_baseline.search.mcts import MCTSConfig
@@ -550,8 +547,7 @@ def make_self_play_config(graph_size: int, n_simulations: int):
         value_norm='bl',
         c_puct=0.05,
         temperature=1.0,
-        # TODO(phase E): add temperature_schedule='step30' once
-        # MCTSConfig.temperature_schedule is merged from the Phase E worktree.
+        temperature_schedule='step30',
         dirichlet_alpha=10.0 / graph_size,
         dirichlet_epsilon=0.25,
         fpu_mode='running_q',
