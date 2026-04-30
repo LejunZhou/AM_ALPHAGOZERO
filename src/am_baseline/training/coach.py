@@ -523,33 +523,48 @@ class InstanceRecord:
     per_step: List[Dict]          # length N; per-step dict matches push_instance
 
 
-def make_self_play_config(graph_size: int, n_simulations: int):
+def make_self_play_config(
+    graph_size: int,
+    n_simulations: int,
+    leaf_eval: str = 'value_head',
+    dirichlet_epsilon: float = 0.25,
+    dirichlet_alpha_factor: float = 10.0,
+    temperature_schedule: str = 'step30',
+):
     """AlphaGo-Zero-style self-play preset.
 
-    Returns an `MCTSConfig` configured per Stage 4 plan §Phase C.1:
-      - `leaf_eval='value_head'` (canonical AGZ; Stage 3 E.2 explicitly allows
-        this with `value_norm='bl'`).
-      - `c_puct=0.05` (Stage 2 routing sweet spot for TSP-20).
-      - `temperature=1.0` base τ with `temperature_schedule='step30'` (Phase E):
-        τ=1 for first ⌈0.3·N⌉ steps, τ=0 thereafter — closest analogue of
-        AGZ's "first 30 of ~250 plies ≈ 12%" scaled to TSP's much shorter
-        N-step games.
-      - Dirichlet root noise (`alpha = 10/N`, `epsilon = 0.25`) — AGZ default.
-      - `tree_reuse=True` (Stage 2 default; Pareto-better on TSP-20).
-      - `return_root_visits=True` so the generator can read per-step root
-        visit dicts off `solver.root_visit_dists_per_instance`.
+    Returns an `MCTSConfig` configured per Stage 4 plan §Phase C.1. The
+    AGZ-canonical defaults (value_head, ε=0.25, step30) work from a
+    random-init policy but **destroy MCTS quality on a converged warm-start**
+    (see _progress/stage4_progress.md F.3 attempt 1). For warm-started
+    Stage 4, override via Coach's CLI (`--leaf_eval rollout`,
+    `--dirichlet_epsilon 0.05`).
+
+    Args:
+        graph_size: TSP-N size.
+        n_simulations: K — MCTS simulations per root.
+        leaf_eval: 'value_head' (AGZ canonical) or 'rollout'. The probe in
+            `src/scripts/probe_mcts_quality.py` shows rollout consistently
+            beats value_head on the Stage 1 checkpoint.
+        dirichlet_epsilon: root-noise mixing weight. AGZ canonical 0.25
+            assumes a near-uniform prior; ε ≤ 0.05 is recommended for
+            warm-started training (probe-validated).
+        dirichlet_alpha_factor: scale for α = factor / N (AGZ default 10/N).
+        temperature_schedule: 'const' | 'step30' | 'step50'. Affects only
+            action-selection σ_t at the root; π_t (the training target) is
+            always raw τ=1 (decoupled per spec §4.2 choice (B)).
     """
     # Local import to avoid circular import at module load.
     from am_baseline.search.mcts import MCTSConfig
     cfg = MCTSConfig(
         n_simulations=n_simulations,
-        leaf_eval='value_head',
+        leaf_eval=leaf_eval,
         value_norm='bl',
         c_puct=0.05,
         temperature=1.0,
-        temperature_schedule='step30',
-        dirichlet_alpha=10.0 / graph_size,
-        dirichlet_epsilon=0.25,
+        temperature_schedule=temperature_schedule,
+        dirichlet_alpha=dirichlet_alpha_factor / graph_size,
+        dirichlet_epsilon=dirichlet_epsilon,
         fpu_mode='running_q',
         fpu_fallback=-1.0,
         root_select='visits',
@@ -1026,6 +1041,10 @@ class MCTSCoach:
             cfg = make_self_play_config(
                 int(opts.graph_size),
                 int(getattr(opts, 'n_simulations_train', 50)),
+                leaf_eval=str(getattr(opts, 'leaf_eval', 'value_head')),
+                dirichlet_epsilon=float(getattr(opts, 'dirichlet_epsilon', 0.25)),
+                dirichlet_alpha_factor=float(getattr(opts, 'dirichlet_alpha_factor', 10.0)),
+                temperature_schedule=str(getattr(opts, 'temperature_schedule', 'step30')),
             )
             records = generate_self_play_batch(
                 self.best_model,
