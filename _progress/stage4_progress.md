@@ -100,13 +100,26 @@ KataGo cross-references added to plan's footer: `MAX_TRAIN_PER_DATA=8` cap (we s
 
 Defaults are unchanged: `MCTSConfig.temperature_schedule = None` ≡ `'const'` ≡ existing scalar `cfg.temperature` behavior — Stage 2/3 callers see no behavioral change. Dirichlet wiring (E.2) was verified end-to-end via A14.c (ε=0.25 + step30 + τ=1 yields seed-divergent first-6 actions).
 
-### Phase F — TSP-20 pilot + main run (~2.5 h compute)
+### Phase F — TSP-20 pilot + main run (~2.5 h compute) — **dev portion (F.1, F.2, F.5) COMPLETE 2026-04-30**
 
-- [ ] **F.1** `src/scripts/train_alphazero.py` CLI.
-- [ ] **F.2** Smoke battery A1-A6.
-- [ ] **F.3** TSP-20 pilot (20 iter × M=1000 × K=50 × 100 train_steps × **buffer_capacity=50K** — AGZ-proportional ~50-iter window).
-- [ ] **F.4** TSP-20 main (100 iter × M=1000 × K=100 × 200 train_steps).
-- [ ] **F.5** Headline plot.
+- [x] **F.1** `src/scripts/train_alphazero.py` CLI (~225 LOC). All required flags landed: `--load_path` (required), `--n_iterations`, `--M_instances`, `--n_simulations_train`, `--buffer_capacity`, `--train_steps_per_iter`, `--batch_size`, `--gate_every`, `--temperature_schedule {const,step30,step50}`, `--dirichlet_epsilon`, `--dirichlet_alpha_factor`, `--lambda_v`, `--weight_decay`, `--lr_model`, `--leaf_eval {value_head,rollout}`, `--resume_from`, `--graph_size`, `--val_size`, `--no_wandb`, `--run_name`. Output dir convention: `outputs/tsp_<graph_size>/<run_name>_<timestamp>/`. Construction order is faithful to plan F.1: parse → finalize opts → load Stage 1 ckpt via `torch_load_cpu` → make `val_dataset` → construct `MCTSCoach(model, problem, opts, val_dataset, device)` (after `opts.val_size` is finalized — init-order trap honored) → optional `coach.load_checkpoint(opts.resume_from)` → `coach.learn(opts.n_iterations)`. The Stage 1 architecture knobs (`embedding_dim`, `n_encode_layers`, `n_heads`, `value_hidden_dim`, etc.) are exposed so the warm-start `state_dict` matches the constructed `AttentionModel`.
+- [x] **F.2** Smoke battery in `src/scripts/smoke_alphazero.py` — A1, A2, A3, A5, A6 all green. **A3 added** as a Phase-F-specific check on the *training-target* π_t entropy under `temperature_schedule='step30'` (spec §4.2 choice (B)). A14 in `smoke_mcts.py` already covers σ_t entropy decay; A3 here exercises the orthogonal invariant — that π_t in the buffer is decoupled from σ_t, i.e. entropy(π_t) > 0 except at the forced last step (N-1). **A4 explicitly skipped** (documented in the smoke harness docstring): legality / support / finiteness on `pi_t` is already covered by A2 here and by A13 in `smoke_mcts.py`. Full smoke wall-clock: ~10 s on CPU.
+- [ ] **F.3** TSP-20 pilot (20 iter × M=1000 × K=50 × 100 train_steps × **buffer_capacity=50K** — AGZ-proportional ~50-iter window). **DEFERRED — needs GPU compute that the dev box lacks.**
+- [ ] **F.4** TSP-20 main (100 iter × M=1000 × K=100 × 200 train_steps). **DEFERRED — needs GPU.**
+- [x] **F.5** `src/scripts/plot_stage4.py` (~225 LOC) — reads Stage 1 `epochs.csv` + Stage 4 `iterations.csv`, projects each row to `(total_instances, val_avg_cost)`, log-x scatter with two curves + three reference horizontal lines (Gurobi opt 3.8279, Stage 1 final 3.83943, Stage 3 K=400 rollout 3.8312). CLI: `--stage1_dir`, `--stage4_dir`, `--out`. Stage-1 cumulative-instances axis read from `args.json:epoch_size` (fallback `1_280_000`). Self-test mode `--smoke` fabricates synthetic 5-row CSVs into a temp dir and verifies the PNG is written and non-empty (~96 KB). Smoke green on this dev box.
+
+**Phase F dev-portion completion note (2026-04-30):** Edits landed in this worktree:
+| File | LOC delta | Change |
+|---|---|---|
+| `src/scripts/train_alphazero.py` | +225 (new) | Stage 4 launcher CLI mirroring `train.py`. |
+| `src/scripts/plot_stage4.py` | +225 (new) | Sample-efficiency plotter + `--smoke` self-test. |
+| `src/scripts/smoke_alphazero.py` | +110 | A3 (π_t entropy under `step30` schedule); docstring updated to explain why A4 is skipped. |
+
+**Decisions on optional smokes:**
+- **A3 (π_t entropy under schedule):** *Added.* Distinct from A14 in `smoke_mcts.py` (which checks σ_t collapse). This guards spec §4.2 choice (B) — the decoupling between action-selection σ_t and training-target π_t — and would catch a future regression where π_t accidentally gets coupled to σ_t.
+- **A4 (legality/support/finiteness on pi_t):** *Skipped.* Fully covered by A13 in `smoke_mcts.py` (raw `solver.root_visit_dists`) and A2 here (post-`generate_self_play_batch` `pi_t`). Adding A4 would only re-run the same checks under the same code path. Documented in the smoke harness docstring instead of duplicating.
+
+F.3/F.4 are explicitly out of scope for this dev pass and are queued for the user's GPU-equipped box.
 
 ### Phase G — Ablations (optional)
 

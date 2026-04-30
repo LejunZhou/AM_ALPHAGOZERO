@@ -1,4 +1,4 @@
-"""Stage 4 Phase B/C/D smoke harness — replay buffer, distillation, coach loop.
+"""Stage 4 Phase B/C/D/F smoke harness — replay buffer, distillation, coach loop.
 
 Cases (cumulative across phases):
   - **B0**: buffer invariants + sample_step(t) + sample(B) shape rules.
@@ -6,9 +6,22 @@ Cases (cumulative across phases):
   - **A1b**: `reconstruct_state` -> `decode_step` round-trip.
   - **A1**: one `train_step_alphazero` call with finite loss + grad flow.
   - **A2**: `generate_self_play_batch` end-to-end with τ=0 invariants.
+  - **A3** (Phase F): π_t target-distribution entropy invariant under
+            `temperature_schedule='step30'`. Validates spec §4.2 choice (B):
+            σ_t may collapse to one-hot late-game, but the *training target*
+            π_t is always raw τ=1 normalized visits. We verify per-step
+            entropy(π_t) > 0 across the run except at the forced last step
+            (N-1) where exactly one legal action remains.
   - **A5**: gating no-op when `gate_every > n_iterations` (Phase D).
   - **A6**: 3-iteration coach loop end-to-end with checkpoint round-trip
             (Phase D).
+
+Notes on cases that were considered but deliberately skipped:
+  - A4 (legality/support/finiteness on `pi_t`): redundant with Phase A's A13
+    (which checks the raw `solver.root_visit_dists`) and the existing A2
+    here (which checks the same invariants on post-`generate_self_play_batch`
+    `pi_t`). Adding a separate A4 would duplicate A2's checks verbatim under
+    the same code path.
 
 Run:
     PYTHONPATH=src python -m scripts.smoke_alphazero
@@ -417,6 +430,109 @@ def test_self_play_generator(N: int = 20, M: int = 10, K: int = 20) -> None:
     print("  [A2] OK")
 
 
+def test_target_entropy_under_schedule(N: int = 20, M: int = 10, K: int = 20) -> None:
+    """Smoke A3 — π_t entropy invariant under `temperature_schedule='step30'`.
+
+    Spec §4.2 choice (B): action selection σ_t honors the per-step temperature
+    schedule (collapses to one-hot at step ⌈0.3·N⌉ for `step30`); the *training
+    target* π_t is always the raw τ=1 normalized visit distribution. So
+    entropy(π_t) at late steps must NOT collapse to zero just because σ_t did.
+
+    This test runs `generate_self_play_batch` with `temperature_schedule='step30'`
+    on M=10 TSP-N instances and verifies:
+      (a) π_t sums to 1 and is non-negative (re-checks A2 invariants under
+          the schedule code path).
+      (b) entropy(π_t) > 0 for every step t ∈ [0, N-1) — the only legitimate
+          collapse is the forced last step (t=N-1) where exactly one legal
+          action remains.
+      (c) entropy(π_t) at the final step (t=N-1) is exactly 0 (one-hot,
+          dictated by legality, not by temperature).
+    """
+    print(f"  [A3] π_t entropy under temperature_schedule='step30' on N={N}, M={M}, K={K} ...")
+    torch.manual_seed(0)
+    np.random.seed(0)
+
+    cfg_model = Config(
+        graph_size=N,
+        embedding_dim=32,
+        n_encode_layers=2,
+        n_heads=4,
+        value_enabled=True,
+        value_hidden_dim=32,
+    )
+    model = AttentionModel(cfg_model).cpu().eval()
+
+    cfg = make_self_play_config(graph_size=N, n_simulations=K)
+    # `make_self_play_config` already sets temperature_schedule='step30';
+    # assert that to lock the test against a future default change.
+    assert cfg.temperature_schedule == 'step30', (
+        f"A3 expects make_self_play_config to default to 'step30', got "
+        f"{cfg.temperature_schedule!r}"
+    )
+    # Disable Dirichlet root noise for a deterministic check on the
+    # raw-visit-derived target distribution.
+    cfg.dirichlet_epsilon = 0.0
+
+    records = generate_self_play_batch(
+        best_model=model,
+        M=M,
+        graph_size=N,
+        cfg=cfg,
+        device=torch.device("cpu"),
+        mcts_batch_size=8,
+    )
+    assert len(records) == M
+
+    cutoff = (N + 9) // 10 * 3 // 10  # not used; inline math kept for clarity below
+    # (We don't need the cutoff index here — A14 in smoke_mcts.py checks σ_t
+    # behavior at the cutoff. A3 only checks π_t.)
+
+    eps_floor = 1e-6
+    for inst_i, rec in enumerate(records):
+        for t in range(N):
+            ps = rec.per_step[t]
+            pi_t = ps['pi'].astype(np.float64)
+            visited = ps['visited']
+
+            # (a) sum / non-negativity (A2 invariants, re-checked under schedule).
+            s = float(pi_t.sum())
+            assert abs(s - 1.0) < 1e-5, (
+                f"A3 inst={inst_i} step={t}: pi sums to {s}, not 1"
+            )
+            assert (pi_t >= 0).all(), (
+                f"A3 inst={inst_i} step={t}: pi has negative entries"
+            )
+
+            # Entropy with 0·log(0) := 0 (numpy broadcasts inf*0 = nan; mask).
+            mask_pos = pi_t > eps_floor
+            entropy = -float((pi_t[mask_pos] * np.log(pi_t[mask_pos])).sum())
+
+            n_unvisited = int((~visited).sum())
+            if t == N - 1:
+                # Forced step — exactly one unvisited city — π_t is one-hot
+                # and entropy MUST be 0 (legality, not temperature).
+                assert n_unvisited == 1, (
+                    f"A3 inst={inst_i} step=N-1: expected 1 unvisited, got {n_unvisited}"
+                )
+                assert entropy < 1e-6, (
+                    f"A3 inst={inst_i} step=N-1: forced step but entropy={entropy} ≠ 0"
+                )
+            else:
+                # σ_t may have collapsed to one-hot at step ≥ ⌈0.3·N⌉, but π_t
+                # uses raw τ=1 visits and must stay above 0 because there are
+                # multiple unvisited cities and MCTS explored more than one of
+                # them under c_puct + Dirichlet (ε=0 here, but PUCT still
+                # spreads visits across unvisited).
+                if n_unvisited > 1:
+                    assert entropy > 0.0, (
+                        f"A3 inst={inst_i} step={t}: π_t entropy collapsed to 0 with "
+                        f"{n_unvisited} unvisited cities — schedule must NOT couple to π_t"
+                    )
+
+    print(f"     M={M} instances; π_t entropy stays > 0 except at forced step N-1")
+    print("  [A3] OK")
+
+
 def _make_tiny_coach_opts(N: int, M: int, K: int, train_steps: int,
                           gate_every: int, save_dir: str,
                           val_size: int = 32, batch_size: int = 16):
@@ -667,7 +783,7 @@ def test_coach_three_iters(N: int = 8) -> None:
 
 
 def main() -> int:
-    print("Stage 4 Phase B + C + D smoke harness")
+    print("Stage 4 Phase B + C + D + F smoke harness")
     print("=" * 64)
     try:
         test_buffer_invariants(N=8)
@@ -675,6 +791,7 @@ def main() -> int:
         test_state_reconstruction_roundtrip(N=6)
         test_train_step_alphazero(N=8)
         test_self_play_generator(N=20, M=10, K=20)
+        test_target_entropy_under_schedule(N=20, M=10, K=20)
         test_coach_gate_noop(N=8)
         test_coach_three_iters(N=8)
     except AssertionError as e:
@@ -686,7 +803,7 @@ def main() -> int:
         print(f"ERROR: {e}", file=sys.stderr)
         return 2
     print("=" * 64)
-    print("PASS — all Phase B + C + D smoke checks succeeded.")
+    print("PASS — all Phase B + C + D + F smoke checks succeeded.")
     return 0
 
 
