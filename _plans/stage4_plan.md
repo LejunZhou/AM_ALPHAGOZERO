@@ -500,7 +500,7 @@ class MCTSCoach:
 
 **F.6.0 Pre-flight grid probe** (~3.3 h Modal A10 wall-clock, ~$10-15 in credits).
 
-12 variants in parallel, all from-scratch (no `--load_path`), 50 iter × M=1000 × K=100 × `train_steps_per_iter=100` × `buffer_capacity=50_000` × `lr_model=1e-4` × `val_seed=42`. Cross three knobs that may not transfer cleanly from b2's warm-start best:
+12 variants in parallel, all from-scratch (no `--load_path`), 50 iter × M=1000 × K=100 × `train_steps_per_iter=200` × `buffer_capacity=200_000` × `lr_model=1e-4` × `val_seed=42`. The `train_steps_per_iter` and `buffer_capacity` values **match F.6.1's defaults** so the F.6.0 winner's `iter-49.pt` + `buffer.pt` cleanly resume into F.6.1 (`buffer.load()` hard-fails on capacity mismatch — see [coach.py:366-370](../src/am_baseline/training/coach.py#L366-L370)). Cross three knobs that may not transfer cleanly from b2's warm-start best:
 
 | Knob | Values probed | Why uncertain at random init |
 |---|---|---|

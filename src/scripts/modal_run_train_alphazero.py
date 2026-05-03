@@ -269,8 +269,11 @@ def run_f60_grid(timestamp: str = "") -> None:
         "--n_iterations", "50",
         "--M_instances", "1000",
         "--n_simulations_train", "100",
-        "--train_steps_per_iter", "100",
-        "--buffer_capacity", "50000",
+        # train_steps_per_iter and buffer_capacity MATCH F.6.1 so the
+        # F.6.0 winner's iter-49.pt + buffer.pt cleanly resume into F.6.1.
+        # (buffer.load() hard-fails on capacity mismatch — see coach.py:366-370.)
+        "--train_steps_per_iter", "200",
+        "--buffer_capacity", "200000",
         "--batch_size", "512",
         "--gate_every", "5",
         "--temperature_schedule", "step30",
