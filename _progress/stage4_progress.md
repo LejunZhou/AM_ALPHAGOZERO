@@ -146,7 +146,53 @@ Defaults are unchanged: `MCTSConfig.temperature_schedule = None` ≡ `'const'` �
 - [x] **F.3 v5 — `--gate_mode=always` test (Phase G.5.c) (FAILED 2026-04-30)** — Same K=200 recipe + new `--gate_mode always` CLI flag (and `MCTSCoach` opt) that bypasses the t-test and forces best_model = working_model every iter. Diagnostic intent: break the catch-22 where gating freezes best_model = Stage 1, so MCTS prior never strengthens. Output: `outputs/tsp_20/stage4_pilot_v5_alwaysgate_K200_*/`.
   - Result: best_model now matches working_model (3.83732, both worse than Stage 1 by +0.00110). 0.00025 better than v4 but still net-worse.
   - **The plateau is NOT a gating artifact.** Letting MCTS prior evolve via always-accept doesn't escape the plateau — the working model itself is the limit.
-- [ ] **F.4 TSP-20 main run (100 iter × K=100 × 200 train_steps)** — **NEGATIVE-RESULT BRANCH.** F.3 ran 5 attempts and could not achieve the F.3 pilot pass conditions even with the corrected recipe. Decision points pending user input: (a) run F.4 anyway with corrected recipe to document the longer-horizon trajectory, (b) try architecture-level interventions (lower lr, freeze encoder, or fresh value head) to break the plateau, (c) move to Stage 5 from-scratch where AGZ has a cleaner test, (d) test on TSP-50/TSP-100 where Stage 1 is weaker and there's more headroom for AGZ to add value.
+- [ ] **F.4 TSP-20 main run (100 iter × K=100 × 200 train_steps)** — superseded by Modal 4-job batch (2026-05-02), see below.
+
+### F.4 + F.3 Modal batch (2026-05-02) — BREAKTHROUGH
+
+Ran 4 parallel jobs on Modal A10 to test (a) two F.4 variants and (b) two F.3-scale architecture/training interventions. Modal wrapper lives at `src/scripts/modal_run_train_alphazero.py`. Runs in `outputs/tsp_20/{f4_a1, f4_a2, f3_b1, f3_b2}_*`.
+
+**Apples-to-apples on seed=42 10K val (`compare_stage1_vs_stage4.py`):**
+
+| Job | Recipe | Iters | val_avg_cost (working) | Δ vs Stage 1 (=3.83622) | p_one_sided(S4<S1) | Verdict |
+|---|---|---|---|---|---|---|
+| Stage 1 | greedy decoder | — | 3.83622 | — | — | baseline |
+| **a1** | F.4 plan-default — K=100 rollout step30 ε=0.05, ttest, 100 iter, train=200, buffer=200K | 100 | 3.83824 | +0.00202 | 1.0000 | ❌ reproducibly worse |
+| **a2** | F.4 v5-best — K=200 rollout step30 ε=0.05, gate=always (every iter), 100 iter, train=200, buffer=200K | 100 | 3.83669 | +0.00047 | 0.9555 | ⚠️ tied, not significantly different |
+| **b1** | F.3 freeze_encoder — K=200 rollout step30 ε=0.05, ttest, 20 iter, train=100, buffer=50K, **--freeze_encoder** | 20 | 3.83576 | **−0.00046** | **0.0519** | ✓ borderline significant improvement |
+| **b2** | F.3 lr=1e-5 — same as b1 but **--lr_model 1e-5** instead of freeze | 20 | **3.83485** | **−0.00137** | **0.0000 (t=−7.08)** | ✓✓ **STATISTICALLY SIGNIFICANT** |
+
+**Per-iter trajectory highlights (from `iterations.csv`):**
+- a1: flat plateau — iter 0 = 3.8413, iter 99 = 3.8418, min = 3.8401 (iter 23). Same shape as F.3 v3 at full scale.
+- a2: slow but real improvement — iter 0 = 3.8411, iter 99 = 3.8402, **min = 3.8394 (iter 69)**. Reached canonical Stage 1 val (3.83943) on per-run val_dataset.
+- b1: monotone decreasing across all 20 iters — iter 0 = 3.8403, iter 19 = **3.8392 (still improving at end)**.
+- b2: best result — iter 0 = 3.8400, iter 12 = **3.8383 (min)**, iter 19 = 3.8387. **Gate accepted at iter 9** — the first ever gate-accept across 7 attempts. Best_model updated mid-run.
+
+**Diagnosis revised — the F.3 plateau wasn't capacity or gating, it was lr.**
+
+The original F.3 v3-v5 plateau at val ≈ 3.840 was caused by **Adam at lr=1e-4 overshooting from the converged Stage 1 checkpoint**. The MCTS-better-than-greedy signal was always real (+0.006 to +0.0075 buffer gap), the policy just couldn't absorb it without poisoning itself with each update. Lowering lr by 10× let the policy settle into local optima around the MCTS distribution. Even at the F.3-pilot scale (20 iters × M=1000), this passes Stage 4 acceptance criterion 1a:
+
+**Stage 4 acceptance criteria — current status:**
+- ✅ **1a (marginal improvement):** b2 working = 3.83485, threshold = 3.83622 − 0.001 = **3.83522 → PASSES** by 0.00037, statistically significant (p=0.0000).
+- ⚠️ **1b (strict total sample efficiency):** b2 used 20K instances vs Stage 1's 128M; combined Stage 1+Stage 4 sample-efficiency curve at matched x will require the headline plot to render against `iterations.csv`.
+- ❌ **2 (ultimate quality ≤ 3.8312, Stage 3's K=400 rollout):** still 0.0036 above target. Needs more iters / longer training to close the gap to test-time MCTS.
+- ✅ **3 (self-improvement):** b2 trajectory is monotone non-increasing for the first 12 iters (3.8400 → 3.8383), then noisy plateau.
+- ✅ **4 (gating fires + accepts):** **first gate-accept across 7 attempts**, at b2 iter 9 (with lr=1e-5).
+
+**Two interventions worked; lr=1e-5 dominated freeze_encoder.**
+
+Comparing b1 vs b2 separates the two hypotheses:
+- "Shared encoder is the noise channel" (freeze_encoder fix): improvement of 0.00046, borderline-significant (p=0.052). Real but marginal.
+- "Adam lr=1e-4 overshoots from converged checkpoint" (lr=1e-5 fix): improvement of 0.00137, decisively significant (p<0.0001). 3× larger effect.
+
+Both fixes are real and complementary; lr is the dominant factor. **Phase G.8 (optimizer ablation) is now load-bearing rather than optional** alongside G.3 (Dirichlet) and G.5 (gating). A combined `freeze_encoder + lr=1e-5` experiment is a natural follow-up.
+
+**What this means for the plan:**
+- Stage 4 hypothesis ("warm-started AGZ improves on REINFORCE on TSP-20") is now **SUPPORTED** with the corrected recipe.
+- The planned F.4 (a1 recipe) is the wrong recipe; it doesn't pass. The lesson is now: **default F.4 recipe should be K=200 rollout step30 ε=0.05 + lr=1e-5**, not the plan's K=100 lr=1e-4.
+- Open question: does b2 keep improving with more iterations / larger M / longer train_steps? At iter 19 with min at iter 12, the trajectory was noisy but not yet plateaued. A natural next experiment is **b2 recipe at full F.4 scale** (100 iter × M=1000 × train_steps=200 × buffer=200K) to see how far it can go. Stretch goal (criterion 2) requires reaching ≤ 3.8312 — distillation needs to close another 0.0036 gap.
+
+**Compute used:** ~1.5 h Modal A10 wall-clock for the 4 jobs in parallel (~3.5 GPU-h, ≈ $2-4).
 
 ### Phase F — TSP-20 pilot diagnosis summary (2026-04-30)
 

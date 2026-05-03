@@ -70,6 +70,10 @@ def parse_opts(argv=None):
                              '(default); always = accept every gating event (Phase G.5.c, '
                              'AlphaZero-style no-gating); never = reject every event '
                              '(diagnostic: freezes best_model = warm-start).')
+    parser.add_argument('--freeze_encoder', action='store_true',
+                        help='Freeze init_embed + embedder (the encoder) and only train '
+                             'decoder + value_head. Tests the "shared encoder is the noise '
+                             'channel" hypothesis from F.3 v3-v5 plateau diagnosis.')
     parser.add_argument('--temperature_schedule', type=str, default='step30',
                         choices=['const', 'step30', 'step50'],
                         help='Per-tour-step temperature schedule for action selection σ_t. '

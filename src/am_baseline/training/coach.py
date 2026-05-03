@@ -836,11 +836,26 @@ class MCTSCoach:
             device='cpu',
         )
 
+        # Optionally freeze the encoder (init_embed + embedder) so distillation
+        # only updates decoder + value_head. Tests the "shared backbone is the
+        # noise channel" hypothesis from F.3 v3-v5 plateau diagnosis: if
+        # freezing the encoder lets the heads cleanly absorb MCTS targets,
+        # the F.3 plateau was encoder-poisoning rather than capacity ceiling.
+        if bool(getattr(opts, 'freeze_encoder', False)):
+            for p in self.model.init_embed.parameters():
+                p.requires_grad_(False)
+            for p in self.model.embedder.parameters():
+                p.requires_grad_(False)
+            n_total = sum(p.numel() for p in self.model.parameters())
+            n_train = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
+            print(f'[freeze_encoder] froze {n_total - n_train:,} encoder params; '
+                  f'{n_train:,} trainable (decoder + value_head + ...)')
+
         # Optimizer over the WORKING copy (not best_model). Stage 1 default
         # picks Adam; SGD+momentum is the AGZ-canonical alternative under
         # plan G.8 ablation.
         self.optimizer = _torch.optim.Adam(
-            self.model.parameters(),
+            [p for p in self.model.parameters() if p.requires_grad],
             lr=float(getattr(opts, 'lr_model', 1e-4)),
             weight_decay=float(self._weight_decay()),
         )
