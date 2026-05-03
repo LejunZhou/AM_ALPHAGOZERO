@@ -270,17 +270,24 @@ The plan ([_plans/stage4_plan.md:455-470](../_plans/stage4_plan.md#L455-L470)) d
 
   **Decision rule for picking F.6.1 defaults:** lowest `val_avg_cost` at iter 50 wins (or steepest decline if multiple variants tie within ±0.001 noise band).
 
-- [ ] **F.6.1 From-scratch main run.** Recipe locked partially: 1000 iter × M=1000 × **K=100** × `train_steps_per_iter=200` × `buffer_capacity=200_000` × `lr_model=1e-4` × val_seed=42 × no `--load_path`. The `leaf_eval`, `dirichlet_epsilon`, and `gate_mode` defaults are TBD per F.6.0 winner. **K=100 chosen** (was K=200 originally proposed) because the probe showed K=100 → K=200 gives only +33% MCTS-vs-greedy gap improvement at 2× cost. K=200 reserved for F.6.3 escalation.
+- [ ] **F.6.1 From-scratch trajectory probe** *(scope reduced 2026-05-02 from 1000 → 100 iter)*. Recipe locked partially: **100 iter** × M=1000 × **K=100** × `train_steps_per_iter=200` × `buffer_capacity=200_000` × `lr_model=1e-4` × val_seed=42. **Resume from F.6.0 winner's `iter-49.pt`** (avoids re-running the first 50 iters; combined trajectory = 150 iter = 150K instances total). The `leaf_eval`, `dirichlet_epsilon`, and `gate_mode` defaults are TBD per F.6.0 winner. **K=100 chosen** because the probe showed K=100 → K=200 gives only +33% MCTS-vs-greedy gap improvement at 2× cost; K=200 reserved for F.6.3 escalation.
 
   Per-iter wall-clock estimate (Modal A10):
-  - K=100 value_head: MCTS ~15 s + train ~5 s ≈ 20 s/iter → **1000 iter ≈ 6 h, ~$3-4 in credits**.
-  - K=100 rollout: MCTS ~125 s + train ~5 s ≈ 130 s/iter → **1000 iter ≈ 36 h, ~$20-25 in credits**.
+  - K=100 value_head: ~20 s/iter → **100 iter ≈ 33 min, ~$0.30-0.50 in credits**.
+  - K=100 rollout: ~130 s/iter → **100 iter ≈ 3.6 h, ~$2-3 in credits**.
 
   Output: `outputs/tsp_20/stage4_main_fromscratch_<timestamp>/`.
 
-- [ ] **F.6.2 Pass conditions evaluation.** All four must hold to declare proposal Stage 4 satisfied: (1c) sample efficiency — F.6.1's val ≤ 3.83943 at fewer instances than Stage 1's 128M; (2) ultimate quality val ≤ 3.8312; (3) monotone non-increasing within ±0.001 noise; (4) ≥1 gate accept.
+  **Why scope-reduced:** treat F.6.1 as a trajectory proof-of-concept rather than a full convergence run. At 150 iter / 150K instances, F.6.1 is at ~12% of Stage 1's first epoch (1.28M) — too short to definitively answer the proposal sample-efficiency claim, but enough to see whether the from-scratch loop is visibly learning and at what rate. Decision: don't auto-scale to 1000 even if 100-iter shows promise; re-decide F.6.3 escalation based on data.
 
-- [ ] **F.6.3 Optional escalation if F.6.1 plateaus above Stage 1 quality.** 5000-iter extended run, OR step up to K=200, OR pivot to TSP-50 where Stage 1 is weaker. Either documented as proposal-acceptable negative result.
+- [ ] **F.6.2 Pass conditions evaluation** (split — see plan F.6.2 in `_plans/stage4_plan.md` for full text).
+  - **Trajectory-probe conditions** (should hold for the F.6.1 100-iter probe to be informative): (3') visible downward val_avg_cost trend (final < initial by ≥ 0.05 — much looser than ±0.001 noise band); (4) ≥1 gate accept (auto with `--gate_mode always`); F.6.0+F.6.1 trajectory smoothly continuous (sanity-check resume).
+  - **Definitive claim conditions** (deferred to F.6.3 if 100-iter probe warrants): (1c) sample efficiency, (2) ultimate quality ≤ 3.8312, (3) strict monotone within ±0.001.
+
+- [ ] **F.6.3 Optional escalation paths** if 100-iter trajectory shows promise:
+  - **F.6.3.a Continue to 1000 iters at K=100** (resume from F.6.1 final). ~6 h value_head / ~36 h rollout.
+  - **F.6.3.b Step up to K=200** (resume from F.6.1 final). 2× per-iter wall-clock; tests whether stronger MCTS targets accelerate convergence.
+  - **F.6.3.c TSP-50 hoist** (pivot to graph size where Stage 1 is weaker — more headroom for AGZ sample efficiency).
 
 **Required code changes before F.6.0 (DONE — committed `3ca066b` and `d61ecae`):**
 
