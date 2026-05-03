@@ -419,9 +419,17 @@ class MCTSCoach:
 
 ---
 
-### Phase F — TSP-20 pilot + main run (~3.5 h compute)
+### Phase F — TSP-20 pilot + main run
 
-**Goal:** End-to-end Stage 4 run on TSP-20.
+**Goal:** End-to-end Stage 4 run on TSP-20 that satisfies `proposal.md` Stage 4 deliverables (sample-efficiency curve from-scratch vs Stage 1 REINFORCE baseline).
+
+> **⚠️ Proposal-vs-plan discrepancy (logged 2026-05-02).** The original Phase F (F.1-F.5 below) defaulted to **warm-start from the Stage 1 checkpoint** for both pilot (F.3) and main run (F.4). That answers "does AGZ improve a converged Stage 1 model?" — a related but **distinct** question from what `proposal.md` Stage 4 actually promises ("sample-efficiency curve compared to AM REINFORCE baseline" + "reaches AM-equivalent quality with fewer total training instances", lines 134-141). The proposal language clearly implies a from-scratch run.
+>
+> **Decision:** Keep the warm-start work (F.1-F.5) as a documented variant — its results are scientifically interesting and we have ~3.7 h of compute invested in it (5 local pilots + 4 Modal jobs; b2 lr=1e-5 statistically beats Stage 1 with p<0.0001). **Add F.6 as the from-scratch run that aligns with proposal Stage 4.**
+>
+> Phases A-E (visit-dist exposure, replay buffer, self-play generator, coach orchestrator, temperature schedule) are needed for either variant — they remain unchanged.
+
+#### Warm-start variant (deviated from proposal — kept for the lr=1e-5 / freeze-encoder findings)
 
 **F.1 New script `src/scripts/train_alphazero.py`** (~180 LOC).
 - CLI mirrors `train.py` plus Stage 4 flags:
@@ -470,13 +478,50 @@ class MCTSCoach:
 - Gates every 5 iterations → 20 gating opportunities.
 
 **F.5 Headline plot** — `src/scripts/plot_stage4.py` (~80 LOC).
-- Reads `iterations.csv` from F.4 plus `outputs/tsp_20/stage1_tsp20_canonical_*/epochs.csv` from Stage 1.
+- Reads `iterations.csv` from F.4 OR F.6 (see below) plus `outputs/tsp_20/stage1_tsp20_canonical_*/epochs.csv` from Stage 1.
 - Output: `outputs/stage4/figures/sample_efficiency_tsp20.png` — `x = total_instances` (log scale), `y = val_avg_cost`, two curves: Stage 1 REINFORCE (epoch checkpoints) vs Stage 4 (per-iteration).
 - Annotate with horizontal lines: Gurobi optimum (3.8279), Stage 1 final val_avg_cost, Stage 3 K=400 rollout MCTS (3.8312).
+- **For the proposal-aligned headline plot, F.5 should be re-run with F.6's output dir** (from-scratch Stage 4) once F.6 has converged enough to make the claim meaningful.
 
-**Wall-clock:** ~15 min pilot + ~2.2 h main + plot = **~2.5 h compute total.**
+**Wall-clock for warm-start variant:** ~15 min pilot + ~2.2 h main + plot = **~2.5 h compute total.**
 
-**Dependencies:** Phases A, B, C, D, E.
+#### Proposal-aligned variant (NEW — added 2026-05-02 after discrepancy review)
+
+**F.6 From-scratch TSP-20 main run** (aligned with `proposal.md` Stage 4 expected outcomes lines 133-142).
+
+**Goal:** Demonstrate the proposal's core thesis: "AGZ's MCTS-based training reaches AM-equivalent tour quality with fewer total training instances than REINFORCE alone." The headline deliverable is the **sample-efficiency curve** at [proposal.md:140-141](../proposal.md#L140), comparing Stage 4 from-scratch against Stage 1's from-scratch REINFORCE trajectory at matched cumulative-instances-seen.
+
+**Setup:**
+- **No `--load_path`** — the model starts from random init (matches Stage 1's starting condition).
+- Recipe inherits the warm-start lessons (commit `4bdae33` finding): `K=200 rollout step30 ε=0.05 lr=1e-5`. The lr=1e-5 lesson may not transfer cleanly to from-scratch (random init may need lr=1e-4 to climb out of the random-policy well); F.6.0 below tests this.
+- Stage 1 architecture flags must match exactly so the from-scratch comparison is apples-to-apples (`embedding_dim=128, n_encode_layers=3, n_heads=8`, etc.).
+- Pin `--val_seed 42` (new flag — see methodology fixes in `_progress`) so per-iter `iterations.csv` val_avg_cost is directly comparable across runs and against Stage 1's published 3.83943.
+
+**F.6.0 Pre-flight learning-rate probe** (~30 min Modal A10).
+- Two short from-scratch runs (50 iter × M=1000 × K=100): one at lr=1e-4 (Stage 1 default), one at lr=1e-5 (warm-start best).
+- Pick whichever shows steeper val_avg_cost decline at iter 50.
+- Justification: warm-start lr=1e-5 was the right choice from a converged minimum; from random init the gradient norm is much larger and lr=1e-4 may be more appropriate.
+
+**F.6.1 From-scratch main run.**
+- Recipe: 1000 iterations × M=1000 × K=200 × `train_steps_per_iter=200` × `buffer_capacity=200_000` × `lr_model={1e-4 or 1e-5 per F.6.0}` × `--gate_mode always` (to break the catch-22 from F.3 v3-v5 diagnosis; `best_model` evolves with the working model so MCTS prior keeps improving).
+- Per-iter wall-clock estimate (Modal A10): MCTS ~250 s + train ~5 s = ~255 s = ~4.3 min/iter. **1000 iter ≈ 70 h Modal A10 wall-clock ≈ ~$25-50 in credits.**
+- Output: `outputs/tsp_20/stage4_main_fromscratch_<timestamp>/`.
+- Persist iter-*.pt every 50 iters (not every iter — saves ~20 GB).
+
+**F.6.2 Pass conditions** (must all hold to declare proposal Stage 4 satisfied):
+- `val_avg_cost(F.6.1 final iter)` ≤ Stage 1's final 3.83943 within ±0.001 noise (acceptance criterion 2).
+- `val_avg_cost` curve is monotone non-increasing within ±0.001 noise band (criterion 3).
+- Sample-efficiency: at val_avg_cost ≤ 3.85 (a coarse "AM-equivalent" anchor), F.6.1's cumulative instances < Stage 1's cumulative instances at the same val level. Compare via F.5 plot.
+- At least one gate accept (criterion 4 — automatic with `--gate_mode always`).
+
+**F.6.3 Optional escalation if F.6.1 plateaus above Stage 1 quality.**
+- 5000-iter extended run (~$120-250 Modal credits, ~14 days A10), OR
+- Move to TSP-50 where Stage 1's REINFORCE baseline is weaker (more headroom for AGZ to beat it on sample efficiency).
+- Document either as Stage 4 negative result acceptable per proposal closing remark ("If Stage 4 (full loop) shows improvement but not sample efficiency, that's still a publishable negative result about the computational tradeoff.")
+
+**Wall-clock for proposal-aligned variant:** F.6.0 ~30 min + F.6.1 ~70 h + headline plot ≈ **~70 h Modal A10 (≈ $25-50)**.
+
+**Dependencies:** Phases A, B, C, D, E. F.1 CLI is reused (drop `--load_path`). F.5 plot is reused (re-pointed to F.6.1's output dir).
 
 ---
 
@@ -505,21 +550,26 @@ Run only the ablations relevant to the user's interpretation of F.4 results. **G
 
 ## Acceptance criteria for Stage 4 closure
 
-**TSP-20 main run (Phase F.4):**
+**TSP-20 warm-start variant (Phase F.4) — diagnostic / sanity, not the proposal deliverable:**
 
-1a. ✅ **Marginal improvement (warm-start signal).** Stage 4's final val_avg_cost is strictly better than its starting checkpoint by ≥ 0.001: `val_avg_cost(θ_iter100) ≤ 3.83843` (Stage 1 final 3.83943 minus 0.001 noise band). This is the AGZ-loop-improves-on-REINFORCE test, and is what Stage 4 is designed to demonstrate.
+1a. ✅ **Marginal improvement (warm-start signal).** Stage 4's final val_avg_cost is strictly better than its starting checkpoint by ≥ 0.001: `val_avg_cost(θ_iter100) ≤ 3.83843` (Stage 1 final 3.83943 minus 0.001 noise band). This is the AGZ-loop-improves-on-REINFORCE test for the warm-start variant. **Status (2026-05-02): PASSED by Modal b2 run with lr=1e-5 — 3.83485 vs 3.83622 baseline, p<0.0001, t=−7.08.**
 
-1b. ⚠️ **Strict total sample efficiency** (proposal-headline claim, requires careful interpretation). The combined (Stage 1 + Stage 4) sample-efficiency curve, plotted with x-axis = cumulative training instances seen across both stages, should reach Stage 1's final val_avg_cost (3.83943) at total instances < 128M (Stage 1 alone). Because Stage 4 warm-starts from the Stage 1 endpoint, this is trivially true at x = 128M + 1 (Stage 4 has only added improvements). The *meaningful* form is: at any matched x in the overlap region, Stage 1 + Stage 4 ≤ Stage 1 alone. Headline plot must annotate this clearly. **Strict from-scratch sample efficiency** (Stage 4 starting from random weights, comparing total instances to Stage 1's curve) is a Stage 5 follow-up — current Stage 4 *cannot* claim it.
+1b. ⚠️ **Strict total sample efficiency** (proposal-headline claim, requires careful interpretation under warm-start). The combined (Stage 1 + Stage 4) sample-efficiency curve, plotted with x-axis = cumulative training instances seen across both stages, should reach Stage 1's final val_avg_cost (3.83943) at total instances < 128M (Stage 1 alone). Because Stage 4 warm-starts from the Stage 1 endpoint, this is trivially true at x = 128M + 1 (Stage 4 has only added improvements). The *meaningful* form for the warm-start variant is: at any matched x in the overlap region, Stage 1 + Stage 4 ≤ Stage 1 alone. **Strict from-scratch sample efficiency** is now F.6 (proposal-aligned variant), not Stage 5.
 
-2. ✅ **Ultimate quality.** Stage 4 final greedy val_avg_cost ≤ 3.8312 (Stage 3 K=400 rollout MCTS) — i.e., Stage 4's network alone (no MCTS at test time) matches Stage 3's search-augmented Stage 1 result. Equivalently, Stage 4 collapses the test-time gap between greedy and MCTS-K=400 rollout to within noise.
+**TSP-20 from-scratch variant (Phase F.6) — the actual proposal Stage 4 deliverable:**
 
-3. ✅ **Self-improvement.** val_avg_cost curve over iterations is monotone non-increasing within a ±0.001 noise band.
+These are the criteria from `proposal.md` Stage 4 expected outcomes that warm-start cannot satisfy.
 
-4. ✅ **Gating fires.** `gating_baseline.epoch_callback` returns `True` at least once over the 20 gating events.
+1c. **Sample efficiency (proposal headline).** F.6.1's val_avg_cost reaches Stage 1's quality (≤ 3.83943) at fewer cumulative-instances-seen than Stage 1's 128M. Plot via F.5 against Stage 1's `epochs.csv`. **Pending F.6 run.**
+
+2. **Ultimate quality.** Stage 4 final greedy val_avg_cost ≤ 3.8312 (Stage 3 K=400 rollout MCTS) — i.e., Stage 4's network alone (no MCTS at test time) matches Stage 3's search-augmented Stage 1 result. Equivalently, Stage 4 collapses the test-time gap between greedy and MCTS-K=400 rollout to within noise. **Pending F.6 run.** *(Warm-start b2 reached 3.83485, still 0.0036 above this target.)*
+
+3. **Self-improvement.** val_avg_cost curve over iterations is monotone non-increasing within a ±0.001 noise band. *(Warm-start b2: ✅ for first 12 iters; F.6 needs to demonstrate over much longer horizon.)*
+
+4. **Gating fires.** `gating_baseline.epoch_callback` returns `True` at least once over the gating events. *(Warm-start b2: ✅ first ever accept at iter 9; F.6 satisfies trivially with `--gate_mode always`.)*
 
 **Reach (Stage 5 stretch):**
 - TSP-20 final greedy val_avg_cost ≤ 3.8298 (= 0.05% gap vs Gurobi optimum 3.8279) — proposal target.
-- Strict from-scratch sample efficiency (criterion 1b at random init) — needs Stage 5 from-scratch run.
 
 ---
 

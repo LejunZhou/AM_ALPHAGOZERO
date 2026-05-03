@@ -29,6 +29,7 @@ import json
 import pprint as pp
 import time
 
+import numpy as np
 import torch
 
 from am_baseline.model.attention_model import AttentionModel
@@ -42,10 +43,11 @@ def parse_opts(argv=None):
         description="Stage 4 — AlphaGo-Zero-style MCTS self-improvement on TSP",
     )
 
-    # ---- Required: Stage 1 warm-start ---------------------------------------
+    # ---- Optional: Stage 1 warm-start (omit for from-scratch / Phase F.6) ----
     parser.add_argument(
-        '--load_path', type=str, required=True,
-        help='Path to Stage 1 checkpoint (e.g. epoch-99.pt). Used to warm-start θ★.',
+        '--load_path', type=str, default=None,
+        help='Optional Stage 1 checkpoint (e.g. epoch-99.pt) to warm-start θ★. '
+             'Omit for from-scratch random-init AGZ training (proposal Phase F.6).',
     )
 
     # ---- Stage 4 flags -------------------------------------------------------
@@ -100,6 +102,11 @@ def parse_opts(argv=None):
     parser.add_argument('--val_size', type=int, default=10000,
                         help='Validation set size (REUSED by RolloutBaseline for gating; '
                              'no separate gate_val_size — see plan F.1 note).')
+    parser.add_argument('--val_seed', type=int, default=42,
+                        help='Seed for the per-iter val_dataset draw. Pinning makes per-run '
+                             'iterations.csv val_avg_cost directly comparable across runs and '
+                             'against Stage 1 canonical baseline. Default = 42 matches '
+                             'compare_stage1_vs_stage4.py for apples-to-apples eval.')
     parser.add_argument('--eval_batch_size', type=int, default=1024,
                         help='Validation/rollout batch size.')
     parser.add_argument('--seed', type=int, default=1234)
@@ -191,22 +198,31 @@ def run(opts):
 
     problem = TSP
 
-    # ---- Step 2: Load Stage 1 warm-start θ★ ----------------------------------
-    print(f'  [*] Loading Stage 1 warm-start from {opts.load_path}')
-    load_data = torch_load_cpu(opts.load_path)
-
-    # Build the model with the Stage 1 architecture knobs threaded through opts.
+    # ---- Step 2: Build model (random-init or load Stage 1 warm-start) -------
     model = AttentionModel(opts).to(opts.device)
-    if 'model' in load_data:
-        model.load_state_dict({**model.state_dict(), **load_data['model']})
+    if opts.load_path is not None:
+        print(f'  [*] Loading Stage 1 warm-start from {opts.load_path}')
+        load_data = torch_load_cpu(opts.load_path)
+        if 'model' in load_data:
+            model.load_state_dict({**model.state_dict(), **load_data['model']})
+        else:
+            # Some checkpoints save the bare state dict (no nesting); accept that.
+            model.load_state_dict({**model.state_dict(), **load_data})
     else:
-        # Some checkpoints save the bare state dict (no nesting); accept that.
-        model.load_state_dict({**model.state_dict(), **load_data})
+        print('  [*] No --load_path; starting from random init (proposal Phase F.6).')
 
     # ---- Step 3: Validation dataset (consumed by RolloutBaseline + validate) -
+    # Pin the val draw to opts.val_seed so per-iter val_avg_cost is comparable
+    # across runs and against Stage 1 canonical (see methodology fix in F.6).
+    _val_torch_state = torch.get_rng_state()
+    _val_np_state = np.random.get_state()
+    torch.manual_seed(int(opts.val_seed))
+    np.random.seed(int(opts.val_seed))
     val_dataset = TSP.make_dataset(
         size=opts.graph_size, num_samples=opts.val_size,
     )
+    torch.set_rng_state(_val_torch_state)
+    np.random.set_state(_val_np_state)
 
     # ---- Step 4: Construct the coach AFTER opts.val_size is finalized --------
     # (Init-order trap — see file docstring + plan F.1 note.)

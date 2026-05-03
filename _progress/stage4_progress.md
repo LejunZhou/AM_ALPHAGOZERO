@@ -235,6 +235,39 @@ Both fixes are real and complementary; lr is the dominant factor. **Phase G.8 (o
 
 F.3/F.4 are explicitly out of scope for this dev pass and are queued for the user's GPU-equipped box.
 
+### Phase F.6 — Proposal-aligned from-scratch run (2026-05-02; PENDING)
+
+**Status: pending.** Discovered during post-Modal-breakthrough discussion that all Phase F warm-start work (F.1-F.5, including the b2 lr=1e-5 result) addresses a *related but distinct* question from what `proposal.md` Stage 4 actually promises.
+
+**The discrepancy:**
+
+| Question | Setup | What we have so far |
+|---|---|---|
+| Does AGZ improve a converged Stage 1 model? | warm-start from `epoch-99.pt` | ✅ Yes — Modal b2 (lr=1e-5) beats Stage 1 by 0.00137, p<0.0001 |
+| **Does AGZ from-scratch reach AM-equivalent quality with fewer instances than REINFORCE?** *(proposal.md:140-141)* | **random init, no `--load_path`** | **❌ Not yet tested** |
+
+The plan ([_plans/stage4_plan.md:455-470](../_plans/stage4_plan.md#L455-L470)) defaulted to warm-start in F.3 and F.4 for cost reasons (warm-start finishes in ~1.5 h on Modal A10; from-scratch needs ~70 h). Under the warm-start framing, criterion 1b in the original plan explicitly punted from-scratch sample efficiency to Stage 5. The proposal language ("**replace** REINFORCE", "**reaches** AM-equivalent quality with fewer total training instances") clearly implies a from-scratch run that produces a sample-efficiency curve to compare against Stage 1's REINFORCE trajectory.
+
+**Plan amended (2026-05-02).** Phase F now has two explicit variants:
+
+- **Warm-start variant (F.1-F.5)** — kept as a documented diagnostic / sanity. The b2 result is real and useful, and the lr=1e-5 + ε=0.05 + K=200-rollout findings transfer directly to F.6.
+- **Proposal-aligned variant (F.6)** — added. From-scratch run that produces the actual headline sample-efficiency curve.
+
+**F.6 sub-tasks:**
+
+- [ ] **F.6.0 Pre-flight learning-rate probe.** ~30 min Modal A10. Two from-scratch runs (50 iter × M=1000 × K=100): one at lr=1e-4, one at lr=1e-5. Pick whichever shows steeper val_avg_cost decline at iter 50. The warm-start lr=1e-5 lesson may not transfer to random init — gradient norm is much larger from a random policy than from a converged one, so lr=1e-4 may dominate.
+- [ ] **F.6.1 From-scratch main run.** Recipe: 1000 iterations × M=1000 × K=200 × `train_steps_per_iter=200` × `buffer_capacity=200_000` × `lr_model={1e-4 or 1e-5 per F.6.0}` × `--gate_mode always` (breaks the catch-22 from F.3 v3-v5). **No `--load_path`** — random init. ETA ~70 h Modal A10 wall-clock, ~$25-50 in credits. Output: `outputs/tsp_20/stage4_main_fromscratch_<timestamp>/`.
+- [ ] **F.6.2 Pass conditions evaluation.** All four must hold to declare proposal Stage 4 satisfied: (1c) sample efficiency — F.6.1's val ≤ 3.83943 at fewer instances than Stage 1's 128M; (2) ultimate quality val ≤ 3.8312; (3) monotone non-increasing within ±0.001 noise; (4) ≥1 gate accept (automatic with `--gate_mode always`).
+- [ ] **F.6.3 Optional escalation if F.6.1 plateaus above Stage 1 quality.** 5000-iter extended run (~14 days Modal) OR pivot to TSP-50 where Stage 1 is weaker. Either documented as proposal-acceptable negative result.
+
+**Required code changes before F.6.0:**
+
+- [ ] Make `--load_path` optional in `train_alphazero.py` (currently required). When omitted, model starts from random init via standard `AttentionModel.__init__`.
+- [ ] Add `--val_seed <int>` flag (default = 42) so per-iter `iterations.csv` `val_avg_cost` is comparable across runs and against Stage 1's published 3.83943. Currently `val_dataset = TSP.make_dataset(...)` is unseeded, so each run draws a different 10K sample (which is what made the iter-0 numbers in the warm-start runs misleading — see analysis below).
+- [ ] Verify `wandb` logging is on by default for Modal-launched runs (already is per `modal_run_train_alphazero.py::_common_args` — `--wandb_project am-alphagozero --wandb_mode online`).
+
+**Methodology fix surfaced from warm-start analysis:** The per-run `iterations.csv` val_avg_cost trajectories from F.3 v1-v5 and Modal a1/a2/b1/b2 were each computed on a different fresh 10K val draw (no seed pinned). Std-error of the mean across 10K-instance draws is ~0.003, so per-run val_avg_cost numbers are not directly comparable to either each other or to Stage 1's canonical 3.83943. Apples-to-apples eval (`compare_stage1_vs_stage4.py` with seed=42) IS comparable — that's why all the breakthrough numbers in the F.4+F.3 Modal batch table are apples-to-apples, not per-run trajectory reads. F.6 fixes this at the source by pinning `--val_seed 42`.
+
 ### Phase G — Ablations (optional)
 
 - [ ] **G.1** Leaf eval `rollout` vs `value_head`.
