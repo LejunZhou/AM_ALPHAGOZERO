@@ -255,16 +255,40 @@ The plan ([_plans/stage4_plan.md:455-470](../_plans/stage4_plan.md#L455-L470)) d
 
 **F.6 sub-tasks:**
 
-- [ ] **F.6.0 Pre-flight learning-rate probe.** ~30 min Modal A10. Two from-scratch runs (50 iter × M=1000 × K=100): one at lr=1e-4, one at lr=1e-5. Pick whichever shows steeper val_avg_cost decline at iter 50. The warm-start lr=1e-5 lesson may not transfer to random init — gradient norm is much larger from a random policy than from a converged one, so lr=1e-4 may dominate.
-- [ ] **F.6.1 From-scratch main run.** Recipe: 1000 iterations × M=1000 × K=200 × `train_steps_per_iter=200` × `buffer_capacity=200_000` × `lr_model={1e-4 or 1e-5 per F.6.0}` × `--gate_mode always` (breaks the catch-22 from F.3 v3-v5). **No `--load_path`** — random init. ETA ~70 h Modal A10 wall-clock, ~$25-50 in credits. Output: `outputs/tsp_20/stage4_main_fromscratch_<timestamp>/`.
-- [ ] **F.6.2 Pass conditions evaluation.** All four must hold to declare proposal Stage 4 satisfied: (1c) sample efficiency — F.6.1's val ≤ 3.83943 at fewer instances than Stage 1's 128M; (2) ultimate quality val ≤ 3.8312; (3) monotone non-increasing within ±0.001 noise; (4) ≥1 gate accept (automatic with `--gate_mode always`).
-- [ ] **F.6.3 Optional escalation if F.6.1 plateaus above Stage 1 quality.** 5000-iter extended run (~14 days Modal) OR pivot to TSP-50 where Stage 1 is weaker. Either documented as proposal-acceptable negative result.
+**Locked decision (2026-05-02): `lr_model = 1e-4` FIXED for F.6.** AM-paper / Stage 1 default. Justification: the proposal headline claim ("AGZ reaches AM-equivalent quality with fewer instances than REINFORCE") requires apples-to-apples vs Stage 1, which used lr=1e-4 only. The b2 warm-start lr=1e-5 finding does NOT transfer (warm-start fix for converged-checkpoint overshoot; from random init there's no converged optimum to overshoot from). lr=1e-5 sweep moved to Phase G.9 ablation — informational only, not part of F.6 main-line claim. See `project_lr_fairness_for_stage4.md` in project memory.
 
-**Required code changes before F.6.0:**
+**Sub-tasks:**
 
-- [ ] Make `--load_path` optional in `train_alphazero.py` (currently required). When omitted, model starts from random init via standard `AttentionModel.__init__`.
-- [ ] Add `--val_seed <int>` flag (default = 42) so per-iter `iterations.csv` `val_avg_cost` is comparable across runs and against Stage 1's published 3.83943. Currently `val_dataset = TSP.make_dataset(...)` is unseeded, so each run draws a different 10K sample (which is what made the iter-0 numbers in the warm-start runs misleading — see analysis below).
-- [ ] Verify `wandb` logging is on by default for Modal-launched runs (already is per `modal_run_train_alphazero.py::_common_args` — `--wandb_project am-alphagozero --wandb_mode online`).
+- [ ] **F.6.0 Pre-flight grid probe (12 variants).** Spec locked 2026-05-02 (commit `d61ecae`). Probes three knobs that may not transfer cleanly from b2's warm-start best to random init:
+  - `leaf_eval` ∈ {`value_head` (AGZ-canonical), `rollout` (AM-paper)}
+  - `dirichlet_epsilon` ε ∈ {0.0, 0.05 (warm-start safe), 0.25 (AGZ-canonical)}
+  - `gate_mode` ∈ {`ttest` (AGZ-style), `always` (AZ-style)}
+
+  Each variant: 50 iter × M=1000 × K=100 × `train_steps_per_iter=100` × `buffer_capacity=50_000` × `lr_model=1e-4` × `val_seed=42` × no `--load_path`. **ETA ~3.3 h Modal A10 parallel wall-clock, ~$10-15 in credits.**
+
+  Modal entrypoint: `modal run --detach src/scripts/modal_run_train_alphazero.py::run_f60_grid` (added in commit `d61ecae`). Output dirs: `outputs/tsp_20/f60_le{vh|rol}_eps{0|05|25}_g{ttest|always}_<timestamp>/`. W&B logging on by default (project `am-alphagozero`).
+
+  **Decision rule for picking F.6.1 defaults:** lowest `val_avg_cost` at iter 50 wins (or steepest decline if multiple variants tie within ±0.001 noise band).
+
+- [ ] **F.6.1 From-scratch main run.** Recipe locked partially: 1000 iter × M=1000 × **K=100** × `train_steps_per_iter=200` × `buffer_capacity=200_000` × `lr_model=1e-4` × val_seed=42 × no `--load_path`. The `leaf_eval`, `dirichlet_epsilon`, and `gate_mode` defaults are TBD per F.6.0 winner. **K=100 chosen** (was K=200 originally proposed) because the probe showed K=100 → K=200 gives only +33% MCTS-vs-greedy gap improvement at 2× cost. K=200 reserved for F.6.3 escalation.
+
+  Per-iter wall-clock estimate (Modal A10):
+  - K=100 value_head: MCTS ~15 s + train ~5 s ≈ 20 s/iter → **1000 iter ≈ 6 h, ~$3-4 in credits**.
+  - K=100 rollout: MCTS ~125 s + train ~5 s ≈ 130 s/iter → **1000 iter ≈ 36 h, ~$20-25 in credits**.
+
+  Output: `outputs/tsp_20/stage4_main_fromscratch_<timestamp>/`.
+
+- [ ] **F.6.2 Pass conditions evaluation.** All four must hold to declare proposal Stage 4 satisfied: (1c) sample efficiency — F.6.1's val ≤ 3.83943 at fewer instances than Stage 1's 128M; (2) ultimate quality val ≤ 3.8312; (3) monotone non-increasing within ±0.001 noise; (4) ≥1 gate accept.
+
+- [ ] **F.6.3 Optional escalation if F.6.1 plateaus above Stage 1 quality.** 5000-iter extended run, OR step up to K=200, OR pivot to TSP-50 where Stage 1 is weaker. Either documented as proposal-acceptable negative result.
+
+**Required code changes before F.6.0 (DONE — committed `3ca066b` and `d61ecae`):**
+
+- [x] Make `--load_path` optional in `train_alphazero.py`. From-scratch path prints `[*] No --load_path; starting from random init (proposal Phase F.6).` Verified by CPU smoke (TSP-8, 1 iter, val 3.667, finite losses).
+- [x] Add `--val_seed <int>` flag (default = 42) with scoped torch+numpy seed swap so val_dataset is reproducible without disturbing model RNG. Verified: two runs with `--val_seed 42 --seed 999` produce bit-identical `val_avg_cost` (3.468627452850342).
+- [x] W&B logging on by default for Modal-launched runs via `modal_run_train_alphazero.py::_common_args` (`--wandb_project am-alphagozero --wandb_mode online`).
+- [x] Modal `run_f60_grid` entrypoint added — 12-variant grid spawn in parallel.
+- [x] Plan G.9 (lr ablation) added so the lr=1e-5 question is preserved as a planned follow-on (informational only — not a Stage 4 sample-efficiency claim).
 
 **Methodology fix surfaced from warm-start analysis:** The per-run `iterations.csv` val_avg_cost trajectories from F.3 v1-v5 and Modal a1/a2/b1/b2 were each computed on a different fresh 10K val draw (no seed pinned). Std-error of the mean across 10K-instance draws is ~0.003, so per-run val_avg_cost numbers are not directly comparable to either each other or to Stage 1's canonical 3.83943. Apples-to-apples eval (`compare_stage1_vs_stage4.py` with seed=42) IS comparable — that's why all the breakthrough numbers in the F.4+F.3 Modal batch table are apples-to-apples, not per-run trajectory reads. F.6 fixes this at the source by pinning `--val_seed 42`.
 
