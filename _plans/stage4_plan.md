@@ -493,20 +493,31 @@ class MCTSCoach:
 
 **Setup:**
 - **No `--load_path`** — the model starts from random init (matches Stage 1's starting condition).
-- Recipe inherits the warm-start lessons (commit `4bdae33` finding): `K=200 rollout step30 ε=0.05 lr=1e-5`. The lr=1e-5 lesson may not transfer cleanly to from-scratch (random init may need lr=1e-4 to climb out of the random-policy well); F.6.0 below tests this.
+- **`lr_model = 1e-4` fixed for F.6** (the AM-paper-original / Stage 1 default). Decision rationale: the proposal's headline claim ("AGZ reaches AM-equivalent quality with fewer instances than REINFORCE", proposal.md:135) requires apples-to-apples comparison against Stage 1. If F.6 wins by switching the optimizer (lr=1e-4 → 1e-5), a reviewer can object "you didn't show MCTS does the work — Stage 1 might also have done better at lr=1e-5; the optimizer is the confound." Fixing lr=1e-4 eliminates that confound. The b2 lr=1e-5 finding was warm-start-specific (Adam at lr=1e-4 overshoots from a *converged* checkpoint); from random init there is no converged checkpoint to overshoot from. **lr=1e-5 is moved to a planned Phase G ablation** (see G.9 below) so we can revisit it as an apples-to-oranges-but-informative side experiment.
+- Recipe defaults inherit the warm-start lessons that DO transfer: `step30 + ε=0.05` (warm-start safe Dirichlet) and `K=100 rollout` are starting points; F.6.0 grid probes which actually transfer to random init.
 - Stage 1 architecture flags must match exactly so the from-scratch comparison is apples-to-apples (`embedding_dim=128, n_encode_layers=3, n_heads=8`, etc.).
 - Pin `--val_seed 42` (new flag — see methodology fixes in `_progress`) so per-iter `iterations.csv` val_avg_cost is directly comparable across runs and against Stage 1's published 3.83943.
 
-**F.6.0 Pre-flight learning-rate probe** (~30 min Modal A10).
-- Two short from-scratch runs (50 iter × M=1000 × K=100): one at lr=1e-4 (Stage 1 default), one at lr=1e-5 (warm-start best).
-- Pick whichever shows steeper val_avg_cost decline at iter 50.
-- Justification: warm-start lr=1e-5 was the right choice from a converged minimum; from random init the gradient norm is much larger and lr=1e-4 may be more appropriate.
+**F.6.0 Pre-flight grid probe** (~3.3 h Modal A10 wall-clock, ~$10-15 in credits).
+
+12 variants in parallel, all from-scratch (no `--load_path`), 50 iter × M=1000 × K=100 × `train_steps_per_iter=100` × `buffer_capacity=50_000` × `lr_model=1e-4` × `val_seed=42`. Cross three knobs that may not transfer cleanly from b2's warm-start best:
+
+| Knob | Values probed | Why uncertain at random init |
+|---|---|---|
+| `leaf_eval` | `value_head`, `rollout` | Probe ([_progress/stage4_progress.md:115-127](../_progress/stage4_progress.md#L115-L127)) showed rollout > value_head on a *converged* model. From random init, rollouts decode random tours so their value estimates are garbage; value_head is also untrained but at least cheaper (10× fewer forward passes per leaf). AGZ-canonical = value_head. |
+| `dirichlet_epsilon` (ε) | `0.0`, `0.05`, `0.25` | ε=0.25 was catastrophic on the converged Stage 1 prior (mean MCTS tour cost +0.246 *worse* than greedy). On a random prior, AGZ-canonical ε=0.25 *should* be safe — but unconfirmed. |
+| `gate_mode` | `ttest`, `always` | Warm-start ttest stalled (catch-22: candidate ~0.001 worse → never accepted → MCTS prior frozen). From random init candidate likely beats baseline early due to large gradient steps, so ttest *should* fire — but unconfirmed. always-gate is AZ-style and rules out catch-22 by construction. |
+
+Decision rule for picking F.6.1 defaults: **lowest val_avg_cost at iter 50 wins** (or steepest decline if multiple variants tie within ±0.001 noise band).
 
 **F.6.1 From-scratch main run.**
-- Recipe: 1000 iterations × M=1000 × K=200 × `train_steps_per_iter=200` × `buffer_capacity=200_000` × `lr_model={1e-4 or 1e-5 per F.6.0}` × `--gate_mode always` (to break the catch-22 from F.3 v3-v5 diagnosis; `best_model` evolves with the working model so MCTS prior keeps improving).
-- Per-iter wall-clock estimate (Modal A10): MCTS ~250 s + train ~5 s = ~255 s = ~4.3 min/iter. **1000 iter ≈ 70 h Modal A10 wall-clock ≈ ~$25-50 in credits.**
+- Recipe: 1000 iterations × M=1000 × **K=100** × `train_steps_per_iter=200` × `buffer_capacity=200_000` × `lr_model={1e-4 or 1e-5 per F.6.0}` × `leaf_eval={value_head or rollout per F.6.0}` × `--gate_mode {ttest or always per F.6.0}` (the catch-22 from F.3 v3-v5 was a warm-start artifact; from random init candidate likely beats baseline early so ttest may accept naturally — F.6.0 confirms).
+- **K=100 chosen** (vs K=200 originally proposed). Probe ([_progress/stage4_progress.md:115-127](../_progress/stage4_progress.md#L115-L127)) showed K=100 → K=200 gives only +33% MCTS-vs-greedy gap improvement at 2× cost; from random init the policy itself is the early-iter bottleneck, not MCTS depth. K=200 reserved for F.6.3 escalation if F.6.1 plateaus.
+- Per-iter wall-clock estimate (Modal A10):
+  - K=100 value_head: MCTS ~15 s + train ~5 s ≈ 20 s/iter → **1000 iter ≈ 6 h, ~$3-4 in credits**.
+  - K=100 rollout:    MCTS ~125 s + train ~5 s ≈ 130 s/iter → **1000 iter ≈ 36 h, ~$20-25 in credits**.
 - Output: `outputs/tsp_20/stage4_main_fromscratch_<timestamp>/`.
-- Persist iter-*.pt every 50 iters (not every iter — saves ~20 GB).
+- Persist iter-*.pt every 50 iters (not every iter — saves ~10 GB at this scale).
 
 **F.6.2 Pass conditions** (must all hold to declare proposal Stage 4 satisfied):
 - `val_avg_cost(F.6.1 final iter)` ≤ Stage 1's final 3.83943 within ±0.001 noise (acceptance criterion 2).
@@ -519,7 +530,7 @@ class MCTSCoach:
 - Move to TSP-50 where Stage 1's REINFORCE baseline is weaker (more headroom for AGZ to beat it on sample efficiency).
 - Document either as Stage 4 negative result acceptable per proposal closing remark ("If Stage 4 (full loop) shows improvement but not sample efficiency, that's still a publishable negative result about the computational tradeoff.")
 
-**Wall-clock for proposal-aligned variant:** F.6.0 ~30 min + F.6.1 ~70 h + headline plot ≈ **~70 h Modal A10 (≈ $25-50)**.
+**Wall-clock for proposal-aligned variant:** F.6.0 ~3.3 h (12-job grid in parallel; longest variant is K=100 rollout) + F.6.1 ~6 h (value_head) or ~36 h (rollout) + headline plot ≈ **~10-40 h Modal A10 total (≈ $5-30 in credits)**.
 
 **Dependencies:** Phases A, B, C, D, E. F.1 CLI is reused (drop `--load_path`). F.5 plot is reused (re-pointed to F.6.1's output dir).
 
@@ -539,6 +550,7 @@ class MCTSCoach:
 | **G.6** Best-so-far per-instance value normalization (replaces original "cost-to-go vs broadcast z" — cost-to-go is now the F.4 default) | $z_t = (\text{tour\_cost} − \text{lengths}_t) / \min_\text{seen} \text{tour\_cost}(x)$ | ~1 h | Value-target normalization shape; tracks instance-level best instead of model's `bl_val` |
 | **G.7** Symmetry augmentation at leaf eval | random 2D rotation+flip of coords pre-encoder | ~1 h | AGZ Methods §Search algorithm: dihedral aug at every leaf eval (8-fold). TSP analog is continuous SO(2) × {flip} |
 | **G.8** Optimizer: Adam vs SGD+momentum 0.9 | F.4 recipe with SGD+momentum, lr=1e-3 | ~3 h | AGZ canonical optimizer; checks whether Adam-from-warmstart is leaving signal on the table |
+| **G.9** Learning-rate ablation (Adam): lr ∈ {1e-3, 1e-4 (F.6 default), 1e-5} | F.6.1 recipe at three lr values, from-scratch | 3× ~6 h | F.6 fixes lr=1e-4 for apples-to-apples vs Stage 1; b2 warm-start finding (lr=1e-5 beats lr=1e-4) suggests revisiting lr is worth a sweep. **NOT a fair Stage 4 sample-efficiency claim — purely informational.** If lr=1e-5 wins from-scratch too, plan revision required to match Stage 1 at lr=1e-5 also (or document the scope of comparison clearly). |
 
 Run only the ablations relevant to the user's interpretation of F.4 results. **G.1 is highest priority** as the explicit AlphaGo-Lee-vs-Zero head-to-head; **G.4** (temperature) and **G.7** (symmetry) are the cheapest paths to AGZ-canonical fidelity.
 
