@@ -79,6 +79,7 @@ Config Config::from_python(py::dict cfg) {
   out.dirichlet_epsilon = get_or<double>(cfg, "dirichlet_epsilon", out.dirichlet_epsilon);
   out.leaf_eval = get_or<std::string>(cfg, "leaf_eval", out.leaf_eval);
   out.value_norm = get_or<std::string>(cfg, "value_norm", out.value_norm);
+  out.value_target_norm = get_or<std::string>(cfg, "value_target_norm", out.value_target_norm);
   out.fpu_mode = get_or<std::string>(cfg, "fpu_mode", out.fpu_mode);
   out.fpu_fallback = get_or<double>(cfg, "fpu_fallback", out.fpu_fallback);
   out.root_select = get_or<std::string>(cfg, "root_select", out.root_select);
@@ -427,6 +428,23 @@ void Solver::fill_priors(Node& node, const EvalResult& eval) {
   }
 }
 
+double Solver::convert_value_head_output(double v_raw, int n, double bl_val) const {
+  // Convert raw value-head output to v_remaining_norm in PUCT-backup units
+  // (cost_to_go / bl_val_current). Mirrors `MCTSSolver._convert_value_head_output`
+  // in the Python backend.
+  const double safe_bl = bl_val > 1e-6 ? bl_val : 1e-6;
+  if (cfg_.value_target_norm == "bl") {
+    return v_raw;
+  }
+  if (cfg_.value_target_norm == "none") {
+    return v_raw / safe_bl;
+  }
+  if (cfg_.value_target_norm == "sqrt_n") {
+    return v_raw * std::sqrt(static_cast<double>(n)) / safe_bl;
+  }
+  throw std::runtime_error("unknown value_target_norm: " + cfg_.value_target_norm);
+}
+
 void Solver::populate_priors(Node& node, double bl_val) {
   if (node.is_terminal()) {
     throw std::runtime_error("populate_priors called on a terminal node");
@@ -436,7 +454,8 @@ void Solver::populate_priors(Node& node, double bl_val) {
   fill_priors(node, eval);
 
   if (cfg_.leaf_eval == "value_head") {
-    node.v_estimate = eval.value;
+    node.v_estimate = convert_value_head_output(
+        eval.value, static_cast<int>(node.state.n), bl_val);
   } else if (cfg_.leaf_eval == "rollout") {
     node.v_estimate = rollout_remaining_real(node.state) / bl_val;
   } else {
@@ -453,7 +472,8 @@ double Solver::expand(Node& node, double bl_val) {
   fill_priors(node, eval);
 
   if (cfg_.leaf_eval == "value_head") {
-    return eval.value;
+    return convert_value_head_output(
+        eval.value, static_cast<int>(node.state.n), bl_val);
   }
   if (cfg_.leaf_eval == "rollout") {
     return rollout_remaining_real(node.state) / bl_val;
@@ -672,7 +692,8 @@ void Solver::evaluate_pending(std::vector<PendingSimulation>& pending, double bl
 
       double v_remaining_norm = 0.0;
       if (cfg_.leaf_eval == "value_head") {
-        v_remaining_norm = evals[row].value;
+        v_remaining_norm = convert_value_head_output(
+            evals[row].value, static_cast<int>(leaf.state.n), bl_val);
       } else if (cfg_.leaf_eval == "rollout") {
         v_remaining_norm = rollout_values[row] / bl_val;
       } else {
@@ -1314,7 +1335,19 @@ struct BatchInstance {
 
     double v_remaining_norm = 0.0;
     if (cfg.leaf_eval == "value_head") {
-      v_remaining_norm = eval.value;
+      // Convert head output by training-time normalization. Mirrors
+      // Solver::convert_value_head_output / Python _convert_value_head_output.
+      const double safe_bl = bl_val > 1e-6 ? bl_val : 1e-6;
+      if (cfg.value_target_norm == "bl") {
+        v_remaining_norm = eval.value;
+      } else if (cfg.value_target_norm == "none") {
+        v_remaining_norm = eval.value / safe_bl;
+      } else if (cfg.value_target_norm == "sqrt_n") {
+        v_remaining_norm = eval.value
+            * std::sqrt(static_cast<double>(pending_leaf->state.n)) / safe_bl;
+      } else {
+        throw std::runtime_error("unknown value_target_norm: " + cfg.value_target_norm);
+      }
     } else {
       v_remaining_norm = rollout_remaining / bl_val;
     }

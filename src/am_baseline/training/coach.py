@@ -530,6 +530,7 @@ def make_self_play_config(
     dirichlet_epsilon: float = 0.25,
     dirichlet_alpha_factor: float = 10.0,
     temperature_schedule: str = 'step30',
+    value_target_norm: str = 'bl',
 ):
     """AlphaGo-Zero-style self-play preset.
 
@@ -560,6 +561,7 @@ def make_self_play_config(
         n_simulations=n_simulations,
         leaf_eval=leaf_eval,
         value_norm='bl',
+        value_target_norm=value_target_norm,
         c_puct=0.05,
         temperature=1.0,
         temperature_schedule=temperature_schedule,
@@ -876,13 +878,18 @@ class MCTSCoach:
         # ends up next to metrics.csv / epochs.csv. Honor opts.no_wandb (or
         # any of the Stage 1 W&B kill-switch flags) by passing
         # `wandb_project=None` to the logger.
+        # `wandb_group=f"tsp_{graph_size}"` matches Stage 1's grouping
+        # convention ([scripts/train.py:45]) so Stage 1 + Stage 4 runs land
+        # in the same W&B group for side-by-side comparison.
         log_dir = getattr(opts, 'save_dir', getattr(opts, 'output_dir', '.'))
         wandb_project = self._wandb_project()
+        graph_size_for_group = int(getattr(opts, 'graph_size', 20))
         self.logger = MetricsLogger(
             log_dir=log_dir,
             use_tensorboard=False,
             wandb_project=wandb_project,
             wandb_entity=getattr(opts, 'wandb_entity', None),
+            wandb_group=getattr(opts, 'wandb_group', f"tsp_{graph_size_for_group}"),
             wandb_name=getattr(opts, 'run_name', None),
             wandb_mode=getattr(opts, 'wandb_mode', 'online'),
             track_gpu_memory=getattr(opts, 'use_cuda', False),
@@ -1060,6 +1067,7 @@ class MCTSCoach:
                 dirichlet_epsilon=float(getattr(opts, 'dirichlet_epsilon', 0.25)),
                 dirichlet_alpha_factor=float(getattr(opts, 'dirichlet_alpha_factor', 10.0)),
                 temperature_schedule=str(getattr(opts, 'temperature_schedule', 'step30')),
+                value_target_norm=str(getattr(opts, 'value_target_norm', 'bl')),
             )
             records = generate_self_play_batch(
                 self.best_model,
@@ -1120,6 +1128,7 @@ class MCTSCoach:
                 mcts_wall_s=t1 - t0,
                 train_wall_s=t2 - t1,
                 buffer_size=int(len(self.buffer)),
+                lr=float(getattr(opts, 'lr_model', 1e-4)),
             )
             self._save_checkpoint(tag=f'{self.iter_idx}')
 

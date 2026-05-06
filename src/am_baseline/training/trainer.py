@@ -270,7 +270,32 @@ def train_step_alphazero(model, optimizer, batch, opts):
     # capacity (~520 MB); transfer happens here, not in the buffer.
     coords = batch["coords"].to(device=device, dtype=torch.float32)
     pi_target = batch["pi"].to(device=device, dtype=torch.float32)
-    z_target = batch["z"].to(device=device, dtype=torch.float32)
+
+    # ---- Value-target normalization ---------------------------------------
+    # The buffer always stores `z = cost_to_go / bl_val` (frozen at self-play
+    # time). At training time we re-derive the actual target based on
+    # `opts.value_target_norm` to disentangle the head from bl_val drift:
+    #   "bl"     : keep z = cost_to_go / bl_val_training (current default;
+    #              suffers from calibration drift between training-time and
+    #              MCTS-time bl_val).
+    #   "sqrt_n" : z = cost_to_go / sqrt(N) — instance-independent,
+    #              time-invariant; no drift.
+    #   "none"   : z = cost_to_go (raw cost-to-go; head learns absolute
+    #              remaining cost. MCTS leaf-eval converts via division by
+    #              current bl_val.).
+    z_buf = batch["z"].to(device=device, dtype=torch.float32)         # cost_to_go / bl_val
+    bl_val_b = batch["bl_val"].to(device=device, dtype=torch.float32)
+    norm_mode = str(getattr(opts, "value_target_norm", "bl"))
+    if norm_mode == "bl":
+        z_target = z_buf
+    elif norm_mode == "none":
+        # Recover raw cost-to-go = z_buf * bl_val.
+        z_target = z_buf * bl_val_b
+    elif norm_mode == "sqrt_n":
+        graph_size = float(getattr(opts, "graph_size", coords.size(1)))
+        z_target = (z_buf * bl_val_b) / (graph_size ** 0.5)
+    else:
+        raise ValueError(f"Unknown value_target_norm: {norm_mode!r}")
 
     # ---- Forward ----------------------------------------------------------
     # Critical (plan B.2): gradient must flow through the same compute graph
@@ -315,8 +340,12 @@ def train_step_alphazero(model, optimizer, batch, opts):
     policy_loss = -(pi_target * log_p_safe).sum(dim=-1).mean()
 
     # ---- Value loss -------------------------------------------------------
-    # batch['z'] = cost_to_go / bl_val is the V_CURRENT cost-to-go target
-    # (matches Stage 1 shape). MSE against the value head's per-step output.
+    # `z_target` was computed above per `opts.value_target_norm` — see comment
+    # block. MSE against the value head's per-step output. The head's
+    # absolute output range scales with the chosen normalizer:
+    #   "bl"     ⇒ v ∈ [0, ~1.5]    (matches Stage 1 shape)
+    #   "sqrt_n" ⇒ v ∈ [0, ~1]      (sqrt(N=20) ≈ 4.47 normalizer)
+    #   "none"   ⇒ v ∈ [0, ~5]      (raw TSP-20 cost-to-go)
     value_loss = F.mse_loss(v, z_target)
 
     # ---- Total loss -------------------------------------------------------

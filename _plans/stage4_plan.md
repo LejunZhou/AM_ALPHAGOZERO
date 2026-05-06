@@ -510,8 +510,58 @@ class MCTSCoach:
 
 Decision rule for picking F.6.1 defaults: **lowest val_avg_cost at iter 50 wins** (or steepest decline if multiple variants tie within ±0.001 noise band).
 
+**F.6.0.5 Learning-rate re-derivation for Stage-4 CE distillation** *(added 2026-05-03 in response to F.6.0 results — winner stuck at val_avg_cost=3.9338, ~0.094 above Stage 1's 3.83943).*
+
+The F.6 setup pinned `lr_model=1e-4` (Stage 1's default) for apples-to-apples sample-efficiency comparison. F.6.0's slow convergence motivates re-deriving lr from the gradient calculation, since Stage 1 (REINFORCE) and Stage 4 (CE distillation) have qualitatively different gradient regimes.
+
+*Gradient regime comparison ([trainer.py:307-324](../src/am_baseline/training/trainer.py#L307) for Stage 4; [trainer.py:120-225](../src/am_baseline/training/trainer.py#L120) for Stage 1):*
+
+- **Stage 4 CE policy gradient on logits:** ∂L_policy/∂ℓ_j = p_j − π_j^target. **Bounded** — each component ∈ [−1, 1]; per-row L2 ≤ √2. Per-element grad scale O(1).
+- **Stage 1 REINFORCE policy gradient on logits:** ∂L_reinforce/∂ℓ^(t)_j = (L_tour − b_l)·(1[a_t=j] − p_j). **Advantage-scaled** — magnitude grows with |cost − baseline|, summed over N tour-steps.
+- Empirical match ([probe_grad_norm.py](../src/scripts/probe_grad_norm.py), n=30, random init, F.6.0-scale): Stage 4 grad-norm mean = **3.76**, Stage 1 = **90.87**. Ratio ~24× consistent with O(1) vs O(advantage·N) prediction. Local production-batch proxy (`batch_size=512`, 10 CPU steps, 2026-05-03): Stage 4 mean = **5.20**, Stage 1 = **35.37**. Both regimes still exceed `max_grad_norm=1.0`, so raw gradient scale is not a reason to lower Stage 4 LR.
+
+*Why lr=1e-4 is conservative for Stage 4:*
+
+Both regimes use Adam ([coach.py:857-861](../src/am_baseline/training/coach.py#L857)) and `max_grad_norm=1.0`. The clip is active in the probes, so it is not a raw-gradient no-op. But because it is active for both regimes, and Adam is approximately scale-invariant to uniform gradient magnitude (uniform `g → c·g` rescales `m → c·m`, `v → c²·v`, leaving `lr · m̂/√v̂` close to unchanged), the practical control knob is still the optimizer step size and update budget, not the unnormalized Stage 1 vs Stage 4 grad-norm ratio. **Per-step parameter movement is governed mainly by `lr` in both regimes.**
+
+Budget arithmetic:
+```
+Stage 1 full convergence:  ~250,000 grad steps × lr=1e-4  ⇒ ~25 units parameter drift
+Stage 4 F.6.0:              10,000 grad steps × lr=1e-4  ⇒ ~ 1 unit
+                                                          ⇒ Stage 4 is at ~4% of Stage 1's drift
+```
+
+Stage 4 distillation is structurally **supervised CE on a transformer**. Reference Adam lrs: BERT-base 1e-4 (with warmup), nanoGPT 6e-4, ViT classification 1e-3. **lr=1e-4 sits at the conservative end** of this range. To match Stage 1's 25-unit drift budget within F.6.1's added 20K steps (30K total), required lr ≈ 25/30,000 ≈ **8.3e-4**.
+
+*Recommendation:* **lr=5e-4 for F.6.1** (geometric mean of principled range 3e-4 – 1e-3, halfway between Stage-1-inheritance and budget-matching). 5× faster expected convergence than F.6.0, with margin below Adam stability ceiling for noisy bootstrapping CE targets. Clip=1.0 retained (catches outliers without binding typical steps under Adam scale-invariance).
+
+*Validation — narrow 3-variant Modal smoke (`run_f605_lr_validation`, ~$8-12, ~1.7 h parallel):*
+
+Hold-fixed at F.6.0 winner config: leaf_eval=rollout, ε=0.25, gate_mode=ttest, K=100, M=1000, train_steps_per_iter=200, buffer=200K, batch_size=512, val_seed=42, max_grad_norm=1.0, **n_iterations=25** (half of F.6.0 — Adam typically discriminates lr scales by step 1k-2k = iter 5-10).
+
+V3 was added 2026-05-04 to disentangle the **weight_decay** confound between regimes: Stage 1 ([train.py:85-92](../src/scripts/train.py#L85-L92)) uses Adam with no `weight_decay` argument → PyTorch default `wd=0` (matches AM-paper convention). Stage 4 ([coach.py:857-861](../src/am_baseline/training/coach.py#L857-L861)) uses `weight_decay=1e-4` (AGZ-canonical L2). Theoretical impact at this scale is below the val_avg_cost noise floor (Adam-coupled L2 contribution ≈ `lr · wd · θ ≈ 5e-8` per step → ~`2.5e-4` cumulative over 5K steps), but verifying empirically removes the apples-to-apples objection.
+
+| variant | lr | weight_decay | role |
+|---|---|---|---|
+| V1 (control) | 1e-4 | 1e-4 | F.6.0-winner replication; sanity that V2/V3 is comparable to F.6.0 |
+| V2 (analytical) | 5e-4 | 1e-4 | first-principles recommendation at Stage-4 wd convention |
+| V3 (apples-to-apples) | 5e-4 | 0 | most apples-to-apples with Stage 1 (lr-only intervention removes wd confound) |
+
+*Pass criteria — two-step decision rule for F.6.1:*
+
+**Step 1 (lr decision):** V2 OR V3 reaches val_avg_cost(iter 25) ≤ V1 − 0.02, AND that variant's trajectory is monotone-decreasing without per-iter regression > 0.05, AND that variant's final policy_loss within 30% of V1's (no divergence).
+
+If neither V2 nor V3 passes Step 1: drop F.6.1 to **lr=3e-4, wd=1e-4** and document failure mode. Don't run additional variants — go straight to F.6.1.
+
+**Step 2 (wd decision, only if Step 1 passed):** compare V3 vs V2 directly:
+- |V3 − V2| < 0.005 → wd doesn't confound at this scale. Adopt **V2 settings (lr=5e-4, wd=1e-4)** for F.6.1 to keep AGZ-canonical L2.
+- V3 < V2 by ≥ 0.01 → wd=0 helps materially. Adopt **V3 settings (lr=5e-4, wd=0)** for F.6.1; document Stage 4 should drop AGZ-canonical L2 in favor of Stage-1/AM-paper convention.
+- V3 > V2 by ≥ 0.01 → wd=1e-4 helps materially (rare). Adopt V2 settings; document the win.
+
+*If F.6.1 succeeds:* F.6.1 default lr (and possibly wd) changes per the decision rule, superseding the lr=1e-4 fixed-by-F.6-setup rule. The proposal claim should then be worded as a regime-appropriate Stage 4 optimizer choice, not "identical LR to Stage 1." Keep `1e-4` as the control curve and treat `1e-3` as an LR ablation unless it clears the same stability checks.
+
 **F.6.1 From-scratch trajectory probe.** *(Scope reduced 2026-05-02: 100 iter, not 1000 — treating Stage 4 from-scratch as a proof-of-concept trajectory check rather than a full convergence run. Decision: don't auto-scale to 1000 even if 100 iter shows promise; re-decide based on data.)*
-- Recipe: **100 iterations** × M=1000 × **K=100** × `train_steps_per_iter=200` × `buffer_capacity=200_000` × `lr_model=1e-4` (fixed, see F.6 setup) × `leaf_eval={value_head or rollout per F.6.0}` × `dirichlet_epsilon={0.0 / 0.05 / 0.25 per F.6.0}` × `gate_mode={ttest or always per F.6.0}`.
+- Recipe: **100 iterations** × M=1000 × **K=100** × `train_steps_per_iter=200` × `buffer_capacity=200_000` × `lr_model={pending F.6.0.5 Step 1; 5e-4 if V2 or V3 passes, 3e-4 fallback}` × `weight_decay={pending F.6.0.5 Step 2; 1e-4 if V2 wins or V2≈V3, 0 if V3 wins by ≥0.01}` × `leaf_eval={value_head or rollout per F.6.0}` × `dirichlet_epsilon={0.0 / 0.05 / 0.25 per F.6.0}` × `gate_mode={ttest or always per F.6.0}`.
 - **Resume from F.6.0 winner's `iter-49.pt`** to avoid re-running the first 50 iters under the winning recipe. Combined trajectory after F.6.1 = 50 (F.6.0) + 100 (F.6.1) = **150 iter, ~150K instances total**.
 - **K=100 chosen** (vs K=200 originally proposed). Probe ([_progress/stage4_progress.md:115-127](../_progress/stage4_progress.md#L115-L127)) showed K=100 → K=200 gives only +33% MCTS-vs-greedy gap improvement at 2× cost; from random init the policy itself is the early-iter bottleneck, not MCTS depth. K=200 reserved for F.6.3 escalation if 100-iter trajectory shows promise but hasn't converged.
 - Per-iter wall-clock estimate (Modal A10):

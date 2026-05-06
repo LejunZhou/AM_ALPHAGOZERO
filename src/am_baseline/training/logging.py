@@ -54,6 +54,10 @@ class MetricsLogger:
         self._iter_current = None     # iter_idx currently being accumulated
         # Stage-4 W&B custom-metric registration is gated until first use.
         self._wandb_iter_axis_defined = False
+        # Cumulative train-step counter across all iterations (Stage-4). Used
+        # to emit a `global_step` series compatible with Stage-1's per-step
+        # x-axis so both regimes can be plotted side-by-side.
+        self._alphazero_global_step = 0
 
         # Optional TensorBoard
         self.tb_logger = None
@@ -324,11 +328,14 @@ class MetricsLogger:
                 self._iter_step_accum[k].append(float(metrics[k]))
         self._iter_step_count += 1
 
-        # W&B per-step (under the iteration axis). Use a unique step axis so
-        # this does not collide with Stage 1's `global_step` series.
+        # W&B per-step. Stage-4-specific names use the `iteration` axis;
+        # Stage-1-aligned aliases (`global_step`, `value_loss`) use the
+        # `global_step` axis so a Stage-4 per-step run can be plotted in the
+        # same W&B panel as a Stage-1 per-step run.
         if self.wandb_run is not None:
             self._ensure_wandb_iter_axis()
             import wandb
+            self._alphazero_global_step += 1
             payload = {
                 'iteration': iter_idx,
                 'alphazero_train_step': step,
@@ -336,18 +343,29 @@ class MetricsLogger:
                 'value_loss_step': float(metrics.get('value_loss', 0.0)),
                 'total_loss_step': float(metrics.get('total_loss', 0.0)),
                 'mean_entropy_pi_step': float(metrics.get('mean_entropy_pi', 0.0)),
+                # Stage-1-aligned aliases (kept on the `global_step` axis):
+                'global_step': int(self._alphazero_global_step),
+                'value_loss': float(metrics.get('value_loss', 0.0)),
+                'epoch': int(iter_idx),
             }
             wandb.log(payload)
 
     def log_iteration(self, iter, total_instances, val_avg_cost,
                       gated=False, accepted=None,
                       mcts_wall_s=0.0, train_wall_s=0.0,
-                      buffer_size=0):
+                      buffer_size=0, lr=None):
         """Stage 4 per-iteration logger. Flushes per-step running means from
         `log_alphazero_step` into one CSV row + one W&B point.
 
         Args mirror plan §D.2 verbatim. `accepted` may be `None` when the
         iteration was not gated (wrote as empty string in CSV).
+
+        Stage-1-aligned W&B aliases: this function ALSO emits the Stage-1
+        per-epoch metric names (`epoch`, `val_avg_cost`, `lr`,
+        `epoch_duration`, `baseline_updated`) keyed off `epoch=iter` so
+        Stage 1 and Stage 4 W&B runs can be compared side-by-side under a
+        common `epoch` x-axis. `lr` is optional; if omitted the alias is
+        skipped.
         """
         self._ensure_iter_csv()
         self._ensure_wandb_iter_axis()
@@ -428,6 +446,19 @@ class MetricsLogger:
                 payload['val_avg_cost_vs_instances'] = float(val_avg_cost)
             if accepted is not None:
                 payload['accepted'] = int(bool(accepted))
+
+            # Stage-1-aligned aliases: emit the per-epoch Stage-1 metric names
+            # keyed off `epoch = iter` so Stage 1 and Stage 4 W&B runs share
+            # the `epoch` x-axis. The Stage-4-specific names above are kept
+            # so existing Stage-4 dashboards/plots are unaffected.
+            payload['epoch'] = int(iter)
+            payload['epoch_duration'] = float(mcts_wall_s) + float(train_wall_s)
+            payload['baseline_updated'] = int(bool(accepted)) if accepted else 0
+            if val_avg_cost is not None:
+                payload['val_avg_cost'] = float(val_avg_cost)
+            if lr is not None:
+                payload['lr'] = float(lr)
+
             wandb.log(payload)
 
     def close(self):

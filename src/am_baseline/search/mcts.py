@@ -59,6 +59,19 @@ class MCTSConfig:
     leaf_eval: str = 'rollout'                # 'value_head' | 'rollout'
     value_norm: str = 'bl'                    # 'bl' (per-instance greedy) | 'sqrt_n'
 
+    # Describes how the value head was TRAINED. Used at value_head leaf-eval
+    # to convert v(state) → v_remaining_norm in the units expected by PUCT
+    # backup (cost_to_go / bl_val_current). Decoupled from `value_norm` which
+    # controls MCTS-time path-cost normalization.
+    #   'bl'     : head trained on z = cost_to_go / bl_val_at_training_time.
+    #              MCTS uses v(state) directly (current default; suffers
+    #              calibration drift if MCTS-time bl_val ≠ training-time bl_val).
+    #   'sqrt_n' : head trained on z = cost_to_go / sqrt(N). MCTS converts
+    #              via v_remaining_norm = v * sqrt(N) / bl_val_current.
+    #   'none'   : head trained on z = cost_to_go (raw). MCTS converts via
+    #              v_remaining_norm = v / bl_val_current. Eliminates drift.
+    value_target_norm: str = 'bl'             # 'bl' | 'sqrt_n' | 'none'
+
     # --- FPU (first-play urgency): Q_init for unvisited actions ---
     # 'fallback'   : constant `fpu_fallback` everywhere (useful for sweeping)
     # 'running_q'  : node's own running mean sum(W)/sum(N); falls back when N=0
@@ -99,6 +112,7 @@ class MCTSSolver:
 
     VALID_LEAF_EVAL = {'value_head', 'rollout'}
     VALID_VALUE_NORM = {'bl', 'sqrt_n'}
+    VALID_VALUE_TARGET_NORM = {'bl', 'sqrt_n', 'none'}
     VALID_FPU_MODE = {'fallback', 'running_q', 'node_value'}
     VALID_ROOT_SELECT = {'visits', 'q'}
     # None and 'const' are treated identically (constant τ = cfg.temperature).
@@ -162,6 +176,11 @@ class MCTSSolver:
             )
         if cfg.value_norm not in cls.VALID_VALUE_NORM:
             raise ValueError(f"cfg.value_norm={cfg.value_norm!r} not in {cls.VALID_VALUE_NORM}")
+        if getattr(cfg, 'value_target_norm', 'bl') not in cls.VALID_VALUE_TARGET_NORM:
+            raise ValueError(
+                f"cfg.value_target_norm={cfg.value_target_norm!r} "
+                f"not in {cls.VALID_VALUE_TARGET_NORM}"
+            )
         if cfg.fpu_mode not in cls.VALID_FPU_MODE:
             raise ValueError(f"cfg.fpu_mode={cfg.fpu_mode!r} not in {cls.VALID_FPU_MODE}")
         if cfg.root_select not in cls.VALID_ROOT_SELECT:
@@ -358,6 +377,25 @@ class MCTSSolver:
             return self.cfg.fpu_fallback
         raise ValueError(f"unknown fpu_mode: {mode}")
 
+    def _convert_value_head_output(self, v: float, node: MCTSNode, bl_val: float) -> float:
+        """Convert raw `value_head(glimpse)` output `v` to v_remaining_norm
+        in the units PUCT expects (cost_to_go / bl_val_current), based on
+        how the head was TRAINED. See `MCTSConfig.value_target_norm` docs."""
+        norm = getattr(self.cfg, 'value_target_norm', 'bl')
+        if norm == 'bl':
+            # Head was trained on z = cost_to_go / bl_val_train. We treat its
+            # output as already in normalized units (current default; suffers
+            # calibration drift if bl_val_current ≠ bl_val_train).
+            return v
+        if norm == 'none':
+            # Head was trained on raw cost_to_go. Convert to current-bl-val
+            # normalized form by dividing.
+            return v / max(bl_val, 1e-6)
+        if norm == 'sqrt_n':
+            n = float(node.state.loc.size(-2))
+            return v * (n ** 0.5) / max(bl_val, 1e-6)
+        raise ValueError(f"Unknown value_target_norm: {norm!r}")
+
     def _populate_priors(self, node: MCTSNode, fixed, bl_val: float) -> None:
         """Populate `node.P` for all legal actions AND cache `node.v_estimate`.
 
@@ -365,8 +403,10 @@ class MCTSSolver:
         `cfg.leaf_eval`) so the root's FPU values are on the same scale
         regardless of leaf-eval mode. Without this caching the root would
         carry `v_estimate=NaN` and `fpu_mode='node_value'` would silently
-        fall back to `running_q` / `fpu_fallback`. `bl_val` is needed only
-        by the rollout branch (value_head returns normalized space directly).
+        fall back to `running_q` / `fpu_fallback`. `bl_val` is needed by
+        the rollout branch to normalize raw remaining cost AND, under
+        `value_target_norm='none'/'sqrt_n'`, by the value-head branch to
+        convert v(state) into normalized space.
         """
         assert not node.is_terminal(), "_populate_priors called on terminal node"
         log_p, mask, glimpse = self.model.decoder.decode_step(
@@ -376,7 +416,8 @@ class MCTSSolver:
         self._fill_priors_from_logp(node, log_p, mask)
 
         if self.cfg.leaf_eval == 'value_head':
-            node.v_estimate = float(self.model.value_head(glimpse).view(-1)[0].item())
+            v_raw = float(self.model.value_head(glimpse).view(-1)[0].item())
+            node.v_estimate = self._convert_value_head_output(v_raw, node, bl_val)
             self.fwd_count_value += 1
         elif self.cfg.leaf_eval == 'rollout':
             remaining_real = self._rollout_remaining_real(node.state, fixed)
@@ -387,8 +428,9 @@ class MCTSSolver:
     def _expand(self, node: MCTSNode, fixed, bl_val: float) -> float:
         """Populate `node.P` AND return estimated NORMALIZED cost-to-go from node.state.
 
-        `bl_val` is only used by the rollout branch to normalize realized
-        remaining cost; the value_head branch is already in normalized space.
+        `bl_val` is used by the rollout branch to normalize realized remaining
+        cost AND, under `value_target_norm='none'/'sqrt_n'`, by the value-head
+        branch to convert v(state) to the same normalized space.
         """
         assert not node.is_terminal(), "_expand called on terminal node"
         log_p, mask, glimpse = self.model.decoder.decode_step(
@@ -398,9 +440,9 @@ class MCTSSolver:
         self._fill_priors_from_logp(node, log_p, mask)
 
         if self.cfg.leaf_eval == 'value_head':
-            v = float(self.model.value_head(glimpse).view(-1)[0].item())
+            v_raw = float(self.model.value_head(glimpse).view(-1)[0].item())
             self.fwd_count_value += 1
-            return v
+            return self._convert_value_head_output(v_raw, node, bl_val)
         if self.cfg.leaf_eval == 'rollout':
             remaining_real = self._rollout_remaining_real(node.state, fixed)
             return remaining_real / bl_val

@@ -30,6 +30,12 @@ struct Config {
   double dirichlet_epsilon = 0.0;
   std::string leaf_eval = "rollout";
   std::string value_norm = "bl";
+  // Mirrors `MCTSConfig.value_target_norm` in the Python backend; describes
+  // the value head's training-time normalizer ("bl" = cost_to_go/bl_val_train,
+  // "sqrt_n" = cost_to_go/sqrt(N), "none" = raw cost_to_go). The leaf-eval
+  // path converts v(state) -> v_remaining_norm using this field. See
+  // `Solver::convert_value_head_output` in mcts.cpp.
+  std::string value_target_norm = "bl";
   std::string fpu_mode = "running_q";
   double fpu_fallback = -1.0;
   std::string root_select = "visits";
@@ -130,6 +136,7 @@ class Solver {
   void populate_priors(Node& node, double bl_val);
   double expand(Node& node, double bl_val);
   double rollout_remaining_real(const TspState& state);
+  double convert_value_head_output(double v_raw, int n, double bl_val) const;
   std::vector<double> rollout_many_remaining_real(const std::vector<TspState>& states);
   void simulate(Node& root, double bl_val);
   void simulate_batched(Node& root, double bl_val);

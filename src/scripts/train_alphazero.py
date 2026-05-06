@@ -145,7 +145,14 @@ def parse_opts(argv=None):
     parser.add_argument('--no_value', action='store_false', dest='value_enabled',
                         help='Disable the auxiliary value head (Stage 4 requires it; default ON).')
     parser.add_argument('--value_hidden_dim', type=int, default=128)
-    parser.add_argument('--value_target_norm', choices=['bl', 'sqrt_n'], default='bl')
+    parser.add_argument('--value_target_norm', choices=['bl', 'sqrt_n', 'none'], default='bl',
+                        help='Value-head training target normalizer: '
+                             '"bl" (default) = z = cost_to_go / bl_val (AGZ-style; '
+                             'has calibration drift between training-time and MCTS-time bl_val); '
+                             '"sqrt_n" = z = cost_to_go / sqrt(N) (instance-independent, '
+                             'time-invariant — fixes drift); '
+                             '"none" = z = cost_to_go (raw cost; cleanest semantics, '
+                             'MCTS divides by current bl_val at leaf-eval time).')
 
     return parser.parse_args(argv)
 

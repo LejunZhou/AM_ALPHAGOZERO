@@ -16,6 +16,20 @@ Parallel-batch usage (the four F.4 + F.3 jobs):
 
 Download results:
   modal volume get am-alphagozero-volume outputs/
+
+W&B logging convention (aligned with Stage 1 for side-by-side comparison):
+  - Stage 4 runs land in the same W&B group `tsp_{graph_size}` as Stage 1
+    runs (set in `am_baseline.training.coach.MCTSCoach.__init__`).
+  - One Stage 4 iteration ≡ one Stage 1 epoch on the W&B `epoch` x-axis:
+    `MetricsLogger.log_iteration` emits `epoch`, `val_avg_cost`, `lr`,
+    `epoch_duration` (= mcts_wall_s + train_wall_s), and `baseline_updated`
+    (= 1 if gate accepted, else 0) alongside the Stage-4-specific
+    `iteration` / `val_avg_cost_iter` / `policy_loss_mean` series.
+  - Stage 4 per-train-step logs emit `global_step` (cumulative across
+    iterations) and `value_loss` aliases on Stage 1's `global_step` x-axis,
+    alongside `iteration` / `policy_loss_step` / `value_loss_step`.
+  Modify these via `src/am_baseline/training/logging.py` (the actual W&B
+  payload construction) — this Modal entrypoint just forwards CLI args.
 """
 import os
 import sys
@@ -311,6 +325,728 @@ def run_f60_grid(timestamp: str = "") -> None:
         h.get()
         print(f"[modal] {label} done.", flush=True)
     print(f"\n[modal] all {len(handles)} F.6.0 grid jobs complete.")
+    print("[modal] download results with: modal volume get am-alphagozero-volume outputs/")
+
+
+@app.local_entrypoint()
+def run_f605_lr_validation(timestamp: str = "") -> None:
+    """Phase F.6.0.5 — 4-variant 2x2 lr × wd grid (value_head leaf eval, K=40, 20 iter).
+
+    Tests the lr × wd interaction at value_head leaf eval, which is ~5x cheaper
+    per iter than rollout (K=100 rollout was ~440 s/iter; K=40 value_head ≈
+    ~80 s/iter). 20 iter at K=40 makes this a fast-iteration probe.
+
+    Why value_head here (vs F.6.0's rollout): F.6.0 showed value_head trailing
+    rollout by ~0.2, but the user wants to retest with the F.6.0.5-derived
+    lr/wd choices to see if better optimizer settings rescue value_head's
+    leaf-eval signal. Cheaper per-iter compute also makes the 4-variant grid
+    feasible.
+
+    Four variants — full 2x2 lr × wd grid:
+
+        V1 (control)        lr=1e-4  wd=1e-4   AGZ-canonical defaults
+        V2 (analytical)     lr=5e-4  wd=1e-4   higher lr at AGZ wd
+        V3 (lr+wd-zero)     lr=5e-4  wd=0      higher lr + Stage-1 wd convention
+        V4 (wd-zero only)   lr=1e-4  wd=0      Stage-1 wd convention at AGZ lr
+
+    Hold-fixed: leaf_eval=value_head, dirichlet_epsilon=0.25, gate_mode=ttest,
+    n_simulations=40, M=1000, train_steps_per_iter=200, buffer=200K,
+    batch_size=512, max_grad_norm=1.0, val_seed=42, no --load_path,
+    n_iterations=20.
+
+    Decision rule (two-axis):
+      LR axis: compare {V1, V4} (lr=1e-4) vs {V2, V3} (lr=5e-4).
+      WD axis: compare {V1, V2} (wd=1e-4) vs {V3, V4} (wd=0).
+      If higher lr helps on average AND wd doesn't matter → F.6.1 = V2 settings.
+      If higher lr helps AND wd=0 helps → F.6.1 = V3 settings.
+
+    Cost: ~$5-8 Modal credits, ~30 min wall-clock parallel (value_head-K=40;
+    much cheaper than F.6.0's rollout-K=100 setup).
+    """
+    from datetime import datetime, timezone
+    if not timestamp:
+        timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")
+
+    base_args = [
+        "--graph_size", "20",
+        "--n_iterations", "20",
+        "--M_instances", "1000",
+        "--n_simulations_train", "40",
+        "--train_steps_per_iter", "200",
+        "--buffer_capacity", "200000",
+        "--batch_size", "512",
+        "--gate_every", "5",
+        "--temperature_schedule", "step30",
+        "--val_size", "10000",
+        "--val_seed", "42",
+        "--leaf_eval", "value_head",
+        "--dirichlet_epsilon", "0.25",
+        "--gate_mode", "ttest",
+        "--max_grad_norm", "1.0",
+        "--wandb_project", "am-alphagozero",
+        "--wandb_mode", "online",
+        # NOTE: no --load_path — from-scratch random init.
+    ]
+
+    # (label, lr, weight_decay)
+    variants = [
+        ("f605vh_lr1e4_wd1e4", "1e-4", "1e-4"),  # V1 control (AGZ defaults)
+        ("f605vh_lr5e4_wd1e4", "5e-4", "1e-4"),  # V2 analytical (higher lr, AGZ wd)
+        ("f605vh_lr5e4_wd0",   "5e-4", "0.0"),   # V3 lr+wd-zero (Stage-1 wd)
+        ("f605vh_lr1e4_wd0",   "1e-4", "0.0"),   # V4 wd-zero only (AGZ lr, Stage-1 wd)
+    ]
+
+    grid = []
+    for label_stem, lr_val, wd_val in variants:
+        run_name = f"{label_stem}_{timestamp}"
+        args = base_args + [
+            "--lr_model", lr_val,
+            "--weight_decay", wd_val,
+            "--run_name", run_name,
+        ]
+        grid.append((run_name, args))
+
+    print(f"[modal] launching {len(grid)} parallel F.6.0.5 jobs (timestamp={timestamp})")
+    for label, _ in grid:
+        print(f"  {label}")
+
+    handles = {
+        label: train_alphazero_remote.spawn(*args) for label, args in grid
+    }
+    print(f"\n[modal] all {len(handles)} jobs spawned. Awaiting completion...")
+    for label, h in handles.items():
+        print(f"[modal] awaiting {label} (function_call_id={h.object_id}) ...", flush=True)
+        h.get()
+        print(f"[modal] {label} done.", flush=True)
+    print(f"\n[modal] all {len(handles)} F.6.0.5 lr-validation jobs complete.")
+    print("[modal] download results with: modal volume get am-alphagozero-volume outputs/")
+
+
+@app.local_entrypoint()
+def run_f605_lr_validation_raw_target(timestamp: str = "") -> None:
+    """Phase F.6.0.5b — 4-variant 2x2 lr × wd grid with RAW cost-to-go value target.
+
+    Identical to `run_f605_lr_validation` (value_head leaf eval, K=40, 20 iter)
+    EXCEPT it sets `--value_target_norm none` — the value head is trained on
+    raw cost_to_go instead of cost_to_go / bl_val. MCTS divides by current
+    bl_val at leaf-eval time. Eliminates three distribution-shift problems:
+      (1) Calibration drift between training-time bl_val and MCTS-time bl_val.
+      (2) Buffer-time non-stationarity as bl_val evolves with gating.
+      (3) Across-instance variance collapse at random init (where cost_to_go
+          and bl_val are correlated, making z ≈ 1 near-constant).
+
+    Hypothesis: if (1)-(3) were the dominant reason value_head trailed rollout
+    in F.6.0 + F.6.0.5, this raw-target re-run should narrow the gap or even
+    flip the leaf-eval ordering.
+
+    Four variants (mirrors `run_f605_lr_validation` exactly except the target):
+
+        V1 (control)        lr=1e-4  wd=1e-4   AGZ-canonical defaults
+        V2 (analytical)     lr=5e-4  wd=1e-4   higher lr at AGZ wd
+        V3 (lr+wd-zero)     lr=5e-4  wd=0      higher lr + Stage-1 wd convention
+        V4 (wd-zero only)   lr=1e-4  wd=0      Stage-1 wd convention at AGZ lr
+
+    Hold-fixed (everything else matches the value_head sibling):
+    leaf_eval=value_head, dirichlet_epsilon=0.25, gate_mode=ttest,
+    n_simulations=40, M=1000, train_steps_per_iter=200, buffer=200K,
+    batch_size=512, max_grad_norm=1.0, val_seed=42, n_iterations=20,
+    no --load_path, **--value_target_norm none**.
+
+    Cost: ~$5-8 Modal credits, ~30 min wall-clock parallel
+    (value_head-K=40, same per-iter cost as F.6.0.5 sibling).
+    """
+    from datetime import datetime, timezone
+    if not timestamp:
+        timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")
+
+    base_args = [
+        "--graph_size", "20",
+        "--n_iterations", "20",
+        "--M_instances", "1000",
+        "--n_simulations_train", "40",
+        "--train_steps_per_iter", "200",
+        "--buffer_capacity", "200000",
+        "--batch_size", "512",
+        "--gate_every", "5",
+        "--temperature_schedule", "step30",
+        "--val_size", "10000",
+        "--val_seed", "42",
+        "--leaf_eval", "value_head",
+        "--dirichlet_epsilon", "0.25",
+        "--gate_mode", "ttest",
+        "--max_grad_norm", "1.0",
+        "--value_target_norm", "none",       # ← key difference vs the sibling
+        "--wandb_project", "am-alphagozero",
+        "--wandb_mode", "online",
+        # NOTE: no --load_path — from-scratch random init.
+    ]
+
+    # (label, lr, weight_decay)
+    variants = [
+        ("f605vhraw_lr1e4_wd1e4", "1e-4", "1e-4"),  # V1 control (AGZ defaults)
+        ("f605vhraw_lr5e4_wd1e4", "5e-4", "1e-4"),  # V2 analytical
+        ("f605vhraw_lr5e4_wd0",   "5e-4", "0.0"),   # V3 lr+wd-zero
+        ("f605vhraw_lr1e4_wd0",   "1e-4", "0.0"),   # V4 wd-zero only
+    ]
+
+    grid = []
+    for label_stem, lr_val, wd_val in variants:
+        run_name = f"{label_stem}_{timestamp}"
+        args = base_args + [
+            "--lr_model", lr_val,
+            "--weight_decay", wd_val,
+            "--run_name", run_name,
+        ]
+        grid.append((run_name, args))
+
+    print(f"[modal] launching {len(grid)} parallel F.6.0.5b (raw-target value_head) jobs (timestamp={timestamp})")
+    for label, _ in grid:
+        print(f"  {label}")
+
+    handles = {
+        label: train_alphazero_remote.spawn(*args) for label, args in grid
+    }
+    print(f"\n[modal] all {len(handles)} jobs spawned. Awaiting completion...")
+    for label, h in handles.items():
+        print(f"[modal] awaiting {label} (function_call_id={h.object_id}) ...", flush=True)
+        h.get()
+        print(f"[modal] {label} done.", flush=True)
+    print(f"\n[modal] all {len(handles)} F.6.0.5b (raw-target) jobs complete.")
+    print("[modal] download results with: modal volume get am-alphagozero-volume outputs/")
+
+
+@app.local_entrypoint()
+def run_f605_lr_validation_rollout(timestamp: str = "") -> None:
+    """Phase F.6.0.5 — 4-variant 2x2 lr × wd grid, rollout leaf eval, K=40, 20 iter.
+
+    Sibling of `run_f605_lr_validation` (which uses value_head leaf eval).
+    Same 4-variant lr × wd grid, same K=40, 20 iter, M=1000, train_steps=200,
+    buffer=200K, ε=0.25, ttest gate, val_seed=42, from-scratch — but
+    `--leaf_eval rollout` instead of value_head.
+
+    Why both: F.6.0 showed rollout > value_head by ~0.2 at K=100. With the
+    new lr/wd choices, this entrypoint tests whether rollout still
+    outperforms value_head, AND maps the lr × wd response surface in the
+    rollout regime. Together with the value_head sibling, we get an 8-cell
+    leaf_eval × lr × wd grid for the same training cost as F.6.0.
+
+    Four variants (mirroring the value_head sibling):
+
+        V1 (control)        lr=1e-4  wd=1e-4   AGZ-canonical defaults
+        V2 (analytical)     lr=5e-4  wd=1e-4   higher lr at AGZ wd
+        V3 (lr+wd-zero)     lr=5e-4  wd=0      higher lr + Stage-1 wd convention
+        V4 (wd-zero only)   lr=1e-4  wd=0      Stage-1 wd convention at AGZ lr
+
+    Cost: ~$8-12 Modal credits, ~50-60 min wall-clock parallel
+    (rollout-K=40 ≈ ~175 s/iter; 20 iter ≈ ~58 min per variant; 4 in parallel).
+    """
+    from datetime import datetime, timezone
+    if not timestamp:
+        timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")
+
+    base_args = [
+        "--graph_size", "20",
+        "--n_iterations", "20",
+        "--M_instances", "1000",
+        "--n_simulations_train", "40",
+        "--train_steps_per_iter", "200",
+        "--buffer_capacity", "200000",
+        "--batch_size", "512",
+        "--gate_every", "5",
+        "--temperature_schedule", "step30",
+        "--val_size", "10000",
+        "--val_seed", "42",
+        "--leaf_eval", "rollout",
+        "--dirichlet_epsilon", "0.25",
+        "--gate_mode", "ttest",
+        "--max_grad_norm", "1.0",
+        "--wandb_project", "am-alphagozero",
+        "--wandb_mode", "online",
+        # NOTE: no --load_path — from-scratch random init.
+    ]
+
+    # (label, lr, weight_decay)
+    variants = [
+        ("f605rol_lr1e4_wd1e4", "1e-4", "1e-4"),  # V1 control (AGZ defaults)
+        ("f605rol_lr5e4_wd1e4", "5e-4", "1e-4"),  # V2 analytical (higher lr, AGZ wd)
+        ("f605rol_lr5e4_wd0",   "5e-4", "0.0"),   # V3 lr+wd-zero (Stage-1 wd)
+        ("f605rol_lr1e4_wd0",   "1e-4", "0.0"),   # V4 wd-zero only (AGZ lr, Stage-1 wd)
+    ]
+
+    grid = []
+    for label_stem, lr_val, wd_val in variants:
+        run_name = f"{label_stem}_{timestamp}"
+        args = base_args + [
+            "--lr_model", lr_val,
+            "--weight_decay", wd_val,
+            "--run_name", run_name,
+        ]
+        grid.append((run_name, args))
+
+    print(f"[modal] launching {len(grid)} parallel F.6.0.5 (rollout) jobs (timestamp={timestamp})")
+    for label, _ in grid:
+        print(f"  {label}")
+
+    handles = {
+        label: train_alphazero_remote.spawn(*args) for label, args in grid
+    }
+    print(f"\n[modal] all {len(handles)} jobs spawned. Awaiting completion...")
+    for label, h in handles.items():
+        print(f"[modal] awaiting {label} (function_call_id={h.object_id}) ...", flush=True)
+        h.get()
+        print(f"[modal] {label} done.", flush=True)
+    print(f"\n[modal] all {len(handles)} F.6.0.5 (rollout) jobs complete.")
+    print("[modal] download results with: modal volume get am-alphagozero-volume outputs/")
+
+
+@app.local_entrypoint()
+def run_f606_eps_validation(timestamp: str = "") -> None:
+    """Phase F.6.0.6 — 2-variant ε sweep at V3 settings (raw-target value_head).
+
+    Holds F.6.0.5b winner's V3 config fixed (lr=5e-4, wd=0,
+    --value_target_norm none, leaf_eval=value_head, K=40, 20 iter) and varies
+    only --dirichlet_epsilon ∈ {0.0, 0.05}. F.6.0.5b's V3 (ε=0.25, val_avg_cost
+    iter-19 = 4.265) acts as the implicit third reference point — not re-run.
+
+    Question: under V3's regime, does any Dirichlet noise help or hurt the
+    F.6.1 trajectory? F.6.0 picked ε=0.25 in a different regime (lr=1e-4,
+    bl-normalized value_head where the value head was effectively broken).
+    Under raw-target (value head actually contributing leaf-discrimination)
+    + 5× higher lr (faster policy mode-locking), theory predicts lower ε
+    is better. This 2-variant sweep tests the floor (ε=0) and the lower
+    edge of the predicted sweet spot (ε=0.05).
+
+    Cost: ~$3-5 Modal credits, ~30 min wall-clock parallel.
+    """
+    from datetime import datetime, timezone
+    if not timestamp:
+        timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")
+
+    base_args = [
+        "--graph_size", "20",
+        "--n_iterations", "20",
+        "--M_instances", "1000",
+        "--n_simulations_train", "40",
+        "--train_steps_per_iter", "200",
+        "--buffer_capacity", "200000",
+        "--batch_size", "512",
+        "--gate_every", "5",
+        "--temperature_schedule", "step30",
+        "--val_size", "10000",
+        "--val_seed", "42",
+        "--leaf_eval", "value_head",
+        "--gate_mode", "ttest",
+        "--max_grad_norm", "1.0",
+        "--value_target_norm", "none",
+        "--lr_model", "5e-4",
+        "--weight_decay", "0.0",
+        "--wandb_project", "am-alphagozero",
+        "--wandb_mode", "online",
+    ]
+
+    variants = [
+        ("f606_eps0",  "0.0"),
+        ("f606_eps05", "0.05"),
+    ]
+
+    grid = []
+    for label_stem, eps_val in variants:
+        run_name = f"{label_stem}_{timestamp}"
+        args = base_args + [
+            "--dirichlet_epsilon", eps_val,
+            "--run_name", run_name,
+        ]
+        grid.append((run_name, args))
+
+    print(f"[modal] launching {len(grid)} parallel F.6.0.6 ε-sweep jobs (timestamp={timestamp})")
+    for label, _ in grid:
+        print(f"  {label}")
+
+    handles = {
+        label: train_alphazero_remote.spawn(*args) for label, args in grid
+    }
+    print(f"\n[modal] all {len(handles)} jobs spawned. Awaiting completion...")
+    for label, h in handles.items():
+        print(f"[modal] awaiting {label} (function_call_id={h.object_id}) ...", flush=True)
+        h.get()
+        print(f"[modal] {label} done.", flush=True)
+    print(f"\n[modal] all {len(handles)} F.6.0.6 ε-sweep jobs complete.")
+    print("[modal] download results with: modal volume get am-alphagozero-volume outputs/")
+
+
+@app.local_entrypoint()
+def run_f607_k20_probe(timestamp: str = "") -> None:
+    """Phase F.6.0.7 — single-variant K=20 probe at F.6.0.6 winner settings.
+
+    Holds F.6.0.6 E1 config fixed (ε=0, lr=5e-4, wd=0, value_target_norm=none,
+    leaf_eval=value_head, 20 iter) and lowers K from 40 → 20. Compares against
+    F.6.0.6 E1 (K=40, val_avg_cost(iter 19) = 4.228) as the implicit reference.
+
+    Question: at TSP-20 (N=20 actions per root), is K=20 enough MCTS budget
+    to produce a usable π_t target? K=N gives each action ~1 visit on average;
+    PUCT with c_puct·P·√N_total/(1+N_a) will pull a few extra visits to the
+    policy's argmax. The π_t target becomes a noisy single-visit estimate
+    rather than a smooth distribution.
+
+    Trade-off: K=20 should be ~2× faster per iter than K=40 in raw compute,
+    but the noisier π_t target may slow policy convergence. The point of this
+    probe is to see whether the wall-clock savings outweigh the per-iter
+    learning rate.
+
+    Cost: ~$2-3 Modal credits, ~15-20 min wall-clock single-job.
+    """
+    from datetime import datetime, timezone
+    if not timestamp:
+        timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")
+
+    args = [
+        "--graph_size", "20",
+        "--n_iterations", "20",
+        "--M_instances", "1000",
+        "--n_simulations_train", "20",
+        "--train_steps_per_iter", "200",
+        "--buffer_capacity", "200000",
+        "--batch_size", "512",
+        "--gate_every", "5",
+        "--temperature_schedule", "step30",
+        "--val_size", "10000",
+        "--val_seed", "42",
+        "--leaf_eval", "value_head",
+        "--gate_mode", "ttest",
+        "--max_grad_norm", "1.0",
+        "--value_target_norm", "none",
+        "--lr_model", "5e-4",
+        "--weight_decay", "0.0",
+        "--dirichlet_epsilon", "0.0",
+        "--wandb_project", "am-alphagozero",
+        "--wandb_mode", "online",
+    ]
+    run_name = f"f607_k20_eps0_{timestamp}"
+    args = args + ["--run_name", run_name]
+
+    print(f"[modal] launching F.6.0.7 K=20 probe (timestamp={timestamp})")
+    print(f"  {run_name}")
+
+    h = train_alphazero_remote.spawn(*args)
+    print(f"\n[modal] awaiting {run_name} (function_call_id={h.object_id}) ...", flush=True)
+    h.get()
+    print(f"[modal] {run_name} done.", flush=True)
+    print("[modal] download results with: modal volume get am-alphagozero-volume outputs/")
+
+
+@app.local_entrypoint()
+def run_f608_k20_bs2048_probe(timestamp: str = "") -> None:
+    """Phase F.6.0.8 — K=20 + batch_size=2048 single-variant probe.
+
+    Holds F.6.0.7 config fixed (ε=0, K=20, lr=5e-4, wd=0,
+    value_target_norm=none, leaf_eval=value_head, 20 iter, M=1000) and
+    raises batch_size 512 → 2048 (4×). Compares against F.6.0.7
+    (K=20, batch=512) to isolate batch_size as the sole variable.
+
+    Question: at K=20 (already a thinner MCTS budget producing noisier π_t
+    targets), does a 4× larger batch reduce gradient variance enough to
+    materially help convergence? Each step now covers 4× more buffer →
+    gradient variance ÷ 2 (sqrt rule). Adam adapts to batch size without
+    needing lr re-tuning at this scale.
+
+    Trade-off: train_wall_s rises ~3.5s/iter → ~14s/iter (4× train compute).
+    Still <15% of mcts_s (~60s at K=20), so wall-clock impact is minor.
+
+    Cost: ~$2-3 Modal credits, ~15-20 min wall-clock single-job.
+    """
+    from datetime import datetime, timezone
+    if not timestamp:
+        timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")
+
+    args = [
+        "--graph_size", "20",
+        "--n_iterations", "20",
+        "--M_instances", "1000",
+        "--n_simulations_train", "20",
+        "--train_steps_per_iter", "200",
+        "--buffer_capacity", "200000",
+        "--batch_size", "2048",
+        "--gate_every", "5",
+        "--temperature_schedule", "step30",
+        "--val_size", "10000",
+        "--val_seed", "42",
+        "--leaf_eval", "value_head",
+        "--gate_mode", "ttest",
+        "--max_grad_norm", "1.0",
+        "--value_target_norm", "none",
+        "--lr_model", "5e-4",
+        "--weight_decay", "0.0",
+        "--dirichlet_epsilon", "0.0",
+        "--wandb_project", "am-alphagozero",
+        "--wandb_mode", "online",
+    ]
+    run_name = f"f608_k20_bs2048_{timestamp}"
+    args = args + ["--run_name", run_name]
+
+    print(f"[modal] launching F.6.0.8 K=20 + batch=2048 probe (timestamp={timestamp})")
+    print(f"  {run_name}")
+
+    h = train_alphazero_remote.spawn(*args)
+    print(f"\n[modal] awaiting {run_name} (function_call_id={h.object_id}) ...", flush=True)
+    h.get()
+    print(f"[modal] {run_name} done.", flush=True)
+    print("[modal] download results with: modal volume get am-alphagozero-volume outputs/")
+
+
+@app.local_entrypoint()
+def run_f609_k20_bs2048_rollout_probe(timestamp: str = "") -> None:
+    """Phase F.6.0.9 — K=20 + batch=2048 + leaf_eval=rollout probe.
+
+    Mirrors F.6.0.8 (ε=0, K=20, batch=2048, lr=5e-4, wd=0, value_target_norm=none,
+    20 iter, M=1000) but switches leaf_eval value_head → rollout.
+
+    Question: at thin K=20 budgets, does rollout leaf eval (fresh Monte Carlo
+    estimate per leaf) outperform value_head leaf eval (cached NN prediction)?
+    F.6.0 winner was rollout at K=100, but in a totally different regime
+    (lr=1e-4, bl-normalized, ε=0.25). Under F.6.0.6 settings (lr=5e-4,
+    raw-target, ε=0), the value head learned non-trivial signal — but it's
+    still the model's prediction, possibly noisier than 1-sample rollouts at
+    leaves.
+
+    Value head still trains on raw cost_to_go (value_target_norm=none) as an
+    auxiliary loss; just not used at MCTS time when leaf_eval=rollout.
+
+    Cost: ~$2-4 Modal credits, ~25-30 min wall-clock single-job (rollout adds
+    ~30-40% per-iter overhead vs value_head at same K).
+    """
+    from datetime import datetime, timezone
+    if not timestamp:
+        timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")
+
+    args = [
+        "--graph_size", "20",
+        "--n_iterations", "20",
+        "--M_instances", "1000",
+        "--n_simulations_train", "20",
+        "--train_steps_per_iter", "200",
+        "--buffer_capacity", "200000",
+        "--batch_size", "2048",
+        "--gate_every", "5",
+        "--temperature_schedule", "step30",
+        "--val_size", "10000",
+        "--val_seed", "42",
+        "--leaf_eval", "rollout",
+        "--gate_mode", "ttest",
+        "--max_grad_norm", "1.0",
+        "--value_target_norm", "none",
+        "--lr_model", "5e-4",
+        "--weight_decay", "0.0",
+        "--dirichlet_epsilon", "0.0",
+        "--wandb_project", "am-alphagozero",
+        "--wandb_mode", "online",
+    ]
+    run_name = f"f609_k20_bs2048_rollout_{timestamp}"
+    args = args + ["--run_name", run_name]
+
+    print(f"[modal] launching F.6.0.9 K=20 + batch=2048 + rollout probe (timestamp={timestamp})")
+    print(f"  {run_name}")
+
+    h = train_alphazero_remote.spawn(*args)
+    print(f"\n[modal] awaiting {run_name} (function_call_id={h.object_id}) ...", flush=True)
+    h.get()
+    print(f"[modal] {run_name} done.", flush=True)
+    print("[modal] download results with: modal volume get am-alphagozero-volume outputs/")
+
+
+@app.local_entrypoint()
+def run_f610_k20_bs2048_M2000_probe(timestamp: str = "") -> None:
+    """Phase F.6.1.0 — M=2000 × 10 iter probe (matched-budget vs F.6.0.8).
+
+    Mirrors F.6.0.8 (K=20, batch=2048, ε=0, lr=5e-4, wd=0,
+    value_target_norm=none, leaf_eval=value_head, train_steps=200) but:
+      - doubles M_instances 1000 → 2000 (more fresh data per iter)
+      - halves n_iterations 20 → 10  (keeps total instances = 20K, same as F.6.0.8)
+
+    Question: does concentrating sample budget into more-fresh-per-iter
+    (10 × 2000) beat spreading it thin (20 × 1000) at matched 20K total?
+    Lifetime sample-per-tuple ratio drops 20.5× → 10.3× — better-balanced
+    producer/consumer rates while still over KataGo's empirical 8× cap.
+
+    Primary comparison: F.6.1.0 iter-9 (final) vs F.6.0.8 iter-19 (final),
+    both at 20K total instances seen. If F.6.1.0 ≤ F.6.0.8 by ≥ 0.02, the
+    M-rebalance hypothesis is validated.
+
+    Cost: ~$2-3 Modal credits, ~20-25 min wall-clock single-job
+    (M doubled but iter count halved → similar total).
+    """
+    from datetime import datetime, timezone
+    if not timestamp:
+        timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")
+
+    args = [
+        "--graph_size", "20",
+        "--n_iterations", "10",
+        "--M_instances", "2000",
+        "--n_simulations_train", "20",
+        "--train_steps_per_iter", "200",
+        "--buffer_capacity", "200000",
+        "--batch_size", "2048",
+        "--gate_every", "5",
+        "--temperature_schedule", "step30",
+        "--val_size", "10000",
+        "--val_seed", "42",
+        "--leaf_eval", "value_head",
+        "--gate_mode", "ttest",
+        "--max_grad_norm", "1.0",
+        "--value_target_norm", "none",
+        "--lr_model", "5e-4",
+        "--weight_decay", "0.0",
+        "--dirichlet_epsilon", "0.0",
+        "--wandb_project", "am-alphagozero",
+        "--wandb_mode", "online",
+    ]
+    run_name = f"f610_k20_bs2048_M2000_{timestamp}"
+    args = args + ["--run_name", run_name]
+
+    print(f"[modal] launching F.6.1.0 K=20 + batch=2048 + M=2000 × 10 iter probe (timestamp={timestamp})")
+    print(f"  {run_name}")
+
+    h = train_alphazero_remote.spawn(*args)
+    print(f"\n[modal] awaiting {run_name} (function_call_id={h.object_id}) ...", flush=True)
+    h.get()
+    print(f"[modal] {run_name} done.", flush=True)
+    print("[modal] download results with: modal volume get am-alphagozero-volume outputs/")
+
+
+@app.local_entrypoint()
+def run_f611_buffer_size_probe(timestamp: str = "") -> None:
+    """Phase F.6.1.1 — 2-variant buffer-size probe (online vs short window).
+
+    Mirrors F.6.0.7 (K=20, batch=512, M=1000, ε=0, lr=5e-4, wd=0,
+    value_target_norm=none, leaf_eval=value_head, 20 iter) — varies only
+    --buffer_capacity ∈ {1000, 5000}.
+
+    Question: does cross-iter buffer averaging (denoising MCTS targets via
+    multiple policy snapshots) help, or does stale data hurt?
+    - buffer=1000 (= M): 1-iter window, fully online — every iter trains
+      ONLY on its own self-play, no cross-iter mix.
+    - buffer=5000 (= 5×M): 5-iter rolling window, mild cross-iter averaging.
+    - F.6.0.7 (buffer=200K): 200-iter window, never evicts in 20-iter run
+      (val_avg_cost(iter 19) = 4.428 reference).
+
+    Lifetime sample-per-tuple ratio is roughly constant (~5×) across all 3
+    settings — only the window (recency mix) varies. Clean isolation.
+
+    Cost: ~$3-5 Modal credits, ~25 min wall-clock parallel.
+    """
+    from datetime import datetime, timezone
+    if not timestamp:
+        timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")
+
+    base_args = [
+        "--graph_size", "20",
+        "--n_iterations", "20",
+        "--M_instances", "1000",
+        "--n_simulations_train", "20",
+        "--train_steps_per_iter", "200",
+        "--batch_size", "512",
+        "--gate_every", "5",
+        "--temperature_schedule", "step30",
+        "--val_size", "10000",
+        "--val_seed", "42",
+        "--leaf_eval", "value_head",
+        "--gate_mode", "ttest",
+        "--max_grad_norm", "1.0",
+        "--value_target_norm", "none",
+        "--lr_model", "5e-4",
+        "--weight_decay", "0.0",
+        "--dirichlet_epsilon", "0.0",
+        "--wandb_project", "am-alphagozero",
+        "--wandb_mode", "online",
+    ]
+
+    variants = [
+        ("f611_buf1k",  "1000"),
+        ("f611_buf5k",  "5000"),
+    ]
+
+    grid = []
+    for label_stem, buf_val in variants:
+        run_name = f"{label_stem}_{timestamp}"
+        args = base_args + [
+            "--buffer_capacity", buf_val,
+            "--run_name", run_name,
+        ]
+        grid.append((run_name, args))
+
+    print(f"[modal] launching {len(grid)} parallel F.6.1.1 buffer-size jobs (timestamp={timestamp})")
+    for label, _ in grid:
+        print(f"  {label}")
+
+    handles = {
+        label: train_alphazero_remote.spawn(*args) for label, args in grid
+    }
+    print(f"\n[modal] all {len(handles)} jobs spawned. Awaiting completion...")
+    for label, h in handles.items():
+        print(f"[modal] awaiting {label} (function_call_id={h.object_id}) ...", flush=True)
+        h.get()
+        print(f"[modal] {label} done.", flush=True)
+    print(f"\n[modal] all {len(handles)} F.6.1.1 buffer-size jobs complete.")
+    print("[modal] download results with: modal volume get am-alphagozero-volume outputs/")
+
+
+@app.local_entrypoint()
+def run_f612_k40_buf5k_probe(timestamp: str = "") -> None:
+    """Phase F.6.1.2 — combined K=40 + buffer=5000 probe.
+
+    Combines the two strongest findings from the F.6.0.7→F.6.1.1 series:
+      - K=40 (F.6.0.6 E1's K, beats K=20 by ~0.20 endpoint)
+      - buffer_capacity=5000 (F.6.1.1 buf=5K beat buf=200K by ~0.13 at K=20)
+
+    All other settings = F.6.0.6 E1 = F.6.1.1 except buffer + (carry K=40):
+    leaf_eval=value_head, batch=512, M=1000, ε=0, lr=5e-4, wd=0,
+    value_target_norm=none, gate=ttest, val_seed=42, train_steps=200, 20 iter.
+
+    Expected: if buffer effect (K=20: −0.129) transfers additively to K=40,
+    final val_avg_cost should be around 4.228 − 0.129 ≈ 4.10. If multiplicative
+    (more efficient training × more visits per root), could go lower.
+
+    Reference: F.6.0.6 E1 (buffer=200K) = 4.228 at iter 19.
+
+    Cost: ~$2-3 Modal credits, ~30 min wall-clock single-job
+    (K=40 doubles per-iter mcts_s vs F.6.1.1's K=20).
+    """
+    from datetime import datetime, timezone
+    if not timestamp:
+        timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")
+
+    args = [
+        "--graph_size", "20",
+        "--n_iterations", "20",
+        "--M_instances", "1000",
+        "--n_simulations_train", "40",
+        "--train_steps_per_iter", "200",
+        "--buffer_capacity", "5000",
+        "--batch_size", "512",
+        "--gate_every", "5",
+        "--temperature_schedule", "step30",
+        "--val_size", "10000",
+        "--val_seed", "42",
+        "--leaf_eval", "value_head",
+        "--gate_mode", "ttest",
+        "--max_grad_norm", "1.0",
+        "--value_target_norm", "none",
+        "--lr_model", "5e-4",
+        "--weight_decay", "0.0",
+        "--dirichlet_epsilon", "0.0",
+        "--wandb_project", "am-alphagozero",
+        "--wandb_mode", "online",
+    ]
+    run_name = f"f612_k40_buf5k_{timestamp}"
+    args = args + ["--run_name", run_name]
+
+    print(f"[modal] launching F.6.1.2 K=40 + buffer=5000 probe (timestamp={timestamp})")
+    print(f"  {run_name}")
+
+    h = train_alphazero_remote.spawn(*args)
+    print(f"\n[modal] awaiting {run_name} (function_call_id={h.object_id}) ...", flush=True)
+    h.get()
+    print(f"[modal] {run_name} done.", flush=True)
     print("[modal] download results with: modal volume get am-alphagozero-volume outputs/")
 
 

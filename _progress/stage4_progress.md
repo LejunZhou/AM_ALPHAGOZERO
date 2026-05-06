@@ -2,7 +2,7 @@
 
 **Plan:** `_plans/stage4_plan.md`
 **Started:** 2026-04-29
-**Last updated:** 2026-04-30 — Phases A, B, C, D, E all complete. Wave 1 (A+B), Wave 2 (C+E), and Wave 3 Phase D merged on this worktree.
+**Last updated:** 2026-05-06 — **F.6.0.7→F.6.1.1 sub-budget probe series complete** (K, batch, M, buffer ablations at F.6.0.6 winner regime). Three findings: **(1) K dominates batch** (K 40→20 costs 0.20; batch 512→2048 helps only 0.02). **(2) Iters dominate M at fixed train_steps** (M=2000 × 10 iter is 0.65 *worse* than M=1000 × 20 iter at matched 20K total instances — train_steps=200 saturates per-iter budget). **(3) Smaller replay buffer dramatically helps**: buffer 200K→5K closes 0.129 at K=20 (4.428 → 4.299); 200K default was dragging policy back via stale MCTS targets. Sweet spot is **buf=5000 (5-iter window)**, not buf=1000 (1-iter, fully online). **Pending follow-up: K=40 + buf=5000 combined**, expected to push past F.6.0.6 E1's 4.228 toward 4.10 or below. F.6.1 recipe revised: keep all F.6.0.6 settings but drop `--buffer_capacity 200000` → `--buffer_capacity 5000`.
 **Status:** **Phases A, B, C, D, E complete; Phase F (TSP-20 pilot/main CLI) and G (ablations) remain.**
 
 ---
@@ -259,7 +259,7 @@ The plan ([_plans/stage4_plan.md:455-470](../_plans/stage4_plan.md#L455-L470)) d
 
 **Sub-tasks:**
 
-- [ ] **F.6.0 Pre-flight grid probe (12 variants).** Spec locked 2026-05-02 (commit `d61ecae`). Probes three knobs that may not transfer cleanly from b2's warm-start best to random init:
+- [x] **F.6.0 Pre-flight grid probe (12 variants).** **COMPLETE 2026-05-03.** Winner: `lerol_eps25_ttest` (rollout × ε=0.25 × ttest gate; iter-49 = 3.9338, Δ = 0.617). See full results table below. Spec locked 2026-05-02 (commit `d61ecae`). Probes three knobs that may not transfer cleanly from b2's warm-start best to random init:
   - `leaf_eval` ∈ {`value_head` (AGZ-canonical), `rollout` (AM-paper)}
   - `dirichlet_epsilon` ε ∈ {0.0, 0.05 (warm-start safe), 0.25 (AGZ-canonical)}
   - `gate_mode` ∈ {`ttest` (AGZ-style), `always` (AZ-style)}
@@ -270,7 +270,244 @@ The plan ([_plans/stage4_plan.md:455-470](../_plans/stage4_plan.md#L455-L470)) d
 
   **Decision rule for picking F.6.1 defaults:** lowest `val_avg_cost` at iter 50 wins (or steepest decline if multiple variants tie within ±0.001 noise band).
 
-- [ ] **F.6.1 From-scratch trajectory probe** *(scope reduced 2026-05-02 from 1000 → 100 iter)*. Recipe locked partially: **100 iter** × M=1000 × **K=100** × `train_steps_per_iter=200` × `buffer_capacity=200_000` × `lr_model=1e-4` × val_seed=42. **Resume from F.6.0 winner's `iter-49.pt`** (avoids re-running the first 50 iters; combined trajectory = 150 iter = 150K instances total). The `leaf_eval`, `dirichlet_epsilon`, and `gate_mode` defaults are TBD per F.6.0 winner. **K=100 chosen** because the probe showed K=100 → K=200 gives only +33% MCTS-vs-greedy gap improvement at 2× cost; K=200 reserved for F.6.3 escalation.
+  **F.6.0 results — full 12-variant grid (complete, 2026-05-03)**
+
+  Launched 2026-05-03 05:22 UTC on Modal A10 (12 parallel jobs, app `ap-mIrMZH1Gi3j9yWopjtapoI`). All 12 variants reached iter-49. Wall-clock from launch to last-job-done: ~9.5 h (vs 3.7 h docstring estimate — the two `rollout × ε=0.25` variants spent ~2h 50min queued before Modal allocated GPUs). Two infrastructure restarts: `levh_eps05_gttest` (orig abandoned at iter-15, restart 06:22 UTC) and `lerol_eps05_gttest` (orig abandoned at iter-7, restart 06:55 UTC); restarts' iter-49 are reported below, originals' partial dirs ignored.
+
+  Sorted by `val_avg_cost(iter 49)` ascending:
+
+  | rank | leaf_eval | ε | gate | iter0 | iter49 | Δ | best | best@ | gated/accepted | mcts s/iter |
+  |---|---|---|---|---|---|---|---|---|---|---|
+  | 1 | rollout | 0.25 | always | 4.4624 | **3.9328** | 0.530 | 3.9276 | 48 | 10/10 | 461.9 |
+  | 2 | rollout | 0.05 | always | 4.5165 | 3.9335 | 0.583 | 3.9335 | 49 | 10/10 | 530.0 |
+  | 3 | rollout | 0.25 | ttest  | 4.5508 | 3.9338 | 0.617 | 3.9314 | 46 | 10/10 | 464.6 |
+  | 4 | rollout | 0.00 | always | 4.5491 | 3.9429 | 0.606 | 3.9353 | 48 | 10/10 | 338.4 |
+  | 5 | rollout | 0.05 | ttest  | 4.4844 | 3.9449 | 0.540 | 3.9271 | 47 | 10/8  | 412.7 |
+  | 6 | rollout | 0.00 | ttest  | 4.5913 | 3.9450 | 0.646 | 3.9313 | 47 | 10/9  | 438.4 |
+  | 7 | value_head | 0.25 | always | 5.2024 | 4.1338 | 1.069 | 4.1338 | 49 | 10/10 | 254.5 |
+  | 8 | value_head | 0.05 | ttest  | 5.3870 | 4.1896 | 1.197 | 4.1627 | 47 | 10/9  | 200.1 |
+  | 9 | value_head | 0.00 | always | 4.9376 | 4.1917 | 0.746 | 4.1917 | 49 | 10/10 | 204.7 |
+  | 10 | value_head | 0.25 | ttest  | 5.2637 | 4.1921 | 1.072 | 4.1592 | 47 | 10/8  | 201.5 |
+  | 11 | value_head | 0.05 | always | 5.4163 | 4.1986 | 1.218 | 4.1767 | 48 | 10/10 | 198.4 |
+  | 12 | value_head | 0.00 | ttest  | 5.2024 | 4.2817 | 0.921 | 4.2817 | 49 | 10/6  | 209.9 |
+
+  All 12 variants are monotone-decreasing (head-mean of iters 0-4 > tail-mean of iters 45-49).
+
+  **Decision-rule application** ("lowest val_avg_cost(iter 49); within ±0.001 noise band, prefer largest Δ"):
+  - Lowest iter-49: `lerol_eps25_galways` at 3.9328.
+  - Within ±0.001 of leader: 3 variants — {`lerol_eps25_galways` (3.9328, Δ=0.530), `lerol_eps05_galways` (3.9335, Δ=0.583), `lerol_eps25_ttest` (3.9338, Δ=0.617)}.
+  - Largest Δ in band → **`lerol_eps25_ttest`** (rollout × ε=0.25 × ttest gate). Δ=0.617, iter-49=3.9338, iter-49 best mid-run=3.9314 at iter 46. **This is the F.6.0 winner under the locked decision rule.**
+
+  Practical co-winners (within noise band, would also be defensible F.6.1 starts): `lerol_eps25_galways` (lowest absolute iter-49) and `lerol_eps05_galways` (cleanest 10/10 acceptance + Δ=0.583).
+
+  **Headline observations:**
+
+  1. **`leaf_eval` is the dominant knob** — it determines outcome more than ε and gate_mode combined. All 6 rollout variants finish strictly below all 6 value_head variants. Rollout cluster: [3.9328, 3.9450] (0.012 spread). value_head cluster: [4.1338, 4.2817] (0.148 spread). Rollout cluster mean is **0.20 cost units below value_head cluster mean** — well outside any plausible noise band.
+
+  2. **Within the rollout sub-grid, ε and gate_mode are essentially irrelevant.** All 6 rollout variants finish within 0.012 of each other. ε=0.25 was identified in `project_alphagozero_warmstart_exploration.md` as toxic to a *converged* Stage 1 policy; **that fragility does NOT transfer to from-scratch** — ε=0.25 is in the winner cluster here. (Memory updated separately.)
+
+  3. **Within the value_head sub-grid, ε and gate_mode are nearly irrelevant** at iter-49 (5/6 variants in [4.1896, 4.1986]; only the `ε=0 + ttest` variant is materially worse at 4.2817). But the whole cluster is held above the rollout cluster by the value-head's leaf-eval failure mode.
+
+  4. **value_head's failure mechanism** (diagnosed mid-run from `iterations.csv`):
+     - `value_loss` collapses 0.091 → 0.024 in *one* iter, then plateaus at ~0.013-0.024 for the entire run.
+     - That's not the value head failing to train — it's the value head **trivially fitting the per-state mean** of `z_t = (tour_cost − lengths_t)/bl_val`. From random init, both `tour_cost` and `bl_val` are sampled under approximately the same noisy random policy and are tightly correlated, so the target distribution has tiny across-instance variance. The MSE landscape is dominated by the constant component.
+     - In MCTS, `v(s) ≈ const` for all expanded leaves means **the value head adds zero leaf-discrimination** to the search. MCTS runs on policy prior + UCB exploration noise alone, with no grounded leaf signal.
+     - `rollout` doesn't have this break: a rollout reaches a *terminal* state and reads realized tour cost — different leaves get genuinely different values from iter 0.
+     - The `/bl_val` normalization is *not* the bug; it's a useful scale-invariance trick for the loss landscape. Removing it doesn't fix the across-instance variance shortage. Real fixes would be value-target whitening, state-conditional baseline subtraction, hybrid leaf eval, or auxiliary value pretrain — all deferred to optional Phase G ablations.
+
+  5. **Gate-mode mechanics confirmed**: every variant has `gated_n=10` (gate_every=5 fires 10 times across 50 iters regardless of mode). `accepted_n` separates as expected: `always` → 10/10 by design; `ttest` → 6-10/10. Across both leaf evals, `ttest` rejects more often when ε=0 (presumably because no exploration noise → less chance of beating θ★ on the gating set). The gate mechanism is doing real work, not a no-op.
+
+  6. **Wall-clock**: rollout averages **~440 s/iter** (range 338-530 s), value_head averages **~211 s/iter** (range 198-255 s). So **rollout is ~2.1× slower per iter** at K=100 — but it's the *only* leaf eval that produces materially-decreasing val_avg_cost from-scratch. The throughput gap is not enough to shift F.6.1 toward value_head.
+
+  7. **Sample-efficiency anchor**: F.6.0 winner reaches **3.93 on TSP-20 in 50 iter × 1000 instances = 50K total instances**. Stage 1 canonical reaches ~3.84 at full convergence (1.28M instances first-epoch baseline). So F.6.0 rollout is **~0.09 above Stage 1 final quality at ~2.6% of Stage 1's instance count** — encouraging signal for the proposal sample-efficiency claim, but the ~0.09 gap remains and the trajectory needs F.6.1 (100-iter extension) to confirm whether it closes.
+
+  **F.6.1 recipe pin (resume from F.6.0 winner)**: `--leaf_eval rollout --dirichlet_epsilon 0.25 --gate_mode ttest --load_path outputs/tsp_20/f60_lerol_eps25_gttest_20260503T052231_20260503T081222/iter-49.pt`. All other args (lr=1e-4, K=100, M=1000, train_steps=200, buffer=200K, val_seed=42) carry over per the F.6.1 spec.
+
+  **Diagnostic infra added**: `src/scripts/probe_grad_norm.py` — measures per-step gradient norm under both Stage 1 (REINFORCE) and Stage 4 (CE distillation) at F.6.0 model scale. Empirical finding (n=30 steps, random init, CPU): Stage 4 grad_norm mean = 3.76, Stage 1 grad_norm mean = 90.87 — Stage 4 is **~25× smaller** than Stage 1 at random init, contradicting first-principles expectation that CE distillation has larger gradients than REINFORCE. With `max_grad_norm=1.0` clipping in both regimes, post-clip step magnitudes are equal (lr × 1.0 = 1e-4) regardless of leaf eval, so the locked-lr=1e-4 choice does not introduce a hidden lr asymmetry. The real per-iter parameter-movement asymmetry is `train_steps_per_iter` (Stage 4 = 200 vs Stage 1 = 1 per epoch-step), which is a candidate F.6.1.5 / G ablation to probe but not a F.6.1 blocker.
+
+- [ ] **F.6.0.5 LR re-derivation for Stage-4 CE distillation** *(NEW 2026-05-03 — gates F.6.1 lr default; supersedes F.6 setup's "lr=1e-4 fixed" rule for F.6.1 onward.)*
+
+  **Motivation.** F.6.0 winner stuck at val_avg_cost=3.9338, ~0.094 above Stage 1's 3.83943. Re-derive lr from the Stage-4 gradient calculation rather than inheriting Stage 1's lr by default.
+
+  **Analysis (full text in [_plans/stage4_plan.md F.6.0.5 section](../_plans/stage4_plan.md)):**
+
+  - **Stage 4 CE policy gradient on logits:** ∂L_policy/∂ℓ_j = p_j − π_j^target. Bounded ∈ [−1,1], per-row L2 ≤ √2. **O(1) bounded.**
+  - **Stage 1 REINFORCE policy gradient on logits:** ∂L/∂ℓ^(t)_j = (L_tour − b_l)·(1[a=j] − p_j). **Advantage-scaled.**
+  - Empirical (probe_grad_norm.py): Stage 4 mean=3.76 vs Stage 1 mean=90.87. Ratio ~24× matches O(1) vs O(advantage·N) prediction.
+  - Local recheck (2026-05-03): reran `probe_grad_norm.py` under `conda activate AM_AlphaGoZero` and reproduced Stage 4 mean=3.759 vs Stage 1 mean=90.866. A short production-batch proxy (`batch_size=512`, 10 CPU steps) gave Stage 4 mean=5.200 vs Stage 1 mean=35.369. Both regimes were still above `max_grad_norm=1.0`, so clipping is active in both; the raw-gradient evidence does **not** support lowering Stage 4 LR just because the loss differs from AM.
+  - **Adam is approximately scale-invariant** to grad magnitude — `lr · m̂/√v̂` is close to invariant under uniform `g → c·g` rescaling. The clip is active in raw-gradient space, but it is active for both regimes; the practical control knob is therefore the optimizer step size and update budget, not the unnormalized Stage 1 vs Stage 4 grad-norm ratio. Per-step parameter movement is governed mainly by `lr` in both regimes.
+  - Budget: Stage 1 converged at ~250K grad steps × lr=1e-4 = ~25 units drift. Stage 4 F.6.0 = 10K steps × lr=1e-4 = ~1 unit. **F.6.0 has had ~4% of Stage 1's drift** — the 0.094 gap is mechanical, not algorithmic.
+  - **Recommended lr for Stage-4 CE distillation on a transformer-AM:** **5e-4** (geometric mean of principled range 3e-4–1e-3; halfway between Stage-1-inheritance and the 8.3e-4 budget-matching estimate for F.6.1 to reach Stage-1 drift in 30K total steps). Reference Adam lrs for transformer CE: BERT 1e-4 (with warmup), nanoGPT 6e-4, ViT 1e-3. lr=1e-4 sits at the conservative end.
+
+  **Validation — narrow 3-variant Modal smoke (`run_f605_lr_validation`).** Hold-fixed at F.6.0 winner config: leaf_eval=rollout, ε=0.25, gate_mode=ttest, K=100, M=1000, train_steps_per_iter=200, buffer=200K, batch_size=512, val_seed=42, max_grad_norm=1.0, **n_iterations=25**, no `--load_path`. V3 added 2026-05-04 to disentangle the **weight_decay** confound: Stage 1 uses Adam wd=0 (PyTorch default; AM-paper convention), Stage 4 uses wd=1e-4 (AGZ-canonical). Theoretical impact at 5K steps is below val_avg_cost noise floor (`lr·wd·θ ≈ 5e-8` per step → ~`2.5e-4` cumulative shrink), but verifying empirically removes the apples-to-apples objection.
+
+  | variant | lr | wd | role | val_avg_cost(iter 19) | policy_loss | value_loss | entropy | final gate accepted | verdict |
+  |---|---|---|---|---|---|---|---|---|---|
+  | V1 (control) | 1e-4 | 1e-4 | F.6.0-winner replication (Stage-4 conventions) | 4.331052 | 1.5270 | 0.2790 | 1.2119 | yes | baseline |
+  | V2 (analytical) | 5e-4 | 1e-4 | first-principles recommendation at Stage-4 wd | 4.348742 | 1.5095 | 0.2958 | 1.1128 | **no** | regressed vs V1 |
+  | V3 (apples-to-apples) | 5e-4 | 0 | lr-only intervention; matches Stage 1 wd | **4.264759** | **1.4651** | **0.2637** | **1.1073** | yes | **winner** |
+  | V4 (lr-isolation)   | 1e-4 | 0 | wd-only intervention at Stage-1 lr | 4.367396 | 1.5506 | 0.2763 | 1.1618 | yes | regressed vs V1 |
+
+  **Note** (2026-05-06): table reports the **raw-target** grid (Option B intervention; F.6.0.5b). Iter count was lowered 25 → 20 and K from 100 → 40 alongside the grid scope expansion to 4 variants; the iter-X comparison column is iter-19 (last completed iter at n_iterations=20). Bl-normalized grid (F.6.0.5a, run earlier) is documented separately in the rolling progress log below.
+
+  **Two-step decision rule for F.6.1:**
+  - **Step 1 (lr):** V2 OR V3 reaches val_avg_cost(iter 25) ≤ V1 − 0.02 AND no per-iter regression > 0.05 AND final policy_loss within 30% of V1's. If neither passes: drop F.6.1 to lr=3e-4, wd=1e-4 and document failure mode.
+  - **Step 2 (wd, only if Step 1 passed):** compare V3 vs V2. |V3−V2| < 0.005 → adopt V2 settings (wd=1e-4) for F.6.1; V3 < V2 by ≥ 0.01 → adopt V3 settings (wd=0); V3 > V2 by ≥ 0.01 → adopt V2 settings.
+
+  If an lr=1e-3 run is launched manually, treat it as an LR-ablation run until it clears the same stability checks; do not make 1e-3 the proposal mainline by assumption.
+
+  **Cost.** ~$8-12 Modal credits, ~1.7 h wall-clock parallel (parallel jobs ⇒ adding V3 doesn't extend wall-clock, only credits). Modal entrypoint: `modal run --detach src/scripts/modal_run_train_alphazero.py::run_f605_lr_validation`. Output dirs: `outputs/tsp_20/f605_lr{1e4_wd1e4|5e4_wd1e4|5e4_wd0}_<timestamp>/`.
+
+  ---
+
+  **F.6.0.5 progress log (rolling) — 2026-05-04 → 2026-05-06**
+
+  **2026-05-05 — Scope/scale revisions before launch.**
+  - **Variants expanded 3 → 4.** Added **V4 (lr=1e-4, wd=0)** to the `(lr, wd)` 2×2 corners. Closes the lr×wd interaction read: with V1=(1e-4,1e-4), V2=(5e-4,1e-4), V3=(5e-4,0), V4=(1e-4,0), the wd main effect is identifiable at *both* lr levels rather than only at lr=5e-4. Marginal cost: 1 extra parallel Modal task (no wall-clock extension).
+  - **Per-iter MCTS scale lowered: K=100 → K=40, n_iterations 25 → 20.** Pure budget choice — keeps total wall-clock per variant under ~30 min so the lr × wd grids run cheaply on Modal in parallel. Note this departs from the F.6.0-winner config (K=100); F.6.0.5 results are a *trend* read on lr/wd, not a direct continuation of F.6.0's iter-49 trajectory.
+  - **Two parallel grids launched, one per leaf-eval.** Same 4-variant `(lr, wd)` grid run separately under `leaf_eval=value_head` (`run_f605_lr_validation`) and `leaf_eval=rollout` (`run_f605_lr_validation_rollout`). Reason: F.6.0 already showed leaf-eval matters for from-scratch convergence; running both isolates whether the lr conclusion travels across leaf-eval regimes.
+  - **W&B logging alignment (committed alongside the launch).** `coach.py` + `logging.py` patched so `log_iteration` and `log_alphazero_step` emit Stage-1 aliases — `epoch=iter`, `val_avg_cost`, `epoch_duration=mcts_wall_s+train_wall_s`, `baseline_updated`, `lr`, `global_step`, `value_loss`. `wandb_group` set to `tsp_{graph_size}` so Stage-1 and Stage-4 runs land in the same group on the W&B sidebar. Effect: F.6.0.5 iteration-axis trajectories overlay Stage 1's epoch-axis trajectories directly without post-hoc reshaping.
+
+  **2026-05-05 — Rollout grid cancelled mid-run.** User observation watching the W&B trajectories: across the 4 (lr, wd) variants the rollout-leaf trajectories were not visibly separating — the dominant rate-limiter looked like *self-play data quality / sample count*, not optimizer step size. Cancelled the in-flight Modal app to avoid burning credits on a null read. Conservative inference: **at K=40 / from-scratch / rollout-leaf, lr in [1e-4, 5e-4] does not materially change the per-iter convergence rate over 20 iters.** Does NOT settle the F.6.0.5 question — value_head grid was kept running because the bl-drift hypothesis (below) made it the more diagnostic of the two leaf-eval regimes.
+
+  **2026-05-06 — Diagnostic refocus: value-target distribution shift.** After value_head/bl-normalized 4-variant grid completed, the visible-from-W&B convergence remained slow regardless of lr/wd. Hypothesis surfaced (user-led): **value head is being trained against a *moving target* z = cost_to_go / bl_val.** Three distinct shift channels at random init / early training:
+   1. **Calibration drift** — bl_val (greedy decode under θ★) decreases monotonically as θ★ improves over iterations, so identical (state, cost_to_go) yields a different z each iteration. The value head chases the divisor.
+   2. **Buffer non-stationarity** — older buffer entries' (z) are normalized by an older bl_val than newer entries' (z), even within a single training step. Per-state target distribution has both fresh and stale calibration mixed.
+   3. **Across-instance variance collapse** — bl_val varies per-instance, so dividing absorbs much of the across-instance signal the value head could otherwise learn from.
+
+  **2026-05-06 — Option B implementation: train value head on raw cost_to_go (`--value_target_norm none`).** Removes the bl_val divisor from the value-head target entirely; eliminates all three shift channels in one stroke at the cost of a coarser z magnitude scale. Implementation (no behavior change for default `bl`):
+   - **CLI** ([train_alphazero.py:157](src/scripts/train_alphazero.py#L157)): existing `--value_target_norm` flag extended with new `'none'` choice.
+   - **Trainer** ([trainer.py train_step_alphazero](src/am_baseline/training/trainer.py)): z target reconstructed from buffer-stored `z_buf * bl_val` when `norm == 'none'` (buffer continues to store the canonical bl-normalized z; the trainer denormalizes at use time).
+   - **MCTS Python** ([mcts.py](src/am_baseline/search/mcts.py)): added `value_target_norm` to `MCTSConfig`, `_convert_value_head_output(v, node, bl_val)` helper applied at `_populate_priors` and `_expand` so the value head's output is interpreted in the same target convention used at training time.
+   - **MCTS C++** ([mcts.hpp/cpp](src/am_baseline/search/mcts_cpp/mcts.cpp)): mirror — `Config::value_target_norm` (parsed from py dict), `Solver::convert_value_head_output(v_raw, n, bl_val)` helper, all 4 call sites updated. Extension rebuilt via `python setup.py build_ext --inplace` (`pip install -e .` was producing a tiny editable wheel that wasn't recompiling the C++ — caught and fixed).
+   - **Coach plumbing** ([coach.py make_self_play_config](src/am_baseline/training/coach.py)): `value_target_norm=str(getattr(opts, 'value_target_norm', 'bl'))` passed through to MCTSConfig.
+   - **CPU smoke**: TSP-8, 1 iter, value_head, `--value_target_norm none` — completed end-to-end with `value_loss=2.85` (consistent with raw cost magnitude on N=8; sanity check on order of magnitude). No NaN, gradients flow, buffer↔trainer↔MCTS conventions agreed.
+
+  **2026-05-06 — F.6.0.5b launched (raw-target 4-variant value_head rerun).**
+   - Modal app: `ap-M3se0bCnottfFqptEhq8oi` (timestamp `20260506T082313`).
+   - Entrypoint: `modal run --detach src/scripts/modal_run_train_alphazero.py::run_f605_lr_validation_raw_target`.
+   - Holds `leaf_eval=value_head`, `K=40`, `n_iterations=20`, `--value_target_norm none`; varies the same 4 (lr, wd) corners.
+   - Run names: `f605vhraw_lr1e4_wd1e4_20260506T082313`, `f605vhraw_lr5e4_wd1e4_…`, `f605vhraw_lr5e4_wd0_…`, `f605vhraw_lr1e4_wd0_…`.
+   - Image built (24s editable-install layer), 4 tasks spawned, ~30 min wall-clock parallel; results pending.
+
+  **What this rerun is testing.** The bl-normalized value_head grid is the **control**; the raw-target rerun (matched lr/wd grid) is the **intervention**. If raw-target trajectories converge visibly faster than bl-normalized, that's evidence the bl_val drift was the dominant value_head-convergence drag, not lr/wd. If they don't separate, value_head's lag is structural (e.g., target magnitude / scale, MLP capacity, or at-init prediction floor) and bl-drift is a smaller effect than hypothesized.
+
+  **2026-05-06 — F.6.0.5b results landed (raw-target 4-variant grid, all 4/4 reached iter-19).** App `ap-M3se0bCnottfFqptEhq8oi` finished cleanly. Numbers in the table above. Key observations:
+
+  - **Winner: V3 (lr=5e-4, wd=0) at val_avg_cost=4.265.** Beats V1 (control, 4.331) by **−0.066** and V2 (analytical, 4.349) by **−0.084**. Lowest policy_loss (1.4651) and value_loss (0.2637) of all 4 — co-improvement, not a noise artifact.
+  - **V2 (lr=5e-4, wd=1e-4) regressed: 4.349 vs V1's 4.331.** And V2 was the only variant whose final gate (iter-19) **rejected** the candidate (cand 4.344 vs baseline 4.341, ttest p>0.05). At lr=5e-4, the AGZ-canonical wd=1e-4 actually *hurts* — the high-lr × non-zero-wd combination plateaued earlier than the low-lr control.
+  - **V4 (lr=1e-4, wd=0) regressed: 4.367 vs V1's 4.331.** At lr=1e-4, dropping wd to 0 hurt slightly (i.e., wd=1e-4 helps when lr is small). So **wd is not uniformly beneficial or harmful — it interacts with lr.**
+
+  **2x2 factorial decomposition** (treating the 4 corners as a `lr × wd` design at iter-19 val_avg_cost):
+
+  | term | value | interpretation |
+  |---|---|---|
+  | grand mean | 4.328 | — |
+  | main effect of lr (5e-4 − 1e-4) | (V2+V3)/2 − (V1+V4)/2 = −0.041 | high lr helps on average |
+  | main effect of wd (0 − 1e-4) | (V3+V4)/2 − (V1+V2)/2 = −0.024 | wd=0 helps on average |
+  | **lr × wd interaction** | V3 − V2 − V4 + V1 = **−0.120** | **strongly synergistic — lr=5e-4 only pays off when wd=0** |
+
+  The interaction term (−0.120) is **3× the larger main effect**, which is why neither V2 (high lr alone) nor V4 (low wd alone) reproduces V3's gain. **The decision is not "raise lr" or "drop wd" individually — it's "raise lr AND drop wd jointly."**
+
+  **Two-step decision rule outcome (per the rule pinned earlier in F.6.0.5):**
+  - **Step 1 (lr):** "V2 OR V3 reaches val_avg_cost(iter 25/19) ≤ V1 − 0.02?" V3 = 4.265, V1 = 4.331 → V1 − V3 = **0.066 ≥ 0.02** → **PASS via V3.** V2 alone fails (regressed). Lr=5e-4 conditionally validated.
+  - **Step 2 (wd):** "V3 vs V2 within lr=5e-4: |V3−V2| < 0.005 → V2; V3 < V2 by ≥ 0.01 → V3; V3 > V2 → V2." V3 − V2 = **−0.084 ≪ −0.01** → **adopt V3 settings (lr=5e-4, wd=0).**
+
+  **F.6.1 default lr/wd resolved: `--lr_model 5e-4 --weight_decay 0` with `--value_target_norm none` retained.** Documents that Stage 4 should drop the AGZ-canonical wd=1e-4 in favor of Stage-1 / AM-paper convention (Adam wd=0) **and** raise lr from inherited 1e-4 to 5e-4 — both of which are required jointly per the interaction-term reading.
+
+  **Comparison vs the F.6.0.5a (bl-normalized) grid.** The bl-normalized grid showed flat val_avg_cost trajectories across (lr, wd) — the dominant drag was the bl_val divisor on the value-head target, not optimizer settings. With raw-target enabled, the (lr, wd) grid finally discriminates. **This validates the bl_val-drift hypothesis as the primary value_head-convergence drag** before optimizer tuning becomes a useful lever.
+
+  **F.6.1 trajectory expectation.** V3's iter-19 (4.265) is already **0.07 below the F.6.0 winner's iter-49** (rollout × ε=0.25 × ttest at 3.93 — but F.6.0 was K=100 not K=40, so direct comparison requires care). At the F.6.0.5b scale (K=40, value_head, raw-target), V3 trended monotonically toward Stage-1's 3.84 ceiling: at iter-9 ≈ 4.62, iter-14 ≈ 4.34, iter-19 = 4.27. Linear extrapolation suggests F.6.1 (100-iter continuation at lr=5e-4, wd=0, raw-target) should clear 3.95 and possibly approach 3.85 by iter-100. **F.6.1 launch decision: GO.**
+
+  **Caveats / things to verify.**
+  - V3's gate accepted at iter-19, but acceptance gate is just a t-test — it doesn't certify monotone convergence; the trajectory needs full plotting from W&B before F.6.1 commits.
+  - K=40 ≠ K=100; F.6.1 should re-derive lr only after a single short K=100 sanity check at V3 settings (one variant, ~5 iter), to confirm the lr conclusion travels across MCTS scale. Alternatively, just run F.6.1 at K=40 to keep apples-to-apples with F.6.0.5b (cheaper, faster, but doesn't directly extend F.6.0).
+  - V2's final-gate rejection (cand 4.344 vs baseline 4.341, p>0.05) could indicate a hard plateau at lr=5e-4 / wd=1e-4 specifically; ruling out an unlucky t-test would require re-running with a different seed.
+
+- [x] **F.6.0.6 Dirichlet ε sweep at V3 settings.** **COMPLETE 2026-05-06.** 2-variant sweep ε ∈ {0, 0.05} holding (lr=5e-4, wd=0, value_target_norm=none, leaf_eval=value_head, K=40, 20 iter, gate=ttest, val_seed=42) fixed. F.6.0.5b's V3 (ε=0.25, val_avg_cost(iter-19) = 4.2648) acts as the implicit third reference point. Modal app: `ap-IAwuU1k9JAADMbtkM7WTOR` (timestamp `20260506T092127`); ~30 min wall-clock parallel.
+
+  **Motivation.** F.6.0 picked ε=0.25 in a different regime (lr=1e-4, K=100, **bl-normalized** value_head where the value head was effectively broken; ε rescued exploration). F.6.0.5b moved to raw-target value_head + lr=5e-4 + wd=0 — value head now contributes leaf-discrimination AND policy mode-locks faster, both predicting **lower ε is better**. F.6.0.5b held ε=0.25 fixed, so the question stayed open. F.6.0.6 closes it.
+
+  **Results table** (sorted by val_avg_cost(iter 19) ascending):
+
+  | variant | ε | val_avg_cost | policy_loss | value_loss | entropy | gate accepted | Δ vs winner |
+  |---|---|---|---|---|---|---|---|
+  | **E2 (winner)** | **0.05** | **4.1856** | 1.4518 | 0.2557 | 1.1429 | yes | — |
+  | E1 | 0.00 | 4.2283 | 1.4334 | 0.2833 | 1.0882 | yes | +0.0427 |
+  | _(implicit)_ V3 | 0.25 | 4.2648 | 1.4651 | 0.2637 | 1.1073 | yes | +0.0792 |
+
+  **Initial decision (revised below) by iter-19 endpoint rule** (±0.02 tie band): E2 beats E1 by 0.043 ≥ 0.02 ✓ AND beats V3 by 0.079 ≥ 0.02 ✓ → endpoint says E2. **But trajectory inspection (next paragraph) reverses this.**
+
+  **Trajectory-stability inspection (per-iter regression analysis 2026-05-06).** Reading the iter-by-iter val_avg_cost from the launch log streams (attributing each iter line by value_loss-decay continuity):
+
+  | metric | E1 (ε=0) | E2 (ε=0.05) | V3 (ε=0.25, F.6.0.5b) |
+  |---|---|---|---|
+  | iter-19 endpoint | 4.228 | **4.186** | 4.265 |
+  | max per-iter regression | **+0.035** | +0.462 (iter 17→18) | (similar ε>0 pattern expected) |
+  | # iters with regression ≥ +0.05 | **0/19** | 7/19 | — |
+  | # iters with regression ≥ +0.20 | **0/19** | 3/19 (iters 5→6, 14→15, 17→18) | — |
+  | mean Δ from iter 10 to 19 | −0.052/iter (smooth) | −0.032/iter (volatile) | — |
+  | iter-18 val_avg_cost | 4.245 | 4.738 | — |
+
+  **E2's iter-19 lead is fragile.** At iter-18, E1 was ahead by **+0.493**; E2's iter-19 = 4.186 is the bottom of a 0.55-amplitude oscillation (4.738 → 4.186 in one iter). Had we logged iter-15 (E1 4.372 vs E2 4.502) or iter-18 (E1 4.245 vs E2 4.738) as the endpoint, E1 would have been clearly ahead. The 0.043 endpoint advantage for E2 is **noise-floor-sized relative to E2's per-iter volatility (max single-iter swing ±0.46).**
+
+  **Mechanism (matches first-principles prediction).** Dirichlet noise corrupts π_t (visit-distribution training target) at every tour-step root. With K=40 visits and ε=0.05, ~2 visits per root are noise-driven — small mean perturbation, but the variance compounds across 20 tour-steps × 1000 instances per iter × 200 train_steps. Under V3's lr=5e-4 (5× faster target-fitting than F.6.0's lr=1e-4), the policy absorbs that variance into per-iter val_avg_cost spikes. ε=0 has zero target corruption → smooth descent.
+
+  **Revised decision: F.6.1 default = ε=0**, not ε=0.05.
+  - Endpoint advantage of E2 (0.043) is real but small — within E2's typical iter-to-iter volatility band.
+  - Stability advantage of E1 is large and consistent (0 vs 7 regressions ≥0.05; 0 vs 3 regressions ≥0.20).
+  - F.6.1 is a 100-iter run; volatility compounds. A spike like iter-17→18's +0.46 happening once in 100 iters could easily land an unlucky F.6.1 endpoint at the *peak* of an oscillation rather than the trough.
+  - V3 (ε=0.25) is dominated on both axes (worse endpoint AND worse stability).
+
+  **First-principles predictions: status updated.**
+  1. **Lower ε helps under V3 regime** (§2.1+§2.2): **CONFIRMED in spirit, taken further than predicted.** Theory said ε ∈ [0.05, 0.10]; data says ε=0 wins on the more important stability axis. Under raw-target value_head + lr=5e-4, MCTS Q-values become informative within ~5 iters, and ε's marginal exploration value evidently goes negative once you account for target-corruption variance.
+  2. **ε=0 lower-bound concern** (§2.3): **REFUTED.** Theory predicted ε=0 would underperform by ~0.01-0.02 due to lack of at-init exploration. Data shows ε=0 actually has the cleanest trajectory shape; the at-init concern was overweighted (state variation across M=1000 instances per iter provides plenty of break-symmetry at init).
+
+  **Regime-comparison observation.** F.6.0 (rollout, lr=1e-4, K=100, bl-normalized) had ε=0.25 ≈ ε=0.05 within 0.001 noise — ε was effectively irrelevant. F.6.0.6 (V3 regime: value_head, lr=5e-4, K=40, raw-target) shows ε=0 wins on stability and ε=0.25 loses on both endpoint and stability. **The F.6.0 ε conclusion does NOT transfer.** Each major regime change (leaf_eval, lr, value_target_norm) re-opens the ε question — and at higher lr / functional value_head, **the stability case for ε=0 strengthens**.
+
+  **F.6.1 default fully resolved (lr × wd × ε):** `--lr_model 5e-4 --weight_decay 0 --value_target_norm none --dirichlet_epsilon 0`. Two-step F.6.0.5 outcome (lr=5e-4, wd=0) plus F.6.0.6 trajectory-revised outcome (ε=0) jointly lock the F.6.1 recipe.
+
+  **Sample-efficiency anchor.** E1 reached val_avg_cost = **4.228 at iter-19 = 19K instances** — a 0.037 improvement over V3's 4.265 (F.6.0.5b) at zero additional iterations or instance budget. Smaller endpoint gain than E2's 0.079 vs V3, but trajectory shape is what matters for projecting F.6.1: E1's mean Δ of −0.052/iter through iter 10-19 (smooth, no oscillations) extrapolates to **~3.85 (Stage 1 ceiling) by iter ~50-60**, beating F.6.0's 50-iter K=100 winner (3.93) on both quality and stability.
+
+  **Caveats.**
+  - V3's 4.265 reference is from a different Modal launch (F.6.0.5b vs F.6.0.6). Cross-launch noise is small but nonzero; the 0.079 gap is above noise floor (single-seed variance ~0.005), but V3 also has the same Dirichlet-induced volatility issue (just unsurfaced because F.6.0.5b only logged endpoints).
+  - K=40, value_head, 20-iter; whether the ε=0 stability advantage generalizes to K=100 / longer runs is untested. **F.6.1 itself is the validation** — if F.6.1's trajectory at ε=0 is also smooth, the conclusion holds.
+  - The "trajectory attribution" was done from interleaved stdout logs by tracking value_loss continuity; spot-checking against W&B run pages would confirm the mapping. Moderate confidence in attribution given the clean monotone-decay structure of value_loss in both variants, but worth a sanity-check before F.6.1 commits.
+  - Did NOT test ε ∈ {0.01, 0.02} — between 0 and 0.05 there could be a sweet spot if even tiny noise helps without compounding. The trajectory data argues no, but a follow-up isn't expensive if F.6.1 surprises us.
+
+- [x] **F.6.0.7 → F.6.1.1 Sub-budget probes (K, batch, M, buffer)** — **COMPLETE 2026-05-06.** Series of small probes exploring auxiliary knobs at the F.6.0.6 winner regime (ε=0, lr=5e-4, wd=0, value_target_norm=none, leaf_eval=value_head, gate=ttest, val_seed=42) before committing to F.6.1. All 20-iter, M=1000 unless noted; reference is F.6.0.6 E1 (K=40, batch=512, buffer=200K) → val_avg_cost(iter 19) = **4.228**.
+
+  **Results table** (sorted by val_avg_cost(final) ascending):
+
+  | run | K | batch | M | iters | buffer | leaf_eval | val_avg_cost(final) | Δ vs E1 |
+  |---|---|---|---|---|---|---|---|---|
+  | F.6.0.6 E1 (reference) | 40 | 512 | 1000 | 20 | 200K | value_head | **4.228** | — |
+  | F.6.0.9 (in flight, iter 17) | 20 | 2048 | 1000 | 20 | 200K | rollout | ~4.236 (provisional) | +0.008 |
+  | F.6.1.1 buf=5000 | 20 | 512 | 1000 | 20 | **5K** | value_head | **4.299** | +0.071 |
+  | F.6.1.1 buf=1000 | 20 | 512 | 1000 | 20 | **1K** | value_head | 4.350 | +0.122 |
+  | F.6.0.8 | 20 | **2048** | 1000 | 20 | 200K | value_head | 4.408 | +0.180 |
+  | F.6.0.7 (K=20 reference) | 20 | 512 | 1000 | 20 | 200K | value_head | 4.428 | +0.200 |
+  | F.6.1.0 (M=2000 × 10 iter) | 20 | 2048 | 2000 | **10** | 200K | value_head | 5.062 | **+0.834** |
+
+  **Findings:**
+  1. **K dominates batch_size** (F.6.0.7 vs F.6.0.8): bumping batch 512 → 2048 at K=20 helped only 0.020 (4.428 → 4.408). The K=40 → K=20 hit (~0.18-0.20) is ~10× larger than the batch effect. K is the top sample-efficiency knob.
+  2. **Iters dominate M_instances** (F.6.0.8 vs F.6.1.0 at matched 20K total): doubling M and halving iters made it 0.654 *worse*. At iter-9 calendar match, F.6.1.0 (M=2000) ≈ F.6.0.8 (M=1000) within ~0.05 — i.e., 2× more fresh data per iter gave essentially zero benefit. **train_steps_per_iter=200 saturates the per-iter "learning budget" at M=1000**; raising M without raising train_steps wastes the extra data.
+  3. **Smaller replay buffer dramatically helps** (F.6.0.7 vs F.6.1.1 buf=5000): shrinking buffer 200K → 5K closed 0.129 of the K=20→40 gap (4.428 → 4.299). The 200K buffer was actively dragging the policy back via stale MCTS targets reflecting earlier, weaker policies. **Diagnostic signature**: policy_loss collapses 1.48 → 0.66 (2.2×) and entropy collapses 1.11 → 0.43 (2.6×) when the buffer shrinks — the policy is no longer getting averaged toward outdated targets.
+  4. **Sweet spot is buf=5000 (5-iter window), not buf=1000 (1-iter window)**: buf=5000 beats buf=1000 by 0.051. Some cross-iter averaging denoises 1-iter MCTS sampling noise, but the AGZ-canonical 200-iter window is far too long for our target-fitting rate. Lifetime sample-per-tuple ratio is held roughly constant (~5×) across all three buffer sizes — only the **window** (recency mix) varies.
+  5. **Rollout still competitive at K=20** (F.6.0.9 in flight, iter 17 = 4.236): trending toward matching F.6.0.6 E1's K=40 value_head endpoint *at K=20* with rollout — but mcts_s is ~3.2× higher (~155s vs ~50s for value_head), so per-credit value_head still wins.
+  6. **Stability**: smaller buffers are mildly less stable (3-4 regressions ≥0.05 vs F.6.0.7's 3) but the bumpiness penalty is small relative to the endpoint gain.
+
+  **F.6.1 recipe revisions** (carrying over from F.6.0.5 + F.6.0.6 + this batch):
+  - Keep: ε=0, lr=5e-4, wd=0, value_target_norm=none, leaf_eval=value_head, gate=ttest, val_seed=42, M=1000.
+  - **Change buffer_capacity 200K → 5000** (~5-iter window). Strongest single F.6.1 improvement candidate.
+  - K=40 (F.6.0.6 E1) > K=20 by ~0.20 endpoint; F.6.1 should run K=40 (or higher).
+  - train_steps_per_iter stays at 200 (saturates per-iter budget at M=1000); raise only if M raises.
+
+  **Pending follow-up: F.6.1.2 = K=40 + buffer=5000** at otherwise-F.6.0.6-E1 settings. Combines the two strongest findings (small-buffer + larger K) and should plausibly push past F.6.0.6 E1's 4.228 toward 4.10 or below at iter-19. Modal entrypoint `run_f612_k40_buf5k_probe`; ~$2-3 credits, ~30 min wall-clock.
+
+  Modal apps: F.6.0.7 (`ap-...`), F.6.0.8 (`ap-...`), F.6.0.9 (`ap-...`, in flight), F.6.1.0 (`ap-...`), F.6.1.1 (`ap-...`).
+
+- [ ] **F.6.1 From-scratch trajectory probe** *(scope reduced 2026-05-02 from 1000 → 100 iter; defaults locked 2026-05-06 by F.6.0.5 + F.6.0.6)*. Recipe locked: **100 iter** × M=1000 × **K=100** × `train_steps_per_iter=200` × `buffer_capacity=200_000` × **`--lr_model 5e-4`** × **`--weight_decay 0`** × **`--value_target_norm none`** × **`--dirichlet_epsilon 0`** × **`--leaf_eval value_head`** × `--gate_mode ttest` × val_seed=42. **Resume from F.6.0 winner's `iter-49.pt`** *(reconsider — F.6.0 winner used different lr/wd/value_target_norm/ε, so resume may not be apples-to-apples; from-scratch may be cleaner)*. **K=100 chosen** because the probe showed K=100 → K=200 gives only +33% MCTS-vs-greedy gap improvement at 2× cost; K=200 reserved for F.6.3 escalation.
 
   Per-iter wall-clock estimate (Modal A10):
   - K=100 value_head: ~20 s/iter → **100 iter ≈ 33 min, ~$0.30-0.50 in credits**.
