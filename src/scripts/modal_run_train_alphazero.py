@@ -1052,6 +1052,7 @@ def _f61_args(
     buffer_capacity: int = 5000,
     lr_model: str = "5e-4",
     lr_decay: str = "1.0",
+    lr_decay_step_size: int = 1,
     temperature_schedule: str = "step30",
     dirichlet_epsilon: str = "0.0",
     n_simulations_schedule: str = "const",
@@ -1102,6 +1103,8 @@ def _f61_args(
             "--n_simulations_late", str(n_simulations_late),
             "--n_simulations_last", str(n_simulations_last),
         ])
+    if lr_decay_step_size != 1:
+        args.extend(["--lr_decay_step_size", str(lr_decay_step_size)])
     return args
 
 
@@ -1519,6 +1522,62 @@ def run_mcts_batch_size_sweep(timestamp: str = "") -> None:
         h.get()
         print(f"[modal] {label} done.", flush=True)
     print(f"\n[modal] all {len(handles)} mcts_batch_size sweep jobs complete.")
+    print("[modal] download results with: modal volume get am-alphagozero-volume outputs/")
+
+
+@app.local_entrypoint()
+def run_f616_400iter_step_decay(timestamp: str = "") -> None:
+    """Phase F.6.1.6 — from-scratch 400-iter run with stepped lr decay.
+
+    Consolidates the manual chain F.6.1.3 -> F.6.1.4 -> F.6.1.4.b -> F.6.1.4.c
+    (which hit val=3.8498 at iter 225 with lr-staircase 5e-4 -> 1e-4) into
+    a single from-scratch run with a built-in lr step schedule:
+
+        iter   0..99:   lr = 5e-4
+        iter 100..199:  lr = 1e-4   (decay factor 0.2)
+        iter 200..299:  lr = 2e-5
+        iter 300..399:  lr = 4e-6
+
+    Achieved via --lr_model 5e-4 --lr_decay 0.2 --lr_decay_step_size 100
+    (new flag, validated by local smoke test).
+
+    All other settings = F.6.1.3 eps=0.25 verbatim. mcts_batch_size=1000
+    (the new default after the chunk-size sweep). 400 iters total -> 400K
+    instances (4x F.6.1.3 budget).
+
+    Hypothesis: the manual chain showed lr=5e-4 saturates at ~3.866 (iter 127)
+    and lr=1e-4 unlocks improvement to ~3.85. Continuing with a smaller lr
+    might push further. The step schedule lets us probe this in one
+    400-iter run instead of three resume chains, with cleaner attribution.
+
+    Expected wall: ~25-30 s/iter at mcts_batch_size=1000 -> ~3 hours total.
+    Cost: ~$8-15 Modal credits.
+    """
+    from datetime import datetime, timezone
+    if not timestamp:
+        timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")
+
+    run_name = f"f616_400iter_step_decay_{timestamp}"
+    args = _f61_args(
+        run_name=run_name,
+        k=40,
+        buffer_capacity=5000,
+        lr_model="5e-4",
+        lr_decay="0.2",                  # 5x reduction at each step
+        lr_decay_step_size=100,          # step every 100 iters
+        temperature_schedule="step10",
+        dirichlet_epsilon="0.25",
+    )
+    idx = args.index("--n_iterations")
+    args[idx + 1] = "400"
+
+    print(f"[modal] launching F.6.1.6 from-scratch 400-iter step-decay run")
+    print(f"  {run_name}")
+    print(f"  lr schedule: 5e-4 (0..99) -> 1e-4 (100..199) -> 2e-5 (200..299) -> 4e-6 (300..399)")
+    h = train_alphazero_remote.spawn(*args)
+    print(f"\n[modal] awaiting {run_name} (function_call_id={h.object_id}) ...", flush=True)
+    h.get()
+    print(f"[modal] {run_name} done.", flush=True)
     print("[modal] download results with: modal volume get am-alphagozero-volume outputs/")
 
 

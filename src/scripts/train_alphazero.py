@@ -111,9 +111,17 @@ def parse_opts(argv=None):
     parser.add_argument('--lr_model', type=float, default=1e-4,
                         help='Adam learning rate for the working model.')
     parser.add_argument('--lr_decay', type=float, default=1.0,
-                        help='Per-iteration multiplicative lr decay. lr(iter k) = lr_model * lr_decay**k. '
-                             'Default 1.0 = no decay (Stage-4 default). Stage-1-style schedule uses 1.0; '
-                             'AGZ-style step-anneal (1e-2 → 1e-3 → 1e-4) is a separate ablation.')
+                        help='Multiplicative lr decay factor per step-down event. With '
+                             '--lr_decay_step_size=1 (default), this is a per-iter exponential '
+                             'decay: lr(iter k) = lr_model * lr_decay**k. With '
+                             '--lr_decay_step_size=N (N>1), this is a step-wise schedule: '
+                             'lr drops by lr_decay every N iters (StepLR-like). '
+                             'Default 1.0 = no decay.')
+    parser.add_argument('--lr_decay_step_size', type=int, default=1,
+                        help='Number of iterations between lr step-down events. 1 (default) gives '
+                             'smooth per-iter exponential decay; N>1 gives step-wise decay '
+                             '(lr unchanged within a 100-iter window if step_size=100). '
+                             'Useful for AGZ-canonical step-anneal schedules.')
     parser.add_argument('--leaf_eval', type=str, default='value_head',
                         choices=['value_head', 'rollout'],
                         help='MCTS leaf evaluator: AGZ value head (default) or AlphaGo-Lee-style rollout.')

@@ -867,12 +867,19 @@ class MCTSCoach:
             weight_decay=float(self._weight_decay()),
         )
 
-        # LR scheduler — multiplicative per-iteration decay.
-        # lr(iter k) = lr_model * lr_decay**k. Default lr_decay=1.0 → no decay.
-        # Stage 1 uses the same LambdaLR pattern (train.py:102).
+        # LR scheduler — supports both per-iter exponential and step-wise decay.
+        # Formula: lr(iter k) = lr_model * lr_decay ** (k // lr_decay_step_size).
+        # With step_size=1 (default), reduces to per-iter exponential decay
+        # (existing behavior, lr_decay**k). With step_size>1, lr is constant
+        # within each step-size-iter window and drops by lr_decay at each
+        # boundary — mimics StepLR. F.6.1.6 uses lr_decay=0.2,
+        # step_size=100 → lr halves every 100 iters from 5e-4 → 1e-4 → 2e-5 →
+        # 4e-6 across a 400-iter run.
         _lr_decay = float(getattr(opts, 'lr_decay', 1.0))
+        _lr_decay_step_size = max(1, int(getattr(opts, 'lr_decay_step_size', 1)))
         self.lr_scheduler = _torch.optim.lr_scheduler.LambdaLR(
-            self.optimizer, lr_lambda=lambda iter_k: _lr_decay ** iter_k
+            self.optimizer,
+            lr_lambda=lambda iter_k: _lr_decay ** (iter_k // _lr_decay_step_size),
         )
 
         # Gating — verbatim Stage 1 RolloutBaseline. Construct AFTER
