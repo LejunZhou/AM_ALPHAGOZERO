@@ -2,7 +2,7 @@
 
 **Plan:** `_plans/stage4_plan.md`
 **Started:** 2026-04-29
-**Last updated:** 2026-05-06 — **F.6.1 K=40 main complete (val=3.92 plateau); F.6.1.3 step10 + ε=0.25 sweep BROKE the plateau to val=3.878 from-scratch — first variant past F.6.1 main's iter-90 best (3.893).** F.6.1.3 also confirmed via diagnostic that value_head leaf eval at K=40 is statistically tied with greedy (K=40 rollout: −0.072 vs greedy; K=40 value_head: +0.002 vs greedy, p=0.63), pinpointing the F.6.1 plateau's root cause: MCTS targets ≈ greedy → CE distillation has no improvement signal → π_t entropy collapses to 0.155 nats by iter 99. **step10 + ε=0.25 partially halts the entropy collapse** (0.335 vs 0.155) by retaining exploration noise on a narrower σ_t window. F.6.1.4 (ε=0.25 +50 iter resume from iter-99) in flight. Telemetry additions this session: per-loss grad norms (policy/value/total, with value split into VH-only + encoder-decoder-shared subspaces) for cos(θ_shared) conflict diagnostic; step10 temperature schedule (cutoff = ⌈0.1·N⌉); standalone Stage-4 MCTS validator (`src/scripts/val_stage4_mcts.py`) with AM-baseline support. Earlier this session: F.6.1 K=20 variants (lr=5e-4 const, lr=1e-3 + 0.95/iter decay) both at val ≈ 3.92 on 100K instances; F.6.0.7→F.6.1.1 sub-budget probes locked the F.6.1 recipe; gate_every revised 5→1 (best_model freshness); lr scheduler infrastructure added (LambdaLR wired into coach.py, --lr_decay CLI flag, checkpoint save/load support).
+**Last updated:** 2026-05-07 (later) — **F.6.1.4.c chain saturated at 3.8498 (gap ~0.008 to AM_S1); mcts_batch_size sweep gives 5× wall-clock reduction at production scale, default updated 64 → 1000.** F.6.1.4.c (3rd in the resume chain, lr=1e-4) added another −0.0017 over F.6.1.4.b's iter-184 best, with 24 consecutive rejects after iter 225 — the lr=1e-4 well is empty. Total chain improvement F.6.1.4 → F.6.1.4.c: **3.8665 → 3.8498 over 100 iters at lr=1e-4**. mcts_batch_size sweep at F.6.1.3 ε=0.25 recipe (10-iter, 4 parallel jobs) confirmed `mcts_batch_size` is the instance-parallelism CHUNK SIZE, not per-NN-forward batch: **default 64 was running 16 sequential chunks per iter at TSP-20**, vastly underutilizing the A10 GPU. Bumping to 1000 (= M) gives 1 chunk/iter at full GPU parallelism, **~5× wall reduction** with no quality cost. Updated default in train_alphazero.py CLI. M2000 probe confirmed doubling M is roughly linear in wall (no free 2× throughput; M=1000 + chunk=1000 is the production sweet spot). Earlier today: F.6.1.4.b (lr=1e-4) broke the iter-127 saturation from F.6.1.4 (lr=5e-4) with 10 gate accepts in 35 iters (3.8665 → 3.8514). Modal image refactored from pip → uv (uv.lock committed; first production uv run was F.6.1.4.c). Per-step K schedule + lr-override-on-resume infrastructure landed. F.6.1.4.b extended F.6.1.4's `iter-149.pt` for +50 iter at `--lr_model 1e-4` (down from 5e-4 via the new lr-override-on-resume logic). Result: 10 gate accepts in 35 productive iters, val_avg_cost dropped **3.8665 → 3.8514** (iter 184 last accept). Confirmed hypothesis that the F.6.1.4 plateau at iter 127 was a per-iter overshoot under lr=5e-4, not true saturation; lr=1e-4 immediately resumed accepting in ONE iter. Soft signals all moved as expected (pg_norm 0.80→0.32, vg_norm 0.83→0.19, value_loss 0.017→0.005). Earlier today: F.6.1.4 (lr=5e-4) revealed val=3.866 at iter-127 (last accept; 22 rejects through iter 149); F.6.1.5 K-bracket schedule run launched in parallel (in flight); per-step K override (`MCTSConfig.n_simulations_per_step`) wired through Python+C++ MCTS backends; lr-override-on-resume added so `--lr_model X` is no longer silently ignored after `coach.load_checkpoint`. Yesterday: F.6.1 K=40 main complete (val=3.92 plateau); F.6.1.3 step10 + ε sweep broke that to 3.878; per-loss grad norms with VH/shared subspace split for clean cos(θ_shared) diagnostic; standalone Stage-4 MCTS validator `val_stage4_mcts.py`; step10 temperature schedule. Modal image refactored from pip → uv (uv.lock committed for reproducibility).
 **Status:** **Phases A, B, C, D, E complete; Phase F (TSP-20 pilot/main CLI) and G (ablations) remain.**
 
 ---
@@ -603,7 +603,53 @@ The plan ([_plans/stage4_plan.md:455-470](../_plans/stage4_plan.md#L455-L470)) d
 
   **Diagnostic inheritance**: per-loss grad norms (added this session — see infrastructure entry below) recorded throughout. policy and value grad norms are within ~1× of each other at iter 99 (pg_norm=0.800, vg_norm=0.825 for ε=0.25), so λᵥ=1.0 is not mis-weighted at this regime. The value-grad VH-vs-shared split was added AFTER these runs finished; F.6.1.4 (resume) will be the first run with that telemetry.
 
-- [ ] **F.6.1.4 ε=0.25 +50 iter resume (in flight)** — extends `f62_step10_eps25_20260507T024345_*/iter-99.pt` for 50 more iterations with the new value-grad VH/shared split telemetry. Tests whether the trajectory keeps improving past iter 99 (would close the AM_S1 gap further) or has hit a new plateau (would suggest step10+ε=0.25 hit a different regime-limit). Modal entrypoint: `run_f62_eps25_resume50`. Same recipe as parent run; coach loads model + best_model + optimizer + lr_scheduler + RNG + sibling buffer.pt; resumes at iter 100 → 149. Output: `outputs/tsp_20/f62_step10_eps25_resume50_<timestamp>_*/iter-{100..149}.pt`. ~1.5-2h wall, ~$8-12 in credits.
+- [x] **F.6.1.4 ε=0.25 +50 iter resume** — **COMPLETE 2026-05-07.** Extended `f62_step10_eps25_20260507T024345_*/iter-99.pt` for 50 more iterations (iter 100→149) with the new value-grad VH/shared split telemetry. Output dir: `outputs/tsp_20/f62_step10_eps25_resume50_20260507T052131_20260507T052139/`. W&B: `z39vi807`.
+
+  **Trajectory** (gate-accepted iters only — best_model state):
+
+  | iter | val_avg_cost | accepted? |
+  |---|---|---|
+  | 100 | 3.8774 | ✓ |
+  | 120 | 3.8733 | ✓ |
+  | 126 | 3.8717 | ✓ |
+  | **127** | **3.8665** | **✓ (LAST)** |
+  | 128–149 | bouncing 3.866–3.883 | ✗ ×22 |
+  | 149 (working) | 3.8787 | — |
+
+  **Key finding**: F.6.1.3's "convergence at val ≈ 3.878" was actually a working-model endpoint reading; the F.6.1.4 trajectory revealed continued improvement to **3.8665 at iter 127** (last gate accept), then 22 consecutive rejects through iter 149. This is the saturation point under lr=5e-4. The −0.012 improvement was only revealed by running the resume.
+
+- [x] **F.6.1.4.b ε=0.25 +50 iter resume at lr=1e-4 (post-iter-127 saturation breakthrough)** — **COMPLETE 2026-05-07.** Extended F.6.1.4's `iter-149.pt` for 50 more iterations (iter 150→199) with `--lr_model 1e-4` (down from 5e-4). The lr-override-on-resume logic added to [train_alphazero.py](src/scripts/train_alphazero.py) fires at startup and prints `[*] Overriding loaded lr 5.00e-04 → 1.00e-04`. Otherwise identical recipe (step10, ε=0.25, K=40, M=1000, train_steps=200, buffer=5000, batch=512, value_target_norm=none, leaf_eval=value_head, gate=ttest gate_every=1, val_seed=42). Modal entrypoint: `run_f64_eps25_lr1e4_resume50`. Output: `outputs/tsp_20/f62_step10_eps25_resume50_lr1e4_20260507T063714_20260507T063723/`. W&B: `a4t72a7s`.
+
+  **Hypothesis**: at iter 127 the policy is close enough to a fixed point that lr=5e-4 is overshooting per-iter; smaller lr=1e-4 lets the model refine into a tighter optimum. AM/Stage 1 canonical lr=1e-4 was the right anchor; the F.6.0.5-derived 5e-4 was for from-scratch random-init drift, no longer applies near the F.6.1.4 endpoint.
+
+  **Trajectory** (gate-accepted iters):
+
+  | iter | val_avg_cost | Δ from prior best |
+  |---|---|---|
+  | 149 (resume start, F.6.1.4 best) | 3.8665 (iter-127's saved best) | — |
+  | **150** | **3.8608** | **−0.0057** ← broke F.6.1.4 saturation in ONE iter |
+  | 152 | 3.8598 | −0.001 |
+  | 154 | 3.8579 | −0.002 |
+  | 158 | 3.8569 | −0.001 |
+  | 161 | 3.8564 | −0.001 |
+  | 164 | 3.8555 | −0.001 |
+  | 168 | 3.8540 | −0.002 |
+  | 174 | 3.8534 | −0.001 |
+  | 178 | 3.8516 | −0.002 |
+  | **184 (LAST)** | **3.8514** | −0.000 |
+  | 185–199 | rejected ×15 | (working bouncing 3.85–3.86) |
+
+  **Headline result**: lr=1e-4 produced **10 gate accepts in 35 productive iters** (28% accept rate vs F.6.1.4's 0% over iter 128–149). Total improvement at lr=1e-4: **3.8665 → 3.8514 (−0.015)** in 35 iters. Endpoint is the closest Stage 4 from-scratch has come to AM_S1 greedy (3.842 on val_seed=20260430): gap is now **~0.009**, down from ~0.066 at F.6.1 main and ~0.024 at F.6.1.4.
+
+  **Soft signals confirm "tightening into a finer optimum"**:
+  - `policy_grad_norm`: 0.80 → 0.32 (~2.5× smaller)
+  - `value_grad_norm`: 0.83 → 0.19 (~4× smaller)
+  - `value_loss`: 0.017 → 0.005 (~3× smaller)
+  - `mean_entropy_pi`: stable at ~0.30 (ε=0.25 + step10 keeps targets non-degenerate)
+
+  The 15 rejects at iter 185–199 again suggest a new (lower) saturation point. A subsequent `lr=1e-4` resume from iter-199 (F.6.1.4.c) tests whether the chain continues, OR whether further lr decay (5e-5, 3e-5) is required.
+
+  **Confirmation that lr override works**: console output line 135 `[*] Overriding loaded lr 5.00e-04 → 1.00e-04 (from --lr_model)`. Without this override, the optimizer's restored lr=5e-4 would have perpetuated under LambdaLR (lr_decay=1.0), silently ignoring the new --lr_model. Verified by the immediate −0.005 improvement at iter 150 — only possible at the lower lr.
 
 - [x] **Telemetry / infrastructure additions (2026-05-06)** — staged ahead of the F.6.1.4 resume so trajectory and post-F.6.1.3 runs all carry the new diagnostics:
 
@@ -620,6 +666,47 @@ The plan ([_plans/stage4_plan.md:455-470](../_plans/stage4_plan.md#L455-L470)) d
 - [ ] **F.6.2 Pass conditions evaluation** (split — see plan F.6.2 in `_plans/stage4_plan.md` for full text).
   - **Trajectory-probe conditions** (should hold for the F.6.1 100-iter probe to be informative): (3') visible downward val_avg_cost trend (final < initial by ≥ 0.05 — much looser than ±0.001 noise band); (4) ≥1 gate accept (auto with `--gate_mode always`); F.6.0+F.6.1 trajectory smoothly continuous (sanity-check resume).
   - **Definitive claim conditions** (deferred to F.6.3 if 100-iter probe warrants): (1c) sample efficiency, (2) ultimate quality ≤ 3.8312, (3) strict monotone within ±0.001.
+
+- [x] **F.6.1.4.c ε=0.25 +50 iter chain at lr=1e-4 (continuation of F.6.1.4.b)** — **COMPLETE 2026-05-07.** Resumed F.6.1.4.b's `iter-199.pt` for 50 more iters (iter 200→249) at the same lr=1e-4. Modal entrypoint: `run_f64c_eps25_lr1e4_resume50_chain`. **First production run on the new uv-built Modal image** (uv_sync replaced pip_install in `3d51e76`). W&B: `52ftg1b8`. Output: `outputs/tsp_20/f62_step10_eps25_resume50_lr1e4_chain_20260507T082205_20260507T082215/`.
+
+  **Trajectory** (gate-accepted iters):
+
+  | iter | val_avg_cost | Δ from prior best |
+  |---|---|---|
+  | 199 (resume start, F.6.1.4.b best = iter-184) | 3.8514 | — |
+  | 200 | 3.8517 | +0.0003 |
+  | 215 | 3.8497 | −0.0017 |
+  | **225 (LAST accept)** | **3.8498** | +0.0001 |
+  | 226–249 | bouncing 3.8485–3.8511 | rejected ×24 |
+  | 249 (working) | 3.8511 | — |
+
+  **Total chain improvement** F.6.1.4 → F.6.1.4.c: 3.8665 → **3.8498** = **−0.0167** in 100 iters at lr=1e-4. Gap to AM_S1 greedy (3.842) is now **~0.008** — within ~1× the val-set SE. The lr=1e-4 well is nearly empty: 24 consecutive rejects after iter 225.
+
+  **Suggested next levers**:
+  1. Drop lr to 5e-5 or 3e-5 for another resume (next saturation tier).
+  2. Pivot to leaf-evaluator: rollout vs value_head — F.6.1 main diagnostic showed K=40 value_head ≈ greedy at MCTS time, suggesting the value head is still not contributing leaf signal.
+  3. Run an apples-to-apples diagnostic of iter-225_accepted.pt on the seed=20260430 paired set vs AM_S1 greedy/sample; verify the F.6.1.4.c best truly closes the AM gap on independent val.
+
+  **Soft signals** (iter 249): policy_grad_norm=0.40, value_grad_norm=0.21, value_loss=0.0045, mean_entropy_pi=0.28. All settled into a tight regime; the model is no longer making meaningful policy-direction updates under lr=1e-4.
+
+- [x] **mcts_batch_size sweep — 5x wall-clock speedup at no quality cost** — **COMPLETE 2026-05-07.** During the K-bracket post-mortem analysis (`_plans/interesting-can-you-analyze-tidy-bubble.md`), discovered that `mcts_batch_size` is NOT a per-NN-forward batch but the **instance-parallelism CHUNK SIZE** in [solver.py:691](src/am_baseline/search/mcts_cpp/solver.py#L691). At the previous default `mcts_batch_size=64` with M=1000 instances, each coach iter sequentially processed **16 chunks** of 64 — wildly underutilizing the A10 GPU at TSP-20.
+
+  Sweep at F.6.1.3 ε=0.25 recipe (10-iter from-scratch, 4 parallel jobs):
+
+  | mcts_batch_size | mean mcts_s/iter (1-9) | speedup | total NN-batch calls/iter |
+  |---|---|---|---|
+  | 64 (prior default) | ~124s | 1.0× | 16 chunks × inner |
+  | 256 | ~38s | 3.3× | 4 chunks × inner |
+  | **1000** | **~25s** | **5.0×** | 1 chunk × inner |
+  | 2000 (≡1000 since M=1000) | ~25s | 5.0× | 1 chunk × inner |
+
+  Quality unaffected (val_avg_cost trajectories near-identical across variants within ±0.05 RNG noise). Modal entrypoint: `run_mcts_batch_size_sweep`. App: `bvcfdjbtb`.
+
+  **Action taken**: changed `--mcts_batch_size` default 64 → **1000** in [train_alphazero.py:139](src/scripts/train_alphazero.py#L139). Future Stage 4 runs at production M=1000 inherit ~5× wall-clock reduction automatically. Existing in-flight runs (F.6.1.4.c chain) unaffected — they continue at the OLD default for their remaining iters.
+
+  **Implications**: a 100-iter F.6.x run that previously took ~110 min mcts wall now takes ~22 min. This significantly tightens the experimental loop: a 50-iter resume drops from ~55 min → ~11 min. Combined with the F.6.1.4.b finding (lr=1e-4 unlocks improvement past iter 127), we can now run the chain F.6.1.3 → F.6.1.4 → F.6.1.4.b → F.6.1.4.c in ~60 min instead of ~5 hours.
+
+  **Companion M2000 probe** (Modal entrypoint `run_M2000_bsz2000_probe`; same recipe + M=2000, mcts_batch_size=2000, buffer=10000): mean mcts_s/iter = **~46s** for 2000 instances/iter. Per-instance wall ~23ms (essentially same as the 25ms at M=1000 chunk=1000). Confirms GPU is no longer the bottleneck at chunk=1000+ on TSP-20. Doubling M doubles per-iter wall ~linearly (no free throughput win). Practical takeaway: **M=1000 + mcts_batch_size=1000 is the sweet spot for production**; M=2000 is a knob for sample-diversity exploration, not wall savings.
 
 - [ ] **F.6.3 Optional escalation paths** if 100-iter trajectory shows promise:
   - **F.6.3.a Continue to 1000 iters at K=100** (resume from F.6.1 final). ~6 h value_head / ~36 h rollout.

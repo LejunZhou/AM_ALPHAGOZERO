@@ -1427,6 +1427,214 @@ def run_f64_eps25_lr1e4_resume50(timestamp: str = "") -> None:
 
 
 @app.local_entrypoint()
+def run_mcts_batch_size_smoke(bsz: str = "512", timestamp: str = "") -> None:
+    """Quick 5-iter smoke at a non-default mcts_batch_size to verify GPU
+    saturation lever (analysis: see plan
+    `interesting-can-you-analyze-tidy-bubble.md`).
+
+    mcts_batch_size is the instance-parallelism CHUNK SIZE in
+    CppBatchMCTSSolver.solve_batch (NOT the per-NN-forward batch). With
+    M=1000 instances and the current default mcts_batch_size=64, each
+    coach iter sequentially processes 16 chunks. Bumping the chunk size
+    fewer-but-larger chunks AND larger NN-eval batches per call.
+
+    Recipe = F.6.1.3 eps=0.25 verbatim except n_iterations=5 and
+    --mcts_batch_size <bsz>. Cost: ~5 min wall, ~$0.20 credits.
+    """
+    from datetime import datetime, timezone
+    if not timestamp:
+        timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")
+
+    bsz_int = int(bsz)
+    run_name = f"mcts_bsz{bsz_int}_smoke_{timestamp}"
+    args = _f61_args(
+        run_name=run_name,
+        k=40,
+        buffer_capacity=5000,
+        lr_model="5e-4",
+        lr_decay="1.0",
+        temperature_schedule="step10",
+        dirichlet_epsilon="0.25",
+    )
+    idx = args.index("--n_iterations")
+    args[idx + 1] = "5"
+    args.extend(["--mcts_batch_size", str(bsz_int)])
+
+    print(f"[modal] launching mcts_batch_size smoke (bsz={bsz_int}, 5 iter)")
+    print(f"  {run_name}")
+    h = train_alphazero_remote.spawn(*args)
+    print(f"\n[modal] awaiting {run_name} (function_call_id={h.object_id}) ...", flush=True)
+    h.get()
+    print(f"[modal] {run_name} done.", flush=True)
+    print("[modal] download results with: modal volume get am-alphagozero-volume outputs/")
+
+
+@app.local_entrypoint()
+def run_mcts_batch_size_sweep(timestamp: str = "") -> None:
+    """4-variant sweep over mcts_batch_size at fixed F.6.1.3 eps=0.25 recipe.
+
+    Variants: {64, 256, 1000, 2000}. The 1000 variant equals M_instances (one
+    chunk per iter); 2000 is a sanity check that going past M doesn't break
+    anything (effectively a single chunk at min(2000, 1000)=1000 fill). Each
+    variant runs 10 iters; we read mean(mcts_s) over iters 1-9 (skip iter 0
+    due to first-iter overhead) to compare wall-clock saturation.
+
+    All other settings match F.6.1.3 eps=0.25 (step10, K=40, M=1000,
+    train_steps=200, buffer=5000, batch=512, lr=5e-4, val_seed=42).
+
+    Cost: ~$3-5 credits, ~30 min parallel wall. Goal: pick the chunk size
+    that minimizes mcts_s/iter; commit it as the new default in
+    train_alphazero.py.
+    """
+    from datetime import datetime, timezone
+    if not timestamp:
+        timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")
+
+    variants = [64, 256, 1000, 2000]
+    grid = []
+    for bsz in variants:
+        run_name = f"mcts_bsz{bsz}_sweep10iter_{timestamp}"
+        args = _f61_args(
+            run_name=run_name,
+            k=40,
+            buffer_capacity=5000,
+            lr_model="5e-4",
+            lr_decay="1.0",
+            temperature_schedule="step10",
+            dirichlet_epsilon="0.25",
+        )
+        idx = args.index("--n_iterations")
+        args[idx + 1] = "10"
+        args.extend(["--mcts_batch_size", str(bsz)])
+        grid.append((run_name, args))
+
+    print(f"[modal] launching {len(grid)} parallel mcts_batch_size sweep jobs (10 iter each)")
+    for label, _ in grid:
+        print(f"  {label}")
+
+    handles = {label: train_alphazero_remote.spawn(*args) for label, args in grid}
+    print(f"\n[modal] all {len(handles)} jobs spawned. Awaiting completion...")
+    for label, h in handles.items():
+        print(f"[modal] awaiting {label} (function_call_id={h.object_id}) ...", flush=True)
+        h.get()
+        print(f"[modal] {label} done.", flush=True)
+    print(f"\n[modal] all {len(handles)} mcts_batch_size sweep jobs complete.")
+    print("[modal] download results with: modal volume get am-alphagozero-volume outputs/")
+
+
+@app.local_entrypoint()
+def run_M2000_bsz2000_probe(timestamp: str = "") -> None:
+    """High-M probe: M=2000, mcts_batch_size=2000, buffer=10000 (10 iters).
+
+    Rationale: with mcts_batch_size=1000 saturating at M=1000 (per the chunk-
+    size sweep), the GPU may have headroom for 2x larger batches. Doubling M
+    AND mcts_batch_size to 2000 tests whether we can double per-iter sample
+    throughput at roughly the same wall-clock — i.e., spend the saved wall
+    on 2x more fresh data per iter.
+
+    Buffer scaled to 10000 (was 5000) to keep the lifetime sample-per-tuple
+    window at 5 iters (10000 / 2000 = 5; same as 5000 / 1000 = 5 in the
+    baseline). This isolates the "more fresh data" effect from the "different
+    consume/produce ratio" effect.
+
+    All other settings = F.6.1.3 eps=0.25 (step10, K=40, train_steps=200,
+    batch=512, lr=5e-4, lr_decay=1.0, weight_decay=0, value_target_norm=none,
+    leaf_eval=value_head, gate=ttest gate_every=1, val_seed=42, no --load_path).
+
+    Reference points after 10 iters:
+    - mcts_bsz1000 (M=1000): predicted ~25-30s mcts_s/iter, ~20K instances.
+    - This run (M=2000): predicted similar mcts_s/iter (GPU not saturated at 1000),
+      but 2x throughput → ~40K instances seen in 10 iters.
+
+    Cost: ~$1-2 Modal credits, ~10 min wall single A10.
+    """
+    from datetime import datetime, timezone
+    if not timestamp:
+        timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")
+
+    run_name = f"M2000_bsz2000_buf10k_10iter_{timestamp}"
+    args = _f61_args(
+        run_name=run_name,
+        k=40,
+        buffer_capacity=10000,
+        lr_model="5e-4",
+        lr_decay="1.0",
+        temperature_schedule="step10",
+        dirichlet_epsilon="0.25",
+    )
+    # Override n_iterations to 10 and M_instances to 2000.
+    idx = args.index("--n_iterations")
+    args[idx + 1] = "10"
+    idx_m = args.index("--M_instances")
+    args[idx_m + 1] = "2000"
+    args.extend(["--mcts_batch_size", "2000"])
+
+    print(f"[modal] launching M=2000 + mcts_batch_size=2000 + buffer=10000 (10 iter)")
+    print(f"  {run_name}")
+    h = train_alphazero_remote.spawn(*args)
+    print(f"\n[modal] awaiting {run_name} (function_call_id={h.object_id}) ...", flush=True)
+    h.get()
+    print(f"[modal] {run_name} done.", flush=True)
+    print("[modal] download results with: modal volume get am-alphagozero-volume outputs/")
+
+
+@app.local_entrypoint()
+def run_f64c_eps25_lr1e4_resume50_chain(timestamp: str = "") -> None:
+    """Phase F.6.1.4.c — chain another +50 iter at lr=1e-4 from F.6.1.4.b's
+    iter-199.pt.
+
+    F.6.1.4.b dropped lr from 5e-4 to 1e-4 and immediately broke the iter-127
+    saturation: 10 gate accepts in 35 iters, val_avg_cost 3.8665 -> 3.8514
+    (last accept iter 184). Then 15 consecutive rejects iter 185-199 -> looks
+    like a new (lower) saturation point under lr=1e-4. F.6.1.4.c tests whether
+    another +50 at the same lr=1e-4 produces further improvement (chain
+    continues), or stalls (suggests further lr decay needed).
+
+    Same recipe as F.6.1.4.b verbatim (step10, eps=0.25, K=40, M=1000,
+    train_steps=200, buffer=5000, batch=512, value_target_norm=none,
+    leaf_eval=value_head, gate=ttest gate_every=1, val_seed=42, lr=1e-4,
+    wd=0). Iter range 200 -> 249. Output:
+    `outputs/tsp_20/f62_step10_eps25_resume50_lr1e4_chain_<ts>_*/`.
+
+    First production run on the new uv-built Modal image (uv_sync replaced
+    pip_install in the previous commit).
+
+    Cost: ~$5-7 Modal credits, ~75 min wall-clock single A10.
+    """
+    from datetime import datetime, timezone
+    if not timestamp:
+        timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")
+
+    resume_from = (
+        "outputs/tsp_20/"
+        "f62_step10_eps25_resume50_lr1e4_20260507T063714_20260507T063723/iter-199.pt"
+    )
+    run_name = f"f62_step10_eps25_resume50_lr1e4_chain_{timestamp}"
+    args = _f61_args(
+        run_name=run_name,
+        k=40,
+        buffer_capacity=5000,
+        lr_model="1e-4",
+        lr_decay="1.0",
+        temperature_schedule="step10",
+        dirichlet_epsilon="0.25",
+    )
+    idx = args.index("--n_iterations")
+    args[idx + 1] = "50"
+    args.extend(["--resume_from", resume_from])
+
+    print(f"[modal] launching F.6.1.4.c chain resume (+50 iter at lr=1e-4) from F.6.1.4.b iter-199.pt")
+    print(f"  {run_name}")
+    print(f"  resume_from={resume_from}")
+    print(f"  iter range: 200 -> 249")
+    h = train_alphazero_remote.spawn(*args)
+    print(f"\n[modal] awaiting {run_name} (function_call_id={h.object_id}) ...", flush=True)
+    h.get()
+    print(f"[modal] {run_name} done.", flush=True)
+    print("[modal] download results with: modal volume get am-alphagozero-volume outputs/")
+
+
+@app.local_entrypoint()
 def run_f63_kbracket_step10_eps25(timestamp: str = "") -> None:
     """Phase F.6.1.5 (a.k.a. F.6.3 step10) — F.6.1.3 ε=0.25 recipe with the
     K-step-bracket schedule replacing constant K=40.

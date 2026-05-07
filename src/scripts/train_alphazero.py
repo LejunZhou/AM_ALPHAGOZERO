@@ -136,8 +136,15 @@ def parse_opts(argv=None):
     parser.add_argument('--seed', type=int, default=1234)
     parser.add_argument('--max_grad_norm', type=float, default=1.0,
                         help='Gradient-norm clip (0 disables).')
-    parser.add_argument('--mcts_batch_size', type=int, default=64,
-                        help='Cross-instance batch for CppBatchMCTSSolver.')
+    parser.add_argument('--mcts_batch_size', type=int, default=1000,
+                        help='Instance-parallelism CHUNK SIZE in '
+                             'CppBatchMCTSSolver.solve_batch (NOT the per-NN-forward '
+                             'batch). Each iter processes ceil(M / mcts_batch_size) '
+                             'sequential chunks; cross-instance NN-batching pools '
+                             'requests within a chunk. With M=1000 (default), '
+                             'mcts_batch_size=1000 means 1 chunk per iter at full GPU '
+                             'parallelism — ~5x faster than the prior default of 64. '
+                             'See _progress/stage4_progress.md for the sweep result.')
     parser.add_argument('--bl_alpha', type=float, default=0.05,
                         help='Significance level for the gating paired t-test.')
     parser.add_argument('--no_progress_bar', action='store_true')
