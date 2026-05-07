@@ -72,6 +72,22 @@ std::vector<unsigned char> sequence_to_bools(py::handle handle) {
 Config Config::from_python(py::dict cfg) {
   Config out;
   out.n_simulations = get_or<int>(cfg, "n_simulations", out.n_simulations);
+  // Per-tour-step K override. Empty list (or absent) = no override.
+  if (cfg.contains("n_simulations_per_step")) {
+    py::handle h = cfg["n_simulations_per_step"];
+    if (!h.is_none()) {
+      py::sequence seq = py::reinterpret_borrow<py::sequence>(h);
+      out.n_simulations_per_step.clear();
+      out.n_simulations_per_step.reserve(static_cast<std::size_t>(py::len(seq)));
+      for (py::handle item : seq) {
+        const int k = py::cast<int>(item);
+        if (k < 1) {
+          throw std::runtime_error("n_simulations_per_step entries must be >= 1");
+        }
+        out.n_simulations_per_step.push_back(k);
+      }
+    }
+  }
   out.simulation_batch_size = get_or<int>(cfg, "simulation_batch_size", out.simulation_batch_size);
   out.virtual_loss_weight = get_or<double>(cfg, "virtual_loss_weight", out.virtual_loss_weight);
   out.virtual_loss_margin = get_or<double>(cfg, "virtual_loss_margin", out.virtual_loss_margin);
@@ -227,6 +243,11 @@ py::dict Solver::solve_instance(std::shared_ptr<const std::vector<double>> coord
                                 double bl_val) {
   counters_ = Counters{};
   tau_per_step_ = build_tau_per_step(cfg_, n);
+  if (!cfg_.n_simulations_per_step.empty() &&
+      static_cast<int>(cfg_.n_simulations_per_step.size()) != n) {
+    throw std::runtime_error(
+        "n_simulations_per_step length does not match graph size n");
+  }
   TspState state = TspState::initial(std::move(coords), n);
   std::unique_ptr<Node> root;
   std::vector<int> tour;
@@ -253,12 +274,17 @@ py::dict Solver::solve_instance(std::shared_ptr<const std::vector<double>> coord
       apply_dirichlet(*root);
     }
 
+    // Per-tour-step K override (Stage 4 F.6.1.5+).
+    const int step = static_cast<int>(tour.size());
+    const int k_t = cfg_.n_simulations_per_step.empty()
+                        ? cfg_.n_simulations
+                        : cfg_.n_simulations_per_step[static_cast<std::size_t>(step)];
     if (cfg_.simulation_batch_size == 1) {
-      for (int i = 0; i < cfg_.n_simulations; ++i) {
+      for (int i = 0; i < k_t; ++i) {
         simulate(*root, bl_val);
       }
     } else {
-      simulate_batched(*root, bl_val);
+      simulate_batched(*root, bl_val, k_t);
     }
 
     counters_.max_virtual_visits_remaining =
@@ -598,10 +624,10 @@ void Solver::simulate(Node& root, double bl_val) {
   }
 }
 
-void Solver::simulate_batched(Node& root, double bl_val) {
+void Solver::simulate_batched(Node& root, double bl_val, int n_sims) {
   int completed = 0;
-  while (completed < cfg_.n_simulations) {
-    const int target = std::min(cfg_.simulation_batch_size, cfg_.n_simulations - completed);
+  while (completed < n_sims) {
+    const int target = std::min(cfg_.simulation_batch_size, n_sims - completed);
     std::vector<PendingSimulation> pending;
     pending.reserve(static_cast<std::size_t>(target));
 
@@ -1224,7 +1250,13 @@ struct BatchInstance {
         bl_val(bl_val_),
         state(TspState::initial(std::move(coords), n)),
         rng(cfg.seed),
-        tau_per_step(build_tau_per_step(cfg, n)) {}
+        tau_per_step(build_tau_per_step(cfg, n)) {
+    if (!cfg.n_simulations_per_step.empty() &&
+        static_cast<int>(cfg.n_simulations_per_step.size()) != n) {
+      throw std::runtime_error(
+          "n_simulations_per_step length does not match graph size n");
+    }
+  }
 
   py::object collect_request(int slot) {
     if (pending_kind != BatchPendingKind::None) {
@@ -1253,7 +1285,12 @@ struct BatchInstance {
         dirichlet_applied = true;
       }
 
-      while (simulations_done < cfg.n_simulations) {
+      // Per-tour-step K override (Stage 4 F.6.1.5+).
+      const int k_t = cfg.n_simulations_per_step.empty()
+                          ? cfg.n_simulations
+                          : cfg.n_simulations_per_step[
+                                static_cast<std::size_t>(tour.size())];
+      while (simulations_done < k_t) {
         std::vector<PathEntry> path;
         Node* node = root.get();
 

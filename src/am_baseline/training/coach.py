@@ -531,6 +531,7 @@ def make_self_play_config(
     dirichlet_alpha_factor: float = 10.0,
     temperature_schedule: str = 'step30',
     value_target_norm: str = 'bl',
+    n_simulations_per_step=None,
 ):
     """AlphaGo-Zero-style self-play preset.
 
@@ -559,6 +560,10 @@ def make_self_play_config(
     from am_baseline.search.mcts import MCTSConfig
     cfg = MCTSConfig(
         n_simulations=n_simulations,
+        n_simulations_per_step=(
+            tuple(int(k) for k in n_simulations_per_step)
+            if n_simulations_per_step else None
+        ),
         leaf_eval=leaf_eval,
         value_norm='bl',
         value_target_norm=value_target_norm,
@@ -1079,6 +1084,7 @@ class MCTSCoach:
                 dirichlet_alpha_factor=float(getattr(opts, 'dirichlet_alpha_factor', 10.0)),
                 temperature_schedule=str(getattr(opts, 'temperature_schedule', 'step30')),
                 value_target_norm=str(getattr(opts, 'value_target_norm', 'bl')),
+                n_simulations_per_step=getattr(opts, 'n_simulations_per_step', None),
             )
             records = generate_self_play_batch(
                 self.best_model,

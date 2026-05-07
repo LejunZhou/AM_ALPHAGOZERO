@@ -221,6 +221,14 @@ class CppMCTSSolver:
                 f"unsupported temperature_schedule for C++ backend: {sched!r}"
             )
         cfg["temperature_schedule"] = self._SCHEDULE_TO_INT[sched]
+        # Per-tour-step K override: marshal to a list of ints (or empty list
+        # if None / empty). The C++ side uses an empty vector as the
+        # "no override" sentinel (falls back to scalar n_simulations).
+        per_step = cfg.get("n_simulations_per_step")
+        if per_step is None:
+            cfg["n_simulations_per_step"] = []
+        else:
+            cfg["n_simulations_per_step"] = [int(k) for k in per_step]
         return cfg
 
     def _make_evaluators(

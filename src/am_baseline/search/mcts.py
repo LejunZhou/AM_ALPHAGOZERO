@@ -19,7 +19,7 @@ Correctness invariants (verified in unit tests):
 """
 import math
 from dataclasses import dataclass
-from typing import Optional, Tuple
+from typing import Optional, Sequence, Tuple
 
 import numpy as np
 import torch
@@ -35,6 +35,17 @@ from am_baseline.search.tree import MCTSNode
 class MCTSConfig:
     # --- search budget / exploration ---
     n_simulations: int = 200
+    # Per-tour-step K override (Stage 4 F.6.1.5+). When None, every root step
+    # uses the scalar `n_simulations` above. When set, must be a length-N
+    # sequence; element t gives the number of MCTS simulations at tour-step t.
+    # Empty list is treated identically to None (matches the C++ side, which
+    # uses `vector::empty()` as the "no override" sentinel).
+    # Use case: TSP first-step is rotation-invariant (all initial cities yield
+    # the same optimal tour cost); the last step is forced. Allocating fewer
+    # simulations to those steps and more to the structurally-decisive
+    # mid-tour steps trims wasted compute. See `_plans/stage4_progress.md`
+    # F.6.1.5 entry for the F.6.1.3-derived schedule.
+    n_simulations_per_step: Optional[Sequence[int]] = None
     simulation_batch_size: int = 1            # C++ backend only; 1 = sequential reference
     virtual_loss_weight: float = 3.0          # C++ batched mode only; 0 = virtual visits only
     virtual_loss_margin: float = 0.5          # temporary Q penalty per pending edge
@@ -191,6 +202,13 @@ class MCTSSolver:
                 f"cfg.temperature_schedule={cfg.temperature_schedule!r} "
                 f"not in {cls.VALID_TEMPERATURE_SCHEDULE}"
             )
+        if cfg.n_simulations_per_step is not None and len(cfg.n_simulations_per_step) > 0:
+            ks = list(cfg.n_simulations_per_step)
+            for t, k in enumerate(ks):
+                if int(k) < 1:
+                    raise ValueError(
+                        f"cfg.n_simulations_per_step[{t}]={k} must be >= 1"
+                    )
         if cfg.leaf_eval == 'value_head' and model.value_head is None:
             raise ValueError(
                 "cfg.leaf_eval='value_head' but model has no value_head. "
@@ -281,7 +299,23 @@ class MCTSSolver:
             if self.cfg.dirichlet_epsilon > 0 and not root.is_terminal():
                 self._apply_dirichlet(root)
 
-            for _ in range(self.cfg.n_simulations):
+            # Per-step K override: cfg.n_simulations_per_step[step] takes
+            # precedence over the scalar cfg.n_simulations when set.
+            if (
+                self.cfg.n_simulations_per_step is not None
+                and len(self.cfg.n_simulations_per_step) > 0
+            ):
+                step_idx = int(state.i.item()) if state.i.numel() == 1 else int(state.i[0].item())
+                if step_idx >= len(self.cfg.n_simulations_per_step):
+                    raise IndexError(
+                        f"n_simulations_per_step has length "
+                        f"{len(self.cfg.n_simulations_per_step)} but solve_instance "
+                        f"reached step {step_idx}"
+                    )
+                k_t = int(self.cfg.n_simulations_per_step[step_idx])
+            else:
+                k_t = int(self.cfg.n_simulations)
+            for _ in range(k_t):
                 self._simulate(root, fixed, bl_val)
 
             a = self._pick_root_action(root)

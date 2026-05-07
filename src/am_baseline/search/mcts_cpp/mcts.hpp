@@ -15,6 +15,11 @@ namespace py = pybind11;
 
 struct Config {
   int n_simulations = 200;
+  // Per-tour-step K override (Stage 4 F.6.1.5+). Empty vector means "no
+  // override; use n_simulations everywhere". When non-empty, must have
+  // length == graph_size; element t gives the simulation count at tour-step
+  // t. Mirrors `MCTSConfig.n_simulations_per_step` on the Python side.
+  std::vector<int> n_simulations_per_step;
   int simulation_batch_size = 1;
   double virtual_loss_weight = 3.0;
   double virtual_loss_margin = 0.5;
@@ -140,7 +145,7 @@ class Solver {
   double convert_value_head_output(double v_raw, int n, double bl_val) const;
   std::vector<double> rollout_many_remaining_real(const std::vector<TspState>& states);
   void simulate(Node& root, double bl_val);
-  void simulate_batched(Node& root, double bl_val);
+  void simulate_batched(Node& root, double bl_val, int n_sims);
   bool collect_pending(Node& root, double bl_val, PendingSimulation& pending);
   void evaluate_pending(std::vector<PendingSimulation>& pending, double bl_val);
   void backup_pending(PendingSimulation& pending, double value_for_backup);

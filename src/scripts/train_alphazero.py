@@ -56,7 +56,25 @@ def parse_opts(argv=None):
     parser.add_argument('--M_instances', type=int, default=1000,
                         help='Self-play instances generated per iteration.')
     parser.add_argument('--n_simulations_train', type=int, default=50,
-                        help='K — MCTS simulations per root during self-play.')
+                        help='K — MCTS simulations per root during self-play. When '
+                             '`--n_simulations_schedule step_bracket` is set, this '
+                             'value is K_mid (the high-K bucket for tour-steps 1..N/2).')
+    parser.add_argument('--n_simulations_schedule', type=str, default='const',
+                        choices=['const', 'step_bracket'],
+                        help='K-per-step schedule. `const` uses --n_simulations_train '
+                             'at every tour-step (existing behavior). `step_bracket` '
+                             'uses K(0)=--n_simulations_first, K(1..N/2)=--n_simulations_train, '
+                             'K(N/2+1..N-2)=--n_simulations_late, K(N-1)=--n_simulations_last. '
+                             'Motivation: TSP first-step is rotation-invariant (all '
+                             'starting cities yield the same optimal tour cost), and '
+                             'the last step is forced — both deserve fewer sims. See '
+                             '_progress/stage4_progress.md F.6.1.5.')
+    parser.add_argument('--n_simulations_first', type=int, default=5,
+                        help='K at tour-step 0 when schedule=step_bracket.')
+    parser.add_argument('--n_simulations_late', type=int, default=10,
+                        help='K at tour-steps N/2+1..N-2 when schedule=step_bracket.')
+    parser.add_argument('--n_simulations_last', type=int, default=1,
+                        help='K at tour-step N-1 (forced) when schedule=step_bracket.')
     parser.add_argument('--buffer_capacity', type=int, default=200000,
                         help='Replay buffer capacity in instances. AGZ-proportional '
                              'pilot uses 50_000 (~50-iter window); main run uses 200_000.')
@@ -193,6 +211,37 @@ def _finalize_opts(opts):
         opts.lr_critic = 1e-4
     if not hasattr(opts, 'lr_decay'):
         opts.lr_decay = 1.0
+
+    # Resolve --n_simulations_schedule into a concrete length-N list which
+    # MCTSCoach.learn forwards to make_self_play_config (and on into
+    # MCTSConfig.n_simulations_per_step). None = scalar n_simulations_train
+    # used at every tour-step (existing behavior).
+    sched = getattr(opts, 'n_simulations_schedule', 'const')
+    if sched == 'const':
+        opts.n_simulations_per_step = None
+    elif sched == 'step_bracket':
+        N = int(opts.graph_size)
+        K_first = int(opts.n_simulations_first)
+        K_mid = int(opts.n_simulations_train)
+        K_late = int(opts.n_simulations_late)
+        K_last = int(opts.n_simulations_last)
+        if N <= 1:
+            opts.n_simulations_per_step = [K_first]
+        else:
+            mid_cutoff = N // 2  # high bucket includes t=N//2 (Interpretation A)
+            schedule = []
+            for t in range(N):
+                if t == 0:
+                    schedule.append(K_first)
+                elif t == N - 1:
+                    schedule.append(K_last)
+                elif t <= mid_cutoff:
+                    schedule.append(K_mid)
+                else:
+                    schedule.append(K_late)
+            opts.n_simulations_per_step = schedule
+    else:
+        raise ValueError(f"Unknown n_simulations_schedule: {sched!r}")
     return opts
 
 
@@ -251,6 +300,25 @@ def run(opts):
     if opts.resume_from is not None:
         print(f'  [*] Resuming Stage 4 coach from {opts.resume_from}')
         coach.load_checkpoint(opts.resume_from)
+
+        # `optimizer.load_state_dict` restores the saved lr (which becomes the
+        # scheduler's `initial_lr` baseline). Without this override, the
+        # `--lr_model` CLI arg has no effect on a resumed run. So if the user
+        # passed an `--lr_model` that differs from the saved value, force it
+        # into both the optimizer's current `lr`/`initial_lr` AND the scheduler's
+        # `base_lrs` so subsequent `scheduler.step()` calls use the new base.
+        new_lr = float(opts.lr_model)
+        loaded_lr = float(coach.optimizer.param_groups[0]['lr'])
+        if abs(new_lr - loaded_lr) > 1e-12:
+            print(f'  [*] Overriding loaded lr {loaded_lr:.2e} → {new_lr:.2e} '
+                  f'(from --lr_model)')
+            for pg in coach.optimizer.param_groups:
+                pg['lr'] = new_lr
+                pg['initial_lr'] = new_lr
+            if hasattr(coach, 'lr_scheduler') and hasattr(coach.lr_scheduler, 'base_lrs'):
+                coach.lr_scheduler.base_lrs = (
+                    [new_lr] * len(coach.lr_scheduler.base_lrs)
+                )
 
     # ---- Step 6: Run the loop -----------------------------------------------
     try:

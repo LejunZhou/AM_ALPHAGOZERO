@@ -1054,6 +1054,10 @@ def _f61_args(
     lr_decay: str = "1.0",
     temperature_schedule: str = "step30",
     dirichlet_epsilon: str = "0.0",
+    n_simulations_schedule: str = "const",
+    n_simulations_first: int = 5,
+    n_simulations_late: int = 10,
+    n_simulations_last: int = 1,
 ) -> list[str]:
     """Shared F.6.1 main-run config builder. Defaults to F.6.0.6/F.6.0.7 winners.
 
@@ -1066,7 +1070,7 @@ def _f61_args(
     F.6.2 step10 + ε-sweep variants can reuse this builder without
     duplicating the rest of the recipe.
     """
-    return [
+    args = [
         "--graph_size", "20",
         "--n_iterations", "100",
         "--M_instances", "1000",
@@ -1091,6 +1095,14 @@ def _f61_args(
         "--wandb_mode", "online",
         "--run_name", run_name,
     ]
+    if n_simulations_schedule != "const":
+        args.extend([
+            "--n_simulations_schedule", n_simulations_schedule,
+            "--n_simulations_first", str(n_simulations_first),
+            "--n_simulations_late", str(n_simulations_late),
+            "--n_simulations_last", str(n_simulations_last),
+        ])
+    return args
 
 
 @app.local_entrypoint()
@@ -1349,6 +1361,119 @@ def run_f62_eps25_resume50(timestamp: str = "") -> None:
     print(f"[modal] launching F.6.2 ε=0.25 resume (+50 iter, target 100→149) from iter-99.pt")
     print(f"  {run_name}")
     print(f"  resume_from={resume_from}")
+    h = train_alphazero_remote.spawn(*args)
+    print(f"\n[modal] awaiting {run_name} (function_call_id={h.object_id}) ...", flush=True)
+    h.get()
+    print(f"[modal] {run_name} done.", flush=True)
+    print("[modal] download results with: modal volume get am-alphagozero-volume outputs/")
+
+
+@app.local_entrypoint()
+def run_f64_eps25_lr1e4_resume50(timestamp: str = "") -> None:
+    """Resume F.6.1.4 (f62_step10_eps25_resume50_*) from iter-149.pt for +50
+    more iterations at lr=1e-4 (down from 5e-4).
+
+    Diagnostic motivation: F.6.1.4 last gate accept was at iter 127 (val=3.866);
+    iter 128-149 stalled (gate rejected every time). Working-model val_avg_cost
+    bounced 3.866-3.883 across those 22 rejected iters — neither degrading
+    nor improving past iter 127.
+
+    Hypothesis: at iter 127 the policy is close enough to a fixed point that
+    lr=5e-4 is overshooting per-iter. A smaller lr=1e-4 might let the model
+    refine into a tighter optimum without the gradient noise that's been
+    knocking it around. (lr=1e-4 was the AM/Stage 1 canonical; the F.6.0.5
+    derivation that picked 5e-4 was for from-scratch random-init drift, which
+    no longer applies at the F.6.1.4 endpoint.)
+
+    train_alphazero.py now honors --lr_model on a resumed run by overriding
+    the optimizer's loaded lr + the LambdaLR base_lrs (added 2026-05-07; was
+    previously a silent no-op because optimizer.load_state_dict restores the
+    saved lr).
+
+    Cost: ~$5-7 Modal credits, ~75 min wall-clock single A10. Outputs to
+    `outputs/tsp_20/f62_step10_eps25_resume50_lr1e4_<timestamp>_*/`.
+    """
+    from datetime import datetime, timezone
+    if not timestamp:
+        timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")
+
+    resume_from = (
+        "outputs/tsp_20/"
+        "f62_step10_eps25_resume50_20260507T052131_20260507T052139/iter-149.pt"
+    )
+    run_name = f"f62_step10_eps25_resume50_lr1e4_{timestamp}"
+    args = _f61_args(
+        run_name=run_name,
+        k=40,
+        buffer_capacity=5000,
+        lr_model="1e-4",                  # ← KEY: dropped from 5e-4
+        lr_decay="1.0",
+        temperature_schedule="step10",
+        dirichlet_epsilon="0.25",
+    )
+    idx = args.index("--n_iterations")
+    args[idx + 1] = "50"
+    args.extend(["--resume_from", resume_from])
+
+    print(f"[modal] launching F.6.1.4.b ε=0.25 +50 iter resume at lr=1e-4 (from iter-149.pt)")
+    print(f"  {run_name}")
+    print(f"  resume_from={resume_from}")
+    print(f"  lr override: 5e-4 → 1e-4 (applied AFTER load_checkpoint)")
+    h = train_alphazero_remote.spawn(*args)
+    print(f"\n[modal] awaiting {run_name} (function_call_id={h.object_id}) ...", flush=True)
+    h.get()
+    print(f"[modal] {run_name} done.", flush=True)
+    print("[modal] download results with: modal volume get am-alphagozero-volume outputs/")
+
+
+@app.local_entrypoint()
+def run_f63_kbracket_step10_eps25(timestamp: str = "") -> None:
+    """Phase F.6.1.5 (a.k.a. F.6.3 step10) — F.6.1.3 ε=0.25 recipe with the
+    K-step-bracket schedule replacing constant K=40.
+
+    Hypothesis: TSP tour cost is invariant under cyclic rotation, so MCTS at
+    t=0 has no optimal-value signal — all 20 starting cities yield the same
+    optimal tour. Spending K=40 sims at t=0 is mostly wasted compute. The
+    last step (t=N-1) is forced. Mid-tour steps are where decisions matter.
+
+    K schedule (TSP-20, "Interpretation A" — high bucket includes midpoint):
+      K(0)        = 5     # rotation-symmetric, just produce ~uniform π_t
+      K(1..10)    = 40    # mid-tour, real decisions
+      K(11..18)   = 10    # late-tour, narrowing search space
+      K(19)       = 1     # forced (one legal action)
+    Total = 5 + 10·40 + 8·10 + 1 = 486 sims/instance vs 800 for constant K=40
+    (~40% cheaper per iter — not budget-matched; the schedule both
+    redistributes AND saves compute).
+
+    All other settings = F.6.1.3 ε=0.25 (step10, M=1000, train_steps=200,
+    buffer=5000, batch=512, lr=5e-4 const, wd=0, value_target_norm=none,
+    leaf_eval=value_head, gate=ttest gate_every=1, val_seed=42, 100 iter
+    from-scratch). Carries the per-loss + value-grad VH/shared telemetry.
+
+    Cost: ~$5-7 Modal credits, ~75 min wall-clock single A10.
+    """
+    from datetime import datetime, timezone
+    if not timestamp:
+        timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")
+
+    run_name = f"f63_kbracket_step10_eps25_{timestamp}"
+    args = _f61_args(
+        run_name=run_name,
+        k=40,                          # K_mid — high bucket (1..N/2)
+        buffer_capacity=5000,
+        lr_model="5e-4",
+        lr_decay="1.0",
+        temperature_schedule="step10",
+        dirichlet_epsilon="0.25",
+        n_simulations_schedule="step_bracket",
+        n_simulations_first=5,
+        n_simulations_late=10,
+        n_simulations_last=1,
+    )
+
+    print(f"[modal] launching F.6.1.5 K-bracket schedule + step10 + ε=0.25 (100 iter)")
+    print(f"  {run_name}")
+    print(f"  K schedule: 5, 40 (×10), 10 (×8), 1  →  486 sims/instance/iter")
     h = train_alphazero_remote.spawn(*args)
     print(f"\n[modal] awaiting {run_name} (function_call_id={h.object_id}) ...", flush=True)
     h.get()
