@@ -1526,6 +1526,61 @@ def run_mcts_batch_size_sweep(timestamp: str = "") -> None:
 
 
 @app.local_entrypoint()
+def run_tsp50_k50_resume50(timestamp: str = "") -> None:
+    """Resume the TSP-50 K=50 ablation winner (iter 19 = val 6.651) for +50
+    more iterations (iter 20 -> 69) at the same recipe.
+
+    Hypothesis: K=50 was descending smoothly through iter 19 (6.65, still
+    accepting late). Continuing for 50 more iters at the same lr=5e-4 const
+    (lr_decay step boundary at iter 100 not reached) should drive val below
+    6.0 and clarify whether the lr=1e-4 transition (at iter 100 in the
+    eventual main run) is the right next lever for TSP-50.
+
+    Same recipe verbatim: K=50, M=1000, train_steps=200, buffer=5000,
+    batch=512, lr=5e-4, lr_decay=0.2 step_size=100 (won't trigger at 50
+    more iters), step10, eps=0.25, value_target_norm=none,
+    leaf_eval=value_head, gate=ttest gate_every=1, val_seed=42,
+    mcts_batch_size=1000.
+
+    Cost: ~50 iter * ~155s/iter = ~130 min wall, ~$5-7 credits.
+    """
+    from datetime import datetime, timezone
+    if not timestamp:
+        timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")
+
+    resume_from = (
+        "outputs/tsp_50/"
+        "tsp50_k50_compare_20iter_20260507T104500_20260507T104508/iter-19.pt"
+    )
+    run_name = f"tsp50_k50_resume50_{timestamp}"
+    args = _f61_args(
+        run_name=run_name,
+        k=50,
+        buffer_capacity=5000,
+        lr_model="5e-4",
+        lr_decay="0.2",
+        lr_decay_step_size=100,
+        temperature_schedule="step10",
+        dirichlet_epsilon="0.25",
+    )
+    # Override graph_size 20 -> 50 and n_iterations 100 -> 50.
+    idx_g = args.index("--graph_size")
+    args[idx_g + 1] = "50"
+    idx_n = args.index("--n_iterations")
+    args[idx_n + 1] = "50"
+    args.extend(["--resume_from", resume_from])
+
+    print(f"[modal] launching TSP-50 K=50 resume +50 iter (iter 20 -> 69)")
+    print(f"  {run_name}")
+    print(f"  resume_from={resume_from}")
+    h = train_alphazero_remote.spawn(*args)
+    print(f"\n[modal] awaiting {run_name} (function_call_id={h.object_id}) ...", flush=True)
+    h.get()
+    print(f"[modal] {run_name} done.", flush=True)
+    print("[modal] download results with: modal volume get am-alphagozero-volume outputs/")
+
+
+@app.local_entrypoint()
 def run_tsp50_k_compare_20iter(timestamp: str = "") -> None:
     """TSP-50 K-comparison ablation: K=50 vs K=100, 20 iters each, parallel.
 
