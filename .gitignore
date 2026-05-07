@@ -31,3 +31,6 @@ wandb/
 # Throwaway diagnostic scripts (not part of the project)
 scripts_tmp/
 .tmp/
+
+# uv local virtualenv (lockfile uv.lock IS committed for reproducibility)
+.venv/

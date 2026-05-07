@@ -76,24 +76,20 @@ def load_gitignore_patterns() -> list[str]:
     return patterns
 
 
-# Build container image: CUDA torch + project deps + C++ toolchain for the
-# pybind11 MCTS extension. The `pip install -e .` step compiles
-# _mcts_cpp.cp311-linux_x86_64.so against the project sources.
+# Build container image (refactored 2026-05-07: pip → uv).
+#   1. `uv_sync()` installs every locked dependency from uv.lock (torch + cu124,
+#      wandb, scipy, etc.) into the image's Python env. The lock file lives at
+#      the repo root and pins the cu124 torch wheels via the
+#      [tool.uv.sources] linux marker in pyproject.toml.
+#   2. `add_local_dir` copies the project sources to PROJECT_DIR — required at
+#      image-build time because step 3 needs the source files present.
+#   3. `pip install -e . --no-deps` installs OUR package (editable) at
+#      PROJECT_DIR/src/am_baseline and triggers the pybind11 build of the C++
+#      MCTS extension. `--no-deps` because uv_sync already provided everything.
 image = (
     modal.Image.debian_slim(python_version="3.11")
     .apt_install("build-essential", "g++", "make")
-    .pip_install(
-        "torch",
-        extra_index_url="https://download.pytorch.org/whl/cu124",
-    )
-    .pip_install(
-        "numpy",
-        "scipy",
-        "tqdm",
-        "matplotlib",
-        "wandb>=0.18.0",
-        "pybind11>=2.11",
-    )
+    .uv_sync()
 )
 
 if NETRC_PATH.is_file():
@@ -107,14 +103,13 @@ image = image.add_local_dir(
     ".",
     remote_path=PROJECT_DIR,
     ignore=load_gitignore_patterns(),
-    # copy=True is REQUIRED because we need a build step (pip install -e .)
-    # that runs AFTER the project sources are present. Modal's default mount
-    # behavior would only attach files at container start, after image build.
     copy=True,
 )
 
-# Build the C++ MCTS extension once at image-build time. setup.py already
-# branches on compiler type so `unix` flags (-O3 -std=c++17) are picked up.
+# Build the C++ MCTS extension once at image-build time on top of uv-installed
+# deps. setup.py uses pybind11 (already in build-system.requires) and emits
+# `_mcts_cpp.cp311-linux_x86_64.so` next to the source files at
+# PROJECT_DIR/src/am_baseline/search/mcts_cpp/.
 image = image.run_commands(
     [
         f"cd {PROJECT_DIR} && pip install -e . --no-deps",
