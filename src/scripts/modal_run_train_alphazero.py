@@ -1526,6 +1526,67 @@ def run_mcts_batch_size_sweep(timestamp: str = "") -> None:
 
 
 @app.local_entrypoint()
+def run_tsp50_k_compare_20iter(timestamp: str = "") -> None:
+    """TSP-50 K-comparison ablation: K=50 vs K=100, 20 iters each, parallel.
+
+    Quick decision-driver before committing to a multi-day TSP-50 main run.
+    Hypothesis: at TSP-50 with N=50 legal actions at step 0, K=50 gives
+    ~1 visit/action — very thin MCTS. K=100 gives ~2 visits/action; π_t
+    target quality may be materially better, justifying 2x per-iter wall.
+
+    Decision rule after 20 iters: pick the K with lower val_avg_cost at
+    iter 19. If K=100 wins by >=0.05 cost units, use K=100 for the
+    400-iter TSP-50 main run; otherwise stick with K=50.
+
+    All other settings = F.6.1.6 TSP-50 mapping (M=1000, train_steps=200,
+    batch=512, buffer=5000, lr=5e-4 const within 20 iters,
+    temperature_schedule=step10, eps=0.25, dirichlet_alpha_factor=10.0,
+    value_target_norm=none, leaf_eval=value_head, gate=ttest gate_every=1,
+    val_seed=42, mcts_batch_size=1000 default).
+
+    Per-iter wall predicted: ~100-120s (K=50), ~200-240s (K=100). Run
+    both in parallel -> ~70-80 min total wall, ~$8-12 credits.
+    """
+    from datetime import datetime, timezone
+    if not timestamp:
+        timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")
+
+    variants = [50, 100]
+    grid = []
+    for k in variants:
+        run_name = f"tsp50_k{k}_compare_20iter_{timestamp}"
+        args = _f61_args(
+            run_name=run_name,
+            k=k,
+            buffer_capacity=5000,
+            lr_model="5e-4",
+            lr_decay="0.2",
+            lr_decay_step_size=100,
+            temperature_schedule="step10",
+            dirichlet_epsilon="0.25",
+        )
+        # Override graph_size 20 -> 50 and n_iterations 100 -> 20.
+        idx_g = args.index("--graph_size")
+        args[idx_g + 1] = "50"
+        idx_n = args.index("--n_iterations")
+        args[idx_n + 1] = "20"
+        grid.append((run_name, args))
+
+    print(f"[modal] launching TSP-50 K-comparison ablation (K=50 vs K=100, 20 iter each)")
+    for label, _ in grid:
+        print(f"  {label}")
+
+    handles = {label: train_alphazero_remote.spawn(*args) for label, args in grid}
+    print(f"\n[modal] all {len(handles)} jobs spawned. Awaiting completion...")
+    for label, h in handles.items():
+        print(f"[modal] awaiting {label} (function_call_id={h.object_id}) ...", flush=True)
+        h.get()
+        print(f"[modal] {label} done.", flush=True)
+    print(f"\n[modal] all {len(handles)} TSP-50 K-comparison jobs complete.")
+    print("[modal] download results with: modal volume get am-alphagozero-volume outputs/")
+
+
+@app.local_entrypoint()
 def run_f616_400iter_step_decay(timestamp: str = "") -> None:
     """Phase F.6.1.6 — from-scratch 400-iter run with stepped lr decay.
 
