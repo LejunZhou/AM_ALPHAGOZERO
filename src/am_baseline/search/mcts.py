@@ -41,8 +41,9 @@ class MCTSConfig:
     c_puct: float = 0.05                      # routing sweet spot; AlphaGo's 1.0 is wrong here
     temperature: float = 0.0                  # 0 = argmax, >0 = sample from N^(1/τ)
     # Per-tour-step temperature schedule (Stage 4 Phase E).
-    # Accepts {None, 'const', 'step30', 'step50'}. Semantics:
+    # Accepts {None, 'const', 'step10', 'step30', 'step50'}. Semantics:
     #   None | 'const' : τ = cfg.temperature for all steps (preserves Stage 2/3 behavior).
+    #   'step10'       : τ = cfg.temperature for first ⌈0.1·N⌉ steps, τ = 0 thereafter.
     #   'step30'       : τ = cfg.temperature for first ⌈0.3·N⌉ steps, τ = 0 thereafter.
     #   'step50'       : τ = cfg.temperature for first ⌈0.5·N⌉ steps, τ = 0 thereafter.
     # Affects ONLY action-selection σ_t at the root; the stored visit dist π_t
@@ -116,7 +117,7 @@ class MCTSSolver:
     VALID_FPU_MODE = {'fallback', 'running_q', 'node_value'}
     VALID_ROOT_SELECT = {'visits', 'q'}
     # None and 'const' are treated identically (constant τ = cfg.temperature).
-    VALID_TEMPERATURE_SCHEDULE = {None, 'const', 'step30', 'step50'}
+    VALID_TEMPERATURE_SCHEDULE = {None, 'const', 'step10', 'step30', 'step50'}
 
     def __init__(self,
                  model: AttentionModel,
@@ -502,6 +503,7 @@ class MCTSSolver:
 
         Behavior (mirrored exactly in the C++ backend):
             - None or 'const' : τ = cfg.temperature for all steps (Stage 2/3 default).
+            - 'step10'        : τ = cfg.temperature for step < ⌈0.1·N⌉, else τ = 0.
             - 'step30'        : τ = cfg.temperature for step < ⌈0.3·N⌉, else τ = 0.
             - 'step50'        : τ = cfg.temperature for step < ⌈0.5·N⌉, else τ = 0.
 
@@ -513,6 +515,9 @@ class MCTSSolver:
         sched = cfg.temperature_schedule
         if sched is None or sched == 'const':
             return float(cfg.temperature)
+        if sched == 'step10':
+            cutoff = math.ceil(0.1 * n)
+            return float(cfg.temperature) if step < cutoff else 0.0
         if sched == 'step30':
             cutoff = math.ceil(0.3 * n)
             return float(cfg.temperature) if step < cutoff else 0.0

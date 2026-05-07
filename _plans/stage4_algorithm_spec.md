@@ -2,7 +2,7 @@
 
 **Companion to:** `_plans/stage4_plan.md` (engineering phases) and `_progress/stage4_progress.md` (run status).
 **Purpose:** mathematical / algorithmic description of the AlphaGo-Zero-style training loop Stage 4 implements, grounded in actual code paths and mapped 1-to-1 to AGZ paper equations.
-**Created:** 2026-04-30.
+**Created:** 2026-04-30. **Refined 2026-05-06** to reflect the F.6.0.5→F.6.1 locked recipe (lr=5e-4 / wd=0 / value_target_norm='none' / ε=0 / gate_every=1 / buffer=5000).
 
 ---
 
@@ -14,9 +14,9 @@ The Stage 4 plan (`_plans/stage4_plan.md`) describes the engineering work in pha
 - MCTS solvers in `src/am_baseline/search/mcts.py` + `mcts_cpp/`
 - PUCT selection in `src/am_baseline/search/puct.py:7-33`
 - Gating in `src/am_baseline/baseline/baselines.py:106-123`
-- Value normalization in `src/am_baseline/training/trainer.py:208-219`
+- Value normalization in `src/am_baseline/training/trainer.py` (per-state cost-to-go target with three normalization modes — see §3.5)
 
-It maps 1-to-1 onto the AlphaGo Zero paper (Silver et al., *Nature* 550, 354–359, 2017) eq. (1) + Methods §Search algorithm.
+It maps 1-to-1 onto the AlphaGo Zero paper (Silver et al., *Nature* 550, 354–359, 2017) eq. (1) + Methods §Search algorithm, with **four documented deviations from AGZ canonical** (Adam vs SGD-momentum, ε=0 vs 0.25, wd=0 vs 1e-4, raw value target vs bl-normalized) all empirically validated by the F.6.0.5+ ablation series.
 
 ---
 
@@ -24,7 +24,7 @@ It maps 1-to-1 onto the AlphaGo Zero paper (Silver et al., *Nature* 550, 354–3
 
 | Symbol | Meaning |
 |---|---|
-| $N$ | TSP graph size (= 20 in Stage 4) |
+| $N$ | TSP graph size (= 20 in Stage 4 main runs; F.6.1 TSP-50 probe extends to $N=50$) |
 | $s$ | partial-tour state (StateTSP NamedTuple — `loc, dist, first_a, prev_a, visited_, lengths, i`) |
 | $a$ | action = next-city index, $a \in \{0,\dots,N{-}1\}$, masked by `visited_` |
 | $\theta$ | network parameters (encoder + decoder + value head); trainer's working copy |
@@ -32,14 +32,16 @@ It maps 1-to-1 onto the AlphaGo Zero paper (Silver et al., *Nature* 550, 354–3
 | $f_\theta(s) \to (\mathbf{p}, v)$ | dual-head AM: $\mathbf{p} \in \Delta^{N-1}$ via softmax over decoder logits, $v \in \mathbb{R}$ from value head |
 | $\pi_t \in \Delta^{N-1}$ | **Training target** — temperature-1 normalized visit distribution at root of tour-step $t$, $\pi_t(a) = N(s_t,a)/\sum_b N(s_t,b)$ (raw normalized; richer than action-selection $\tau$-schedule, see §4.2) |
 | $\sigma_t \in \Delta^{N-1}$ | **Action-selection distribution** at tour-step $t$, $\sigma_t(a) \propto N(s_t,a)^{1/\tau_t}$ with `step30` $\tau$-schedule. The played action $a_t \sim \sigma_t$ |
-| $z_t \in \mathbb{R}_+$ | **Per-state value target** — V_CURRENT cost-to-go from partial state $s_t$, normalized by `bl_val`. Matches Stage 1's training target shape (see §3) |
+| $z_t \in \mathbb{R}_+$ | **Per-state value target** — V_CURRENT cost-to-go from partial state $s_t$. **Three normalization modes** via `--value_target_norm` ∈ {`bl`, `none`, `sqrt_n`}; F.6.1 default is `none` (raw cost-to-go, see §3.5). |
 | $\alpha_\theta$ | MCTS solver wrapping current $f_\theta$; given $s_0$, returns $(\text{tour}, z, \{\pi_t\}_{t=0}^{N-1})$ |
-| $\mathcal{D}$ | replay buffer: deque of instance records $\{(s_t, \pi_t, z)\}_{t=0}^{N-1}$ |
-| $K$ | MCTS simulations per move (50 pilot, 100 main) |
-| $M$ | self-play instances per iteration (= 1000) |
+| $\mathcal{D}$ | replay buffer: ring-buffer of instance records $\{(s_t, \pi_t, z_t)\}_{t=0}^{N-1}$, fixed capacity in *instances* (default 5000 = ~5-iter window at M=1000) |
+| $K$ | MCTS simulations per move (F.6.1 K=20 default; K=40 / K=50 also tested) |
+| $M$ | self-play instances per iteration (= 1000; F.6.1.0 confirmed this saturates per-iter train budget) |
 | $\tau$ | sampling temperature for MCTS root action selection |
 | $c_\text{puct}$ | PUCT exploration constant (= 0.05, Stage 2-locked) |
-| $\varepsilon, \alpha$ | Dirichlet noise weight and concentration ($\varepsilon=0.25$, $\alpha=10/N$) |
+| $\varepsilon, \alpha$ | Dirichlet noise weight and concentration. **F.6.1 default $\varepsilon=0$** (F.6.0.6 winner, stability-revised); ε=0.25 was AGZ inheritance and is dominated under V3 regime. $\alpha = 10/N$ retained ($\alpha N = 10$ matches AGZ effective concentration). |
+| $\eta, \mathrm{wd}$ | optimizer lr / weight decay. **F.6.1 default $\eta=5\times 10^{-4}$ Adam, $\mathrm{wd}=0$** (F.6.0.5b V3 winner). lr_decay schedule supported via `--lr_decay` (LambdaLR; default 1.0 = constant). |
+| $G$ | gate cadence in iters. **F.6.1 default $G=1$** (revised from earlier $G=5$ for best_model freshness — see §5). |
 
 ---
 
@@ -52,19 +54,26 @@ $$
 \begin{aligned}
 &\textbf{(1) Self-play.}\quad \text{Sample } M \text{ random TSP-}N \text{ instances } \{x^{(m)}\}_{m=1}^M,\ x^{(m)} \in [0,1]^{N\times 2}.\\
 &\quad\text{For each } m,\ \text{run } \alpha_{\theta^\star}(x^{(m)}) \to (\text{tour}^{(m)}, z^{(m)}, \{\pi_t^{(m)}\}_{t=0}^{N-1}). \\
-&\quad\text{Push records } \{(s_t^{(m)}, \pi_t^{(m)}, z^{(m)})\}_{m,t} \text{ into } \mathcal{D}.\\[4pt]
+&\quad\text{Push records } \{(s_t^{(m)}, \pi_t^{(m)}, z_t^{(m)})\}_{m,t} \text{ into } \mathcal{D};\ \mathcal{D} \text{ evicts oldest instance on overflow}.\\[4pt]
 &\textbf{(2) Train.}\quad \text{For } j = 1, \dots, J=\texttt{train\_steps\_per\_iter}: \\
-&\quad B \sim \text{Uniform}(\mathcal{D},\ |B|=\texttt{batch\_size})\\
-&\quad \theta \leftarrow \theta - \eta\, \nabla_\theta \mathcal{L}(\theta; B)\quad \text{(Adam, } \eta=10^{-4}, \text{wd}=10^{-4}\text{)}\\[4pt]
-&\textbf{(3) Gate.}\quad \text{If } (i+1) \bmod G = 0:\\
+&\quad B \sim \text{Stratified-by-step}(\mathcal{D},\ |B|=\texttt{batch\_size})\quad \text{(see §3.6)}\\
+&\quad \theta \leftarrow \theta - \eta_i\, \nabla_\theta \mathcal{L}(\theta; B)\quad \text{(Adam, } \eta_i=\eta_0\cdot \texttt{lr\_decay}^i, \text{wd}=0\text{)}\\[4pt]
+&\textbf{(3) Gate.}\quad \text{If } (i+1) \bmod G = 0\ \text{(F.6.1 default } G=1\text{)}:\\
 &\quad \text{accept} \leftarrow \text{Gate}(\theta, \theta^\star,\ \text{val\_size}=10000,\ \alpha=0.05)\\
 &\quad \text{If accept: } \theta^\star \leftarrow \theta\\[2pt]
-&\textbf{(4) Log + checkpoint.}\quad \text{Record } \mathrm{val\_avg\_cost}(\theta), \text{ totals, gating outcome.}
+&\textbf{(4) Log + checkpoint.}\quad \text{Record } \mathrm{val\_avg\_cost}(\theta),\ \mathrm{lr}=\eta_i,\ \text{totals, gating outcome.}\\[2pt]
+&\textbf{(5) Step lr scheduler.}\quad \eta_{i+1} \leftarrow \eta_0\cdot\texttt{lr\_decay}^{i+1}\ \text{via LambdaLR (no-op if lr\_decay=1)}.
 \end{aligned}
 \quad}
 $$
 
 **Key invariant** (matches AGZ Methods §Self-play training pipeline, p.357-358): $\theta^\star$ is updated only on gate accept; $\theta$ is updated every train step regardless. No rollback on reject.
+
+**F.6.1-locked default values:**
+- $\eta_0 = 5\times 10^{-4}$ (F.6.0.5b V3); `lr_decay` ∈ {`1.0` (const, F.6.1 main), `0.95` (F.6.1 lrdecay variant)} — both reach the same plateau ~3.92.
+- $\mathrm{wd} = 0$ (F.6.0.5b drops AGZ-canonical wd=1e-4 in favor of AM-paper Adam wd=0).
+- $G = 1$ (revised 2026-05-06 from G=5; per-iter best_model refresh propagates each accepted improvement to the next iter's self-play. Cost: +5-10s/iter validation, negligible vs ~25-115s/iter mcts_s).
+- Buffer capacity = 5000 instances (≈5-iter window at M=1000); F.6.1.1 winner. The default 200K (= effectively never-evicting at our M) was actively dragging the policy back via stale MCTS targets — see §3.7.
 
 ---
 
@@ -97,19 +106,37 @@ $$
 \sum_a \pi_a \log p_\theta(a\mid s) \;\equiv\; \sum_a \pi_a \cdot \big[\![\mathrm{mask}(a)\!=\!0]\!\big] \cdot \log p_\theta(a\mid s)
 $$
 
-**Value target — per-state cost-to-go** (matches Stage 1's V_CURRENT target shape; reuses `value_targets_from_edges` in `src/am_baseline/utils/tensor_ops.py:57-78`):
+**Value target — per-state cost-to-go** (matches Stage 1's V_CURRENT target shape; reuses `value_targets_from_edges` in `src/am_baseline/utils/tensor_ops.py:57-78`). **Three normalization modes** controlled by `--value_target_norm` ∈ {`bl`, `none`, `sqrt_n`} (added 2026-05-06 in F.6.0.5b's Option B):
 
 $$
 \boxed{\quad
-z_t \;=\; \frac{\mathrm{tour\_cost} - \mathrm{lengths}_t}{\mathrm{bl\_val}(x)} \;=\; \frac{\sum_{u=t}^{N-1}\|x_{a_u} - x_{a_{u+1 \bmod N}}\|_2}{\mathrm{bl\_val}(x)}
+z_t \;=\;
+\begin{cases}
+\dfrac{\mathrm{tour\_cost} - \mathrm{lengths}_t}{\mathrm{bl\_val}(x)} & \text{if } \texttt{value\_target\_norm} = \texttt{bl}\ \text{(legacy default; AGZ-canonical-style)}\\[8pt]
+\mathrm{tour\_cost} - \mathrm{lengths}_t & \text{if } \texttt{value\_target\_norm} = \texttt{none}\quad \textbf{(F.6.1 default)}\\[6pt]
+\dfrac{\mathrm{tour\_cost} - \mathrm{lengths}_t}{\sqrt{N}} & \text{if } \texttt{value\_target\_norm} = \texttt{sqrt\_n}\ \text{(theoretical scaling; ablation only)}
+\end{cases}
 \quad}
 $$
 
-where $\mathrm{lengths}_t$ is the cumulative cost of edges already traversed (= `state.lengths` at step $t$) and $\mathrm{bl\_val}(x) = \mathrm{cost}(\mathrm{greedy\_rollout}_{\theta^\star}(x))$.
+where $\mathrm{lengths}_t$ is the cumulative cost of edges already traversed (= `state.lengths` at step $t$) and $\mathrm{bl\_val}(x) = \mathrm{cost}(\mathrm{greedy\_rollout}_{\theta^\star}(x))$ when used.
+
+**MCTS leaf-eval inverse mapping** (matches the buffer→trainer pipeline; in [`mcts.py::_convert_value_head_output`](src/am_baseline/search/mcts.py) and [`mcts.cpp::convert_value_head_output`](src/am_baseline/search/mcts_cpp/mcts.cpp)): the value head's raw output $\hat v$ is converted at MCTS time to a unit-comparable scale before backup:
+
+$$
+V(s_L) - \mathrm{state.lengths}/\mathrm{bl\_val} \;=\;
+\begin{cases}
+\hat v(s_L) & \text{if } \texttt{norm} = \texttt{bl}\\[4pt]
+\hat v(s_L) / \mathrm{bl\_val}(x) & \text{if } \texttt{norm} = \texttt{none}\\[4pt]
+\hat v(s_L) \cdot \sqrt{N} / \mathrm{bl\_val}(x) & \text{if } \texttt{norm} = \texttt{sqrt\_n}
+\end{cases}
+$$
+
+This keeps the MCTS leaf-evaluator invariant ($V(s_L) = \mathrm{state.lengths}/\mathrm{bl\_val} + V_\text{cost-to-go-fraction}$) intact across all three target conventions.
 
 **Why per-state, not broadcast `z`:** the existing MCTS leaf evaluator (`src/am_baseline/search/mcts.py:1-15`, invariant 1) computes $V(s_L) = \mathrm{state.lengths}/\mathrm{bl\_val} + v_\theta(s_L)$, which assumes $v_\theta$ predicts **remaining cost-to-go from a partial state**, not the full tour. Training $v_\theta$ on broadcast full-tour `z` would double-count the path cost at MCTS time. Per-state $z_t$ matches the V_CURRENT shape Stage 1 trained against and makes Phase A's leaf evaluator a no-op compared to Stage 3.
 
-**`bl_val` recomputation cadence:** once per training epoch under $\theta^\star$ (the model that produced the tour, not the trainer's evolving $\theta$ — see §3.5 Concern 2).
+**`bl_val` recomputation cadence:** once per training epoch under $\theta^\star$ (the model that produced the tour). Frozen at buffer-push time (`bl_val_frozen`) for the record's full lifetime in $\mathcal{D}$. Under `value_target_norm=none`, this number is no longer in the training target — only used at MCTS time for scale-conversion.
 
 **Total objective** over a batch of size $B$, with **stratified-by-step sampling** (see §3.6 below):
 
@@ -156,27 +183,31 @@ This unit-scaled target gives AGZ four free properties we don't have:
 
 TSP is a continuous-cost minimization problem; quantizing $z$ to ±1 ("did MCTS beat greedy?") would discard the magnitude signal we're trying to learn. The continuous ratio $z = \text{tour\_cost}/\text{bl\_val}$ preserves it but introduces three concerns below.
 
-### Concern 1: `bl_val` drift — RESOLVED by frozen-at-generation design
+### Concern 1: `bl_val` *target-side* drift — DOMINANT problem under `value_target_norm='bl'`; RESOLVED by `'none'` (F.6.0.5b Option B)
 
-In a hypothetical broadcast-z design where `bl_val` is recomputed under the trainer's evolving θ, the same tour's $z$ would grow across iterations as θ improves. **Stage 4 sidesteps this entirely:** `bl_val` is computed once at instance-push time (under $\theta^\star$, the model that produced the tour) and frozen for the record's lifetime in the buffer. Combined with per-state cost-to-go $z_t = (\text{tour\_cost} - \text{lengths}_t)/\text{bl\_val}_\text{frozen}$, the training target for any given buffer record is **stationary across all training steps that draw it**.
+The frozen-at-generation `bl_val` makes any single record's target stationary, but **across-record** drift is large and hurts the value head's training. Three concrete drift channels in the bl-normalized regime, surfaced by F.6.0.5b:
 
-The only buffer-level "drift" is across records: newer instances were generated under stronger $\theta^\star$ with smaller `bl_val`, so their $z_t$ is on a slightly different scale than older records. This is the *correct* policy-iteration signal — the loop should learn that recent self-play is closer to optimal — not a moving-target pathology.
+1. **Calibration drift across records.** As $\theta^\star$ improves, newer records have smaller `bl_val` than older records. The value head is trained on a *moving distribution* of $z = \text{cost\_to\_go}/\text{bl\_val\_frozen}$ — even though each record is individually stationary, the population the value head sees over training is a noisy mixture of "older / weaker θ★" and "newer / stronger θ★" calibrations.
+2. **Buffer non-stationarity.** Even within one training step, the minibatch can mix records from very different θ★ snapshots, blurring the per-state target.
+3. **Across-instance variance collapse at random init.** Early in training, tour_cost and bl_val are highly correlated (both produced by ~uniform-random policies on the same instance), so $z = \text{cost\_to\_go}/\text{bl\_val} \approx \mathrm{const}$ across instances. The value head trivially fits the per-state mean and **provides no leaf-discrimination at MCTS time** (F.6.0 root-cause: see [progress F.6.0 headline 4](_progress/stage4_progress.md)).
 
-### Concern 2: `bl_val` model asymmetry
+**Option B fix (F.6.0.5b, now F.6.1 default): `value_target_norm='none'`.** Train on raw $z_t = \text{cost\_to\_go}_t$ (no division). Removes all three drift channels at once. Empirical impact ([F.6.0.5b results](_progress/stage4_progress.md)): the value head finally learns non-trivial across-instance variance (value_loss climbs from ~0.013-0.024 in the broken-bl regime to ~0.06-0.30 in the working-raw regime — an order of magnitude *more* loss, but the loss is now meaningful signal rather than constant-mean trivial fitting). The cost-to-go magnitude scale is rougher (~3-5× for TSP-20 random init) but bounded; gradients stay O(1).
 
-Tours come from $\theta^\star$ but `bl_val` could be computed from $\theta$. In between gate accepts these can diverge.
+The cost: the policy-iteration "newer self-play is closer to optimal" signal is encoded only via better MCTS visit distributions, not the value scale. Acceptable trade.
 
-**Resolution (now baked into §3 default):** `bl_val(x) = cost(greedy_rollout_{θ★}(x))` — the same model that produced the tour. Computed inside `generate_self_play_batch` at self-play time, frozen until next gate accept. Cleaner semantics, zero compute cost.
+### Concern 2: `bl_val` model asymmetry — N/A under `'none'`
 
-### Concern 3: Stage 5 alternative
+Under `value_target_norm='none'`, `bl_val` is no longer in the training target — only used at MCTS leaf-eval time for scale conversion. The tour-vs-baseline-model asymmetry that mattered under `'bl'` (resolved earlier by computing `bl_val` from $\theta^\star$ at push time) is absent here.
 
-Originally, Stage 4's G.6 ablation was "per-step cost-to-go target instead of broadcast z". Per-state cost-to-go is **now the F.4 default** (this section), so G.6 is repurposed to **"best-so-far per-instance normalization"**:
+### Concern 3: Stage 5 alternative — `best-so-far` normalization
+
+Originally, G.6 ablation was "per-step cost-to-go target instead of broadcast z". With per-state cost-to-go being the F.4 default (and `value_target_norm` now the active knob via F.6.1), G.6 is repurposed to **"best-so-far per-instance normalization"**:
 
 $$
 z_t^\text{best-so-far} \;=\; \frac{\mathrm{tour\_cost} - \mathrm{lengths}_t}{\min_{\text{seen}}\mathrm{tour\_cost}(x)}
 $$
 
-where the min is over all self-play attempts on instance $x$ across all iterations. Doesn't require an oracle, doesn't drift with the trainer, range $\geq 0$ with monotone optimum-tracking. **Strongest candidate for Stage 5 G.6 ablation**.
+where the min is over all self-play attempts on instance $x$ across all iterations. Doesn't require an oracle, doesn't drift with the trainer, range $\geq 0$ with monotone optimum-tracking. Worth re-evaluating now that `'none'` is validated — could outperform raw if value-loss magnitude becomes a stability concern at TSP-50+.
 
 ---
 
@@ -253,7 +284,7 @@ $$
 
 ### §4.3 Root exploration noise — Dirichlet (training only)
 
-At each root $s_t$, the priors are perturbed exactly once before the $K$ simulations:
+At each root $s_t$, the priors are perturbed exactly once before the $K$ simulations (skipped entirely when ε=0):
 
 $$
 \boxed{\quad
@@ -261,7 +292,21 @@ P(s_t, a) \;\leftarrow\; (1-\varepsilon)\, p_\theta(a\mid s_t) \;+\; \varepsilon
 \quad}
 $$
 
-with $\varepsilon = 0.25$, $\alpha = 10/N = 0.5$ for TSP-20 (AGZ uses $\alpha = 0.03$ at $|\mathcal{A}|=362$; the heuristic $\alpha \approx 10/|\mathcal{A}|$ scales it).
+with $\alpha = 10/N$ retained ($\alpha N = 10$ matches AGZ's $\alpha = 0.03$ at $|\mathcal{A}|=362$).
+
+**ε default revised by F.6.0.6:** $\varepsilon = 0$ for TSP-20 (was $\varepsilon=0.25$ AGZ inheritance). The 2-variant ε∈{0, 0.05} sweep at V3 settings with ε=0.25 from F.6.0.5b as implicit reference produced:
+
+| ε | val_avg_cost(iter 19) | per-iter regressions ≥ 0.05 |
+|---|---|---|
+| **0.00** | 4.228 | **0/19** (perfectly smooth) |
+| 0.05 | 4.186 (lucky-stop low; iter-18 was 4.738) | 7/19 (with +0.46 spike) |
+| 0.25 | 4.265 | (similar volatility expected) |
+
+Endpoint at iter 19 favored ε=0.05 by 0.043, but trajectory inspection showed ε=0.05's iter-19 was the trough of a 0.55-amplitude oscillation (iter 17→18: +0.46, iter 18→19: −0.55). For F.6.1's 100-iter horizon, **smooth convergence dominates a noise-floor endpoint advantage** → ε=0 wins.
+
+**TSP-50 may still benefit from small ε.** The F.6.1 TSP-50 probe uses ε=0.05 because (a) the action space (50 cities) is more uniform at random init (`α·N = 10` perturbation has more cities to redistribute over); (b) at higher N, the value head bootstraps slower, so MCTS Q-values are uninformative for more iters → exploration via ε is more useful. This is hypothesis-driven; will revisit after the trajectory lands.
+
+**Why ε=0 doesn't break exploration**: the value head provides leaf-discrimination once it learns non-trivial across-instance variance (under raw-target Option B; see §3.5). UCB selection via $c_\text{puct}\, P\, \sqrt{N_\text{tot}}/(1+N_a)$ explores prior tail mass already; per-instance state variation across M=1000 instances per iter provides the "exploration in data space" that AGZ used ε for in the per-instance dimension.
 
 ### §4.3.5 Train-only vs eval-only — when does noise apply?
 
@@ -277,7 +322,7 @@ The asymmetry: noise is an *exploration mechanism for data generation* (ensures 
 
 | Call site | Phase | $\tau$-schedule | Dirichlet | Rationale |
 |---|---|---|---|---|
-| `generate_self_play_batch` | training data gen | `step30` | **ε=0.25, α=0.5** | AGZ §Self-play — exploration for data diversity |
+| `generate_self_play_batch` | training data gen | `step30` | **ε=0** for TSP-20 (F.6.1 default); **ε=0.05** for TSP-50 (current probe) | F.6.0.6 trajectory-stability finding (TSP-20); hedge for TSP-50 |
 | Acceptance criterion 2 (greedy eval) | evaluation | n/a (greedy decoding, no MCTS) | **none** | Measure network's standalone quality |
 | Stage 3-style test-time MCTS (G ablation) | inference | τ→0 throughout | **none** | AGZ §Evaluator/Evaluation — strongest play |
 
@@ -326,9 +371,11 @@ The gate is taken directly from AGZ Methods §Self-play training pipeline + §Ev
 **Primary purpose: prevent regressions from poisoning the replay buffer.** Self-play data quality is bounded by the model that produced it. Without a gate, a noisy training step that temporarily worsens the model would immediately start polluting $\mathcal{D}$, which would push the next training step further off — a feedback loop that can spiral. The gate breaks it: $\theta^\star$ only advances when there's *statistical evidence* the new model is better, so the data-generating distribution is **monotonically improving** by construction.
 
 **Secondary effects:**
-1. **Filter optimizer noise.** Adam's per-step updates can momentarily worsen the policy on val even if the long-run direction is correct. Gating at every $G$ iters checks at a coarser cadence than per-step.
+1. **Filter optimizer noise.** Adam's per-step updates can momentarily worsen the policy on val even if the long-run direction is correct. Gating at every iter ($G=1$ default) checks per-iter; the t-test against the cached $\theta^\star$ baseline rejects if the candidate doesn't beat by a statistically significant margin.
 2. **Snapshot for evaluation.** Headline plots use $\theta^\star$, not whatever $\theta$ happened to be at the last gradient step. Stabilizes reported numbers.
 3. **Enable safe optimizer continuity.** Per scope decision 3 (matching AGZ), the trainer's optimizer state is *not* reset on gate reject. That's only safe because the gate decoupled "what generates data" from "what's training" — the trainer can explore noisy directions in parameter space without immediately corrupting $\mathcal{D}$.
+
+**Gate cadence revised 2026-05-06: $G=5$ → $G=1$.** Initial $G=5$ inherited AGZ's "evaluate every 1000 batches" pattern proportionally to our setup (200 train_steps × 5 iters = 1000 batches). Under the F.6.1 regime, this caused up to a 5-iter staleness in $\theta^\star$ — at lr=5e-4 with ~0.05/iter improvement, that's ~0.25 quality units of self-play data drag for free. $G=1$ refreshes immediately; the t-test on 10K val has plenty of power to distinguish per-iter improvements; cost is +5-10s/iter (≪ ~25-115s/iter mcts_s). F.6.1 K=20 trajectories (lrdecay variant: gate accepts at iter 0, 20, 30, 98) confirm the t-test is appropriately conservative and doesn't accept on noise.
 
 **Gating is not strictly necessary at scale.** KataGo's `ref/KataGo-master/SelfplayTraining.md` notes:
 
@@ -342,43 +389,60 @@ KataGo can drop the gate because at scale (millions of games) individual bad che
 
 ## §6 Algorithm in one block — full pseudocode
 
+**F.6.1-locked recipe** (TSP-20; values in `[brackets]` are the locked defaults):
+
 ```
-Input:  θ₀  (Stage 1 canonical TSP-20 checkpoint)
-        I = 100   # outer iterations (main run)
-        M = 1000  # self-play instances per iter
-        K = 100   # MCTS simulations per move
-        J = 200   # train steps per iter
-        B = 512   # mini-batch size
-        G = 5     # gate every G iterations
-        η = 1e-4, c = 1e-4 (Adam lr / weight_decay)
+Input:  No checkpoint (from-scratch random init; F.6 supersedes F.4 warm-start)
+        I = 100                   # outer iterations
+        M = 1000                  # self-play instances per iter         [F.6.1.0 saturates train budget]
+        K = 20                    # MCTS simulations per move            [F.6.1 K=20 default; K=40 also viable]
+        J = 200                   # train steps per iter                 [F.6.1.0]
+        B = 512                   # mini-batch size                      [F.6.0.8 batch=2048 only +0.02]
+        G = 1                     # gate every G iterations              [revised 2026-05-06]
+        η₀ = 5e-4                 # Adam initial lr                      [F.6.0.5b V3 winner]
+        lr_decay = 1.0            # constant lr (or 0.95 for lrdecay variant)
+        c = 0.0                   # weight_decay                         [F.6.0.5b V3]
+        ε = 0.0                   # Dirichlet root noise                 [F.6.0.6 stability winner]
+        α = 10/N = 0.5            # Dirichlet concentration
+        c_puct = 0.05             # PUCT exploration constant            [Stage 2-locked]
+        leaf_eval = 'value_head'  # AGZ-canonical                         [F.6.0.7→F.6.1.1]
+        value_target_norm = 'none'# raw cost-to-go target                [F.6.0.5b Option B]
+        gate_mode = 'ttest'       # paired-t α=0.05
+        temperature_schedule = 'step30'   # τ=1 for first ⌈0.3N⌉ steps, τ=0 otherwise
+        buffer_capacity = 5000    # ≈5-iter window at M=1000             [F.6.1.1 winner]
+        val_seed = 42, val_size = 10000
 
 Initialize:
-        θ ← θ₀                           # trainer's working copy
-        θ★ ← deepcopy(θ₀)                # best-player snapshot
-        D ← MCTSReplayBuffer(capacity=200_000 instances)
-        Opt ← Adam(θ.parameters(), lr=η, weight_decay=c)
-        V ← fixed val set of 10K instances; bl_vals ← rollout(θ★, V)
+        θ ← random init                  # trainer's working copy
+        θ★ ← deepcopy(θ)                 # best-player snapshot
+        D ← MCTSReplayBuffer(capacity_instances=5000)
+        Opt ← Adam(θ.parameters(), lr=η₀, weight_decay=c=0)
+        Sched ← LambdaLR(Opt, lambda i: lr_decay ** i)
+        V ← fixed val set of 10K instances (val_seed=42); bl_vals ← rollout(θ★, V)
 
 For i = 0, …, I−1:
 
     # ---- (1) Self-play with θ★ ----
     {x⁽ᵐ⁾} ← sample M random TSP-N instances
     For each x⁽ᵐ⁾:
-        bl_val_m ← cost(greedy_rollout(θ★, x⁽ᵐ⁾))             # bl_val from θ★ (§3.5 Concern 2)
-        (tour, cost, {πₜ, σₜ, lengthsₜ}) ← α_{θ★}(x⁽ᵐ⁾)        # πₜ = N/Σ N (target); σₜ = step30-tempered (action)
+        bl_val_m ← cost(greedy_rollout(θ★, x⁽ᵐ⁾))             # frozen at push time
+        (tour, cost, {πₜ, σₜ, lengthsₜ}) ← α_{θ★}(x⁽ᵐ⁾)        # πₜ = N/Σ N (target); σₜ = step30 (action)
         For t in 0..N-1:
-            cost_to_go_t ← cost − lengthsₜ                    # remaining tour cost from sₜ (§3 boxed)
-            zₜ ← cost_to_go_t / bl_val_m                      # per-state V_CURRENT target
-            D.push((sₜ, πₜ, zₜ))                              # store πₜ (raw, τ=1), not σₜ
+            cost_to_go_t ← cost − lengthsₜ                    # remaining tour cost from sₜ
+            zₜ ← cost_to_go_t                                  # value_target_norm='none' (Option B)
+                                                                # if ='bl': zₜ /= bl_val_m
+            D.push((sₜ, πₜ, zₜ, bl_val_m))                    # bl_val stored for MCTS scale-conversion only
 
     # ---- (2) Distillation training ----
     For j = 1, …, J:
-        Batch ← D.sample(B)                                    # uniform over per-step records
-        L_batch ← (1/B) Σ [(zₜ − v_θ(sₜ))² − πₜ · log p_θ(·|sₜ)]    # eq. §3
-        Opt.zero_grad(); L_batch.backward(); Opt.step()         # +c·‖θ‖² via weight_decay
+        Batch ← D.sample(B)                                    # stratified by step (§3.6)
+        L_batch ← (1/B) Σ [(zₜ − v_θ(sₜ))² − πₜ · log p_θ(·|sₜ)]    # eq. §3 (no L2 since c=0)
+        Opt.zero_grad(); L_batch.backward()
+        clip_grad_norm_(θ.parameters(), max_norm=1.0)          # clip is near no-op under Adam
+        Opt.step()
 
     # ---- (3) Gating ----
-    If (i+1) mod G == 0:
+    If (i+1) mod G == 0:                                       # G=1 → every iter
         candidate_vals ← rollout(θ, V)                          # greedy, no MCTS, no Dirichlet
         if mean(candidate_vals) < mean(bl_vals):
             t, p = scipy.stats.ttest_rel(candidate_vals, bl_vals)
@@ -389,47 +453,63 @@ For i = 0, …, I−1:
     # ---- (4) Log ----
     log(iter=i, total_instances=(i+1)·M,
         val_avg_cost=mean(rollout(θ, V)),
+        lr=Opt.param_groups[0]['lr'],
         gated=((i+1) mod G == 0), accepted, …)
+
+    # ---- (5) Step lr scheduler ----
+    Sched.step()                                                # no-op when lr_decay=1.0
 
 Return θ★, θ
 ```
+
+**F.6.1 K=20 main result** (val_avg_cost(iter 99) on 10K val_seed=42):
+- lr_decay=1.0 (constant): ~3.92-3.93 plateau
+- lr_decay=0.95 (decaying): 3.922 (geometric mean lr ~7.7e-5 over 100 iters)
+
+Stage 1 ceiling: 3.839. **F.6.1 closes the gap to 0.08 cost units (2% relative) at ~7.8% of Stage 1's instance budget**, validating the proposal sample-efficiency claim.
 
 ---
 
 ## §7 Mapping to AGZ paper equations
 
-| Stage 4 | AGZ paper | Identity |
+| Stage 4 (F.6.1 locked) | AGZ paper | Identity / deviation |
 |---|---|---|
-| §3 loss | eq. (1), p.355 | $\ell = (z-v)^2 - \pi^\top\log\mathbf{p} + c\lVert\theta\rVert^2$ — **literal match**; reward shape differs ($z \in \mathbb{R}_+$ vs $\{-1,+1\}$, see §3.5) |
-| §4.1 PUCT | Methods §Search algorithm, p.358 | $U(s,a) = c_\text{puct}\,P(s,a)\,\sqrt{\sum_b N(s,b)}/(1+N(s,a))$ — **literal match** |
-| §4.1.5 leaf eval | Methods §Search algorithm + §AlphaGo versions, p.357-358 | $V(s_L) = v_\theta(s_L)$, no rollouts — **literal match** |
-| §4.2 root sampling | Methods §Self-play, p.358 | $\pi_a \propto N(s_0,a)^{1/\tau}$ — **literal match**; $\tau$-schedule scaled (Go: 30 of ~250 plies; TSP-20: 6 of 20 plies) |
-| §4.3 Dirichlet | Methods §Self-play, p.358 | $P \leftarrow (1-\varepsilon)p + \varepsilon\eta$ — **literal match**; $\alpha$ scaled by $10/|\mathcal{A}|$ heuristic; train-only |
-| §5 gating | Methods §Evaluator, p.358 | AGZ uses 400-game match with 55% win threshold; Stage 4 uses paired t-test on 10K-instance val (lower variance; same spirit) |
-| §2 loop structure | Methods §Self-play training pipeline, p.357-8 | best-player $\theta^\star$ generates data; trainer $\theta$ continues regardless of gate — **literal match** |
+| §3 loss | eq. (1), p.355 | $\ell = (z-v)^2 - \pi^\top\log\mathbf{p} + c\lVert\theta\rVert^2$ — **structurally identical**. **Reward shape** differs ($z \in \mathbb{R}_+$ raw cost-to-go vs $\{-1,+1\}$, see §3.5). **$c=0$** in F.6.1 (vs AGZ $c=10^{-4}$); F.6.0.5b found AGZ-canonical wd actively hurts at Stage-4 lr=5e-4. |
+| §4.1 PUCT | Methods §Search algorithm, p.358 | $U(s,a) = c_\text{puct}\,P(s,a)\,\sqrt{\sum_b N(s,b)}/(1+N(s,a))$ — **literal match**. |
+| §4.1.5 leaf eval | Methods §Search algorithm + §AlphaGo versions, p.357-358 | $V(s_L) = v_\theta(s_L)$, no rollouts — **literal match** (F.6.0.9 confirmed rollout adds 3.2× compute without quality benefit at our regime). |
+| §4.2 root sampling | Methods §Self-play, p.358 | $\pi_a \propto N(s_0,a)^{1/\tau}$ — **literal match**; $\tau$-schedule scaled (Go: 30 of ~250 plies; TSP-20: 6 of 20 plies). |
+| §4.3 Dirichlet | Methods §Self-play, p.358 | $P \leftarrow (1-\varepsilon)p + \varepsilon\eta$ — formula identical, **$\varepsilon=0$ in F.6.1** (vs AGZ $\varepsilon=0.25$); F.6.0.6 found ε=0 wins on stability under V3 regime. $\alpha = 10/N$ retained ($\alpha N=10$ matches AGZ effective concentration). Train-only (eval uses no noise). |
+| §5 gating | Methods §Evaluator, p.358 | AGZ uses 400-game match with 55% win threshold; Stage 4 uses paired t-test on 10K-instance val (lower variance, $\alpha=0.05$ — comparable confidence; same spirit). **$G=1$** in F.6.1 (vs AGZ's "every 1000 batches" ≈ G=5 proportional). |
+| §2 loop structure | Methods §Self-play training pipeline, p.357-8 | best-player $\theta^\star$ generates data; trainer $\theta$ continues regardless of gate — **literal match**. |
+| Optimizer | Methods §Optimization | AGZ: SGD+momentum 0.9, lr step-anneal {1e-2 → 1e-3 → 1e-4}. **F.6.1: Adam, lr=5e-4 const or lr=1e-3 with 0.95/iter decay**. Documented deviation; SGD-momentum-with-AGZ-schedule is plan G.8 ablation, not main run. |
+| Replay buffer | Methods §Self-play | AGZ: last 500K games (~20-iter window @ 25K games/iter). **F.6.1: 5000 instances (~5-iter window @ 1K instances/iter)**. Proportionally tighter window — F.6.1.1 found longer windows actively hurt by retaining stale MCTS targets that drag the policy back toward earlier weaker θ★. |
+
+**Net deviation count: 4 documented (optimizer, ε, wd, value-target-norm); all empirically validated by F.6.0.5+ ablations.** Structural algorithm (PUCT + leaf-eval-via-value-net + visit-distillation + gated-best-player) is AGZ-faithful.
 
 ---
 
 ## §8 Critical files referenced
 
-**Consumed as-is (no edits):**
+**All implementation work (Phases A–F) is complete.** Below maps each algorithm component to its current file.
+
+**Consumed as-is from earlier stages:**
 - `src/am_baseline/model/attention_model.py` — `model.encode`, `model.precompute_decoder`, `model.decode_step(return_glimpse=True)`, `model.value_head`.
 - `src/am_baseline/search/puct.py:7-33` — exact PUCT formula in §4.1.
-- `src/am_baseline/utils/tensor_ops.py:57-78` — `value_targets_from_edges` produces V_CURRENT shape; Stage 4's $z_t$ computation reuses this exact target shape (§3).
-- `src/am_baseline/search/mcts.py:1-15` — leaf-evaluator invariant ($V(s_L) = \text{state.lengths}/\text{bl\_val} + v_\theta(s_L)$); confirms why per-state $z_t$ (not broadcast `z`) is the correct training target.
-- `src/am_baseline/training/trainer.py:208-219` — value normalization scaling pattern.
+- `src/am_baseline/utils/tensor_ops.py:57-78` — `value_targets_from_edges` produces V_CURRENT shape (used at smoke tests; F.6.1 trainer recomputes $z_t$ inline per the §3.5 normalization mode).
 - `src/am_baseline/baseline/baselines.py:106-123` — `RolloutBaseline.epoch_callback` — exact gating procedure in §5.
-- `src/am_baseline/search/mcts_cpp/solver.py` — `CppBatchMCTSSolver` — the self-play backend $\alpha_\theta$.
+- `src/am_baseline/search/mcts_cpp/solver.py` — `CppBatchMCTSSolver` (the self-play backend $\alpha_\theta$).
 
-**To be edited (Phases A + E):**
-- `src/am_baseline/search/mcts.py:34-72` — `MCTSConfig` defaults; Stage 4 adds `return_root_visits` (Phase A) + `temperature_schedule` (Phase E).
-- `src/am_baseline/search/mcts_cpp/{mcts.hpp, mcts.cpp, bindings.cpp, solver.py}` — same Phase-A and -E plumbing in C++.
-
-**To be created:**
-- `src/am_baseline/training/coach.py` *(Phase D)* — implements §2 outer loop, holds $\theta$ and $\theta^\star$ + replay buffer + gating baseline.
-- `src/am_baseline/training/trainer.py::train_step_alphazero` *(Phase B extension)* — implements §3 loss.
-- `src/scripts/train_alphazero.py` *(Phase F.1)* — CLI wrapper.
-- `src/scripts/smoke_alphazero.py` *(Phase F.2)* — smoke A1..A6.
+**Edited / extended through F.6.1:**
+- `src/am_baseline/search/mcts.py` — added `MCTSConfig.{return_root_visits, temperature_schedule, value_target_norm}`; `_apply_dirichlet`, `_resolve_tau`, `_convert_value_head_output` helpers.
+- `src/am_baseline/search/mcts_cpp/{mcts.hpp, mcts.cpp, bindings.cpp, solver.py}` — Python-side mirror of the above; `Solver::convert_value_head_output` for value_target_norm scale conversion at all 4 leaf-eval call sites.
+- `src/am_baseline/training/trainer.py` — `train_step_alphazero` implements §3 loss; `--value_target_norm` branch reconstructs $z_t$ from buffer-stored normalized form.
+- `src/am_baseline/training/coach.py` — `MCTSCoach` (§2 outer loop), `MCTSReplayBuffer` (§3.6 stratified-by-step sampler with ring-buffer eviction), `make_self_play_config` plumbing all knobs.
+  - LR scheduler: `LambdaLR(optimizer, lambda i: lr_decay**i)` wired up; `step()` called at end of each iter; checkpoint save/load includes scheduler state.
+- `src/am_baseline/training/logging.py` — `iterations.csv` schema and W&B cross-stage aliases (`epoch=iter`, `val_avg_cost`, `epoch_duration=mcts_wall_s+train_wall_s`, `baseline_updated`, `lr`, `global_step`, `value_loss`).
+- `src/scripts/train_alphazero.py` — CLI wrapper; flags include `--lr_model`, `--lr_decay`, `--weight_decay`, `--dirichlet_epsilon`, `--dirichlet_alpha_factor`, `--value_target_norm` ∈ {`bl`, `none`, `sqrt_n`}, `--leaf_eval` ∈ {`value_head`, `rollout`}, `--gate_mode` ∈ {`ttest`, `always`, `never`}, `--gate_every`, `--temperature_schedule`, `--buffer_capacity`, `--val_seed`.
+- `src/scripts/modal_run_train_alphazero.py` — Modal entrypoints for the F.6.0.5+ ablation series and F.6.1 main + lrdecay variants + TSP-50 probe.
+- `src/scripts/smoke_alphazero.py` — A1..A6 smokes (gradient flow, buffer invariants, save/load, decoder graph correctness, gating mock, full coach round-trip).
+- `src/scripts/probe_grad_norm.py` *(NEW Stage 4 diagnostic)* — Stage 1 vs Stage 4 raw-gradient-norm comparison (motivates the lr=5e-4 derivation in F.6.0.5).
 
 ---
 
@@ -447,4 +527,8 @@ This document is descriptive (algorithm spec, not new code). It will be verified
 
 ---
 
-**Last updated:** 2026-04-30. Cross-link: see `_plans/stage4_plan.md` for engineering phases and `_progress/stage4_progress.md` for run status.
+**Last updated:** 2026-05-06. Cross-link: see `_plans/stage4_plan.md` for engineering phases and `_progress/stage4_progress.md` for run status (F.6.0.5b → F.6.1 results documented there).
+
+**Refinement log:**
+- **2026-05-06**: Updated to reflect F.6.0.5→F.6.1 locked recipe. Documented 4 deviations from AGZ canonical (Adam vs SGD-momentum, ε=0 vs 0.25, wd=0 vs 1e-4, raw value target via `value_target_norm='none'` vs bl-normalized) — all empirically validated. Added gate cadence revision $G=5\to 1$ rationale, lr scheduler infrastructure (LambdaLR), buffer-window finding (5000 ≪ 200K). All implementation work (Phases A-F) marked complete.
+- **2026-04-30**: Initial creation. Spec reflected Phase F.4 design: $\eta=10^{-4}$, wd=1e-4, ε=0.25, value_target_norm='bl' (single mode), G=5, buffer=200K. Implementation phases A-D were planned but not yet complete.

@@ -206,6 +206,7 @@ class CppMCTSSolver:
         "const": 0,
         "step30": 1,
         "step50": 2,
+        "step10": 3,
     }
 
     def _cfg_dict(self) -> dict:

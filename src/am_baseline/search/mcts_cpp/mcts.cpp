@@ -33,6 +33,7 @@ std::vector<double> sequence_to_doubles(py::handle handle) {
 //   0 = None / 'const'  → constant τ = cfg.temperature
 //   1 = 'step30'        → τ = cfg.temperature for step < ceil(0.3*n), else 0
 //   2 = 'step50'        → τ = cfg.temperature for step < ceil(0.5*n), else 0
+//   3 = 'step10'        → τ = cfg.temperature for step < ceil(0.1*n), else 0
 std::vector<double> build_tau_per_step(const Config& cfg, int n) {
   std::vector<double> tau(static_cast<std::size_t>(std::max(n, 0)), cfg.temperature);
   if (cfg.temperature_schedule == 0 || n <= 0) {
@@ -43,6 +44,8 @@ std::vector<double> build_tau_per_step(const Config& cfg, int n) {
     frac = 0.3;
   } else if (cfg.temperature_schedule == 2) {
     frac = 0.5;
+  } else if (cfg.temperature_schedule == 3) {
+    frac = 0.1;
   } else {
     throw std::runtime_error("unknown temperature_schedule encoding");
   }
@@ -95,9 +98,10 @@ Config Config::from_python(py::dict cfg) {
   if (out.virtual_loss_margin < 0.0) {
     throw std::runtime_error("virtual_loss_margin must be >= 0");
   }
-  if (out.temperature_schedule < 0 || out.temperature_schedule > 2) {
+  if (out.temperature_schedule < 0 || out.temperature_schedule > 3) {
     throw std::runtime_error(
-        "temperature_schedule must be 0 (const/None), 1 (step30), or 2 (step50)");
+        "temperature_schedule must be 0 (const/None), 1 (step30), 2 (step50), "
+        "or 3 (step10)");
   }
   return out;
 }

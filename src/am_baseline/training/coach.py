@@ -862,6 +862,14 @@ class MCTSCoach:
             weight_decay=float(self._weight_decay()),
         )
 
+        # LR scheduler — multiplicative per-iteration decay.
+        # lr(iter k) = lr_model * lr_decay**k. Default lr_decay=1.0 → no decay.
+        # Stage 1 uses the same LambdaLR pattern (train.py:102).
+        _lr_decay = float(getattr(opts, 'lr_decay', 1.0))
+        self.lr_scheduler = _torch.optim.lr_scheduler.LambdaLR(
+            self.optimizer, lr_lambda=lambda iter_k: _lr_decay ** iter_k
+        )
+
         # Gating — verbatim Stage 1 RolloutBaseline. Construct AFTER
         # `opts.val_size` is finalized (init-order trap). Note that
         # `RolloutBaseline.__init__` runs a greedy rollout over `val_size`
@@ -964,6 +972,7 @@ class MCTSCoach:
             'model': self.model.state_dict(),
             'best_model': self.best_model.state_dict(),
             'optimizer': self.optimizer.state_dict(),
+            'lr_scheduler': self.lr_scheduler.state_dict(),
             'iter_idx': int(self.iter_idx),
             'total_instances_seen': int(self.total_instances_seen),
             'rng_state': rng_state,
@@ -997,6 +1006,8 @@ class MCTSCoach:
         self.model.load_state_dict(d['model'])
         self.best_model.load_state_dict(d['best_model'])
         self.optimizer.load_state_dict(d['optimizer'])
+        if 'lr_scheduler' in d:
+            self.lr_scheduler.load_state_dict(d['lr_scheduler'])
         # Stored `iter_idx` is the LAST COMPLETED iteration; advance one so
         # `learn(...)` resumes at the next integer.
         self.iter_idx = int(d['iter_idx']) + 1
@@ -1119,6 +1130,9 @@ class MCTSCoach:
                     self._save_checkpoint(tag=f'{self.iter_idx}_accepted')
                 # NB: per scope decision 3, NO rollback on reject.
 
+            # Capture lr USED this iter (before stepping the scheduler for next iter).
+            current_lr = float(self.optimizer.param_groups[0]['lr'])
+
             self.logger.log_iteration(
                 iter=self.iter_idx,
                 total_instances=self.total_instances_seen,
@@ -1128,9 +1142,12 @@ class MCTSCoach:
                 mcts_wall_s=t1 - t0,
                 train_wall_s=t2 - t1,
                 buffer_size=int(len(self.buffer)),
-                lr=float(getattr(opts, 'lr_model', 1e-4)),
+                lr=current_lr,
             )
             self._save_checkpoint(tag=f'{self.iter_idx}')
+
+            # Advance lr scheduler for next iter. lr(iter k+1) = lr_model * lr_decay**(k+1).
+            self.lr_scheduler.step()
 
         # Position iter_idx at the next integer so a follow-up call to
         # `learn(...)` resumes after the last completed iteration.

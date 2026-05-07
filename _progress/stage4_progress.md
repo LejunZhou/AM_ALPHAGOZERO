@@ -2,7 +2,7 @@
 
 **Plan:** `_plans/stage4_plan.md`
 **Started:** 2026-04-29
-**Last updated:** 2026-05-06 — **F.6.0.7→F.6.1.1 sub-budget probe series complete** (K, batch, M, buffer ablations at F.6.0.6 winner regime). Three findings: **(1) K dominates batch** (K 40→20 costs 0.20; batch 512→2048 helps only 0.02). **(2) Iters dominate M at fixed train_steps** (M=2000 × 10 iter is 0.65 *worse* than M=1000 × 20 iter at matched 20K total instances — train_steps=200 saturates per-iter budget). **(3) Smaller replay buffer dramatically helps**: buffer 200K→5K closes 0.129 at K=20 (4.428 → 4.299); 200K default was dragging policy back via stale MCTS targets. Sweet spot is **buf=5000 (5-iter window)**, not buf=1000 (1-iter, fully online). **Pending follow-up: K=40 + buf=5000 combined**, expected to push past F.6.0.6 E1's 4.228 toward 4.10 or below. F.6.1 recipe revised: keep all F.6.0.6 settings but drop `--buffer_capacity 200000` → `--buffer_capacity 5000`.
+**Last updated:** 2026-05-06 — **F.6.1 K=40 main complete (val=3.92 plateau); F.6.1.3 step10 + ε=0.25 sweep BROKE the plateau to val=3.878 from-scratch — first variant past F.6.1 main's iter-90 best (3.893).** F.6.1.3 also confirmed via diagnostic that value_head leaf eval at K=40 is statistically tied with greedy (K=40 rollout: −0.072 vs greedy; K=40 value_head: +0.002 vs greedy, p=0.63), pinpointing the F.6.1 plateau's root cause: MCTS targets ≈ greedy → CE distillation has no improvement signal → π_t entropy collapses to 0.155 nats by iter 99. **step10 + ε=0.25 partially halts the entropy collapse** (0.335 vs 0.155) by retaining exploration noise on a narrower σ_t window. F.6.1.4 (ε=0.25 +50 iter resume from iter-99) in flight. Telemetry additions this session: per-loss grad norms (policy/value/total, with value split into VH-only + encoder-decoder-shared subspaces) for cos(θ_shared) conflict diagnostic; step10 temperature schedule (cutoff = ⌈0.1·N⌉); standalone Stage-4 MCTS validator (`src/scripts/val_stage4_mcts.py`) with AM-baseline support. Earlier this session: F.6.1 K=20 variants (lr=5e-4 const, lr=1e-3 + 0.95/iter decay) both at val ≈ 3.92 on 100K instances; F.6.0.7→F.6.1.1 sub-budget probes locked the F.6.1 recipe; gate_every revised 5→1 (best_model freshness); lr scheduler infrastructure added (LambdaLR wired into coach.py, --lr_decay CLI flag, checkpoint save/load support).
 **Status:** **Phases A, B, C, D, E complete; Phase F (TSP-20 pilot/main CLI) and G (ablations) remain.**
 
 ---
@@ -507,6 +507,77 @@ The plan ([_plans/stage4_plan.md:455-470](../_plans/stage4_plan.md#L455-L470)) d
 
   Modal apps: F.6.0.7 (`ap-...`), F.6.0.8 (`ap-...`), F.6.0.9 (`ap-...`, in flight), F.6.1.0 (`ap-...`), F.6.1.1 (`ap-...`).
 
+- [x] **F.6.1 K=20 100-iter trajectory probes** — **COMPLETE 2026-05-06.** Two parallel 100-iter F.6.1 main runs at K=20 + buf=5000 testing whether a learning-rate schedule changes the convergence target. Both share the locked recipe: ε=0, wd=0, value_target_norm=none, leaf_eval=value_head, gate=ttest, **gate_every=1** (revised this session — see "gate_every revision" below), val_seed=42, M=1000, train_steps=200, batch=512, n_iterations=100, from-scratch.
+
+  | run | lr_model | lr_decay | iter-99 val_avg_cost | best mid-run | trajectory shape |
+  |---|---|---|---|---|---|
+  | F.6.1 lrdecay | 1e-3 | 0.95/iter | **3.922** | 3.922 (iter 99) | smooth, monotone through iter 70, plateau ≈3.92-3.93 |
+  | F.6.1 main const | 5e-4 | 1.0 (none) | ~3.92-3.93 (log truncated) | **3.912 (iter 90)** | bumpier; regressions at iter 30, 60, 95 |
+
+  **Key trajectory checkpoints (val_avg_cost @ iter):**
+
+  | iter | lrdecay | const | Δ |
+  |---|---|---|---|
+  | 0 | 6.831 | 7.787 | (random init noise) |
+  | 10 | 4.376 | 4.715 | lrdecay ahead by 0.339 (high lr=1e-3 advantage at random init) |
+  | 20 | 4.094 | 4.143 | lrdecay ahead by 0.049 |
+  | 30 | 3.999 | 4.377 | const regression (lrdecay ahead by 0.378) |
+  | 40 | 3.981 | 3.993 | converging (Δ=0.012) |
+  | 50 | 3.957 | 3.981 | lrdecay ahead by 0.024 |
+  | 60 | 3.941 | 3.992 | const regression (lrdecay ahead by 0.051) |
+  | 70 | 3.938 | 3.940 | matched (Δ=0.002) |
+  | 80 | 3.934 | 3.927 | const ahead by 0.007 |
+  | 90 | 3.933 | **3.912** | const ahead by 0.021 (const's mid-run best) |
+  | 99 | **3.922** | ~3.92-3.93 (truncated) | both at the same plateau |
+
+  **Findings:**
+  1. **Both lr schedules reach the same ~3.92 plateau** — the destination doesn't depend on lr schedule choice. Constant lr=5e-4 is a fine default; no scheduling complexity needed.
+  2. **lr=1e-3 + decay=0.95/iter has visibly faster early descent** (iter 10 advantage of 0.34, iter 30 advantage of 0.38). The high initial lr buys faster initial progress; the decay handles the late-stage plateau.
+  3. **Constant lr trajectory is bumpier** (3 regressions ≥ 0.05 over iter 0-99 vs lrdecay's smooth descent). At lr=5e-4 throughout, the policy keeps bouncing within the plateau noise band; lrdecay's late-iter lr~6e-6 effectively damps further updates.
+  4. **Best mid-run val_avg_cost is the same in both** (lrdecay iter 99 = 3.922; const iter 90 = 3.912). The const variant *touched* a slightly lower point at iter 90 but didn't hold it (regressed back to 3.93 by iter 95-98).
+  5. **Gate accept patterns differ**: const-lr accepted at iter 0, 10, 20, 90 (sparse); lrdecay accepted at iter 0, 20, 30, 98 (also sparse). Most iters' candidates didn't beat the running baseline by enough to clear the t-test — typical mid-plateau behavior.
+
+  **Sample-efficiency anchor (proposal claim materialized):**
+
+  | run | total instances | val_avg_cost | comment |
+  |---|---|---|---|
+  | Stage 1 ceiling | 1,280,000 (1 epoch) | 3.839 | converged AM-paper greedy decoding |
+  | F.6.0 winner (K=100, 50 iter, lr=1e-4 / bl-normalized regime) | 50,000 | 3.93 | prior best Stage 4 from-scratch |
+  | F.6.1 main / lrdecay (K=20, 100 iter, V3-derived recipe) | 100,000 | **3.92** | **new state-of-art, ~7.8% of Stage 1 budget, 5× cheaper per-iter compute than F.6.0 winner** |
+
+  **Stage 4 from-scratch closes the gap to Stage 1 to 0.08 cost units (2% relative) at <8% of Stage 1's instance budget**, validating the proposal sample-efficiency claim. The F.6.1 trajectory monotonically descends past F.6.0's 3.93 by iter ~50-60 and plateaus ~3.92 through iter ~80-99.
+
+  **gate_every revision (2026-05-06).** Pre-launch I had `gate_every=5` inheriting AGZ's "evaluate every 1000 batches" pattern proportional to our setup. User pushed back; analysis showed best_model staleness (up to 5 iters lag) directly hurts self-play quality at lr=5e-4 where each iter brings ~0.05 quality gain. Per-iter gating costs only ~5-10s extra (negligible vs ~30s/iter mcts_s) and the t-test has plenty of power on 10K-eval. **gate_every=1 adopted** as the F.6.1 default — propagates each accepted improvement to self-play immediately.
+
+  **lr scheduler infrastructure added (2026-05-06)** for the lrdecay variant:
+  - `--lr_decay` CLI flag added in [train_alphazero.py:91-94](src/scripts/train_alphazero.py)
+  - `LambdaLR(optimizer, lambda iter_k: lr_decay**iter_k)` wired up after optimizer creation in [coach.py](src/am_baseline/training/coach.py); `step()` called at end of each iter
+  - Scheduler state included in checkpoint save/load
+  - `current_lr = optimizer.param_groups[0]['lr']` captured for accurate W&B logging (was previously logging the static `opts.lr_model` regardless of decay)
+
+  **K=40 + buf=5K + lr=5e-4 const variant** — **COMPLETE 2026-05-06.** Run name: `f61_main_K40_buf5000_20260506T201909_20260506T201920`. val_avg_cost(iter 90, last accept) = **3.893** (val_seed=42); iter 99 working-model = 3.917 (gate rejected every iter 91-99). Same plateau as the K=20 variants → **K-axis effect is essentially nil at 100-iter horizon** under the F.6.0.6/F.6.1 recipe.
+
+  **Post-mortem diagnostic (2026-05-06)** — performed via the new `val_stage4_mcts.py` script on a fresh seed=20260430, n=500 paired val set against AM_S1 canonical:
+
+  | Decoder | mean | Δ vs greedy θ★ | Δ vs AM_S1 greedy |
+  |---|---|---|---|
+  | AM_S1 greedy | 3.84221 | — | (ref) |
+  | AM_S1 sample(x1280) | 3.83381 | — | −0.0084 |
+  | Stage4 iter-90 greedy | 3.90808 | (ref) | +0.0659 |
+  | Stage4 iter-90 + MCTS K=40 **value_head** ε=0 const | 3.90974 | **+0.0017** (p=0.63) | +0.0675 |
+  | Stage4 iter-90 + MCTS K=40 **rollout** ε=0 const | 3.83644 | **−0.0716** (p<0.0001) | −0.0058 |
+
+  **Smoking gun: at the same K=40 budget, swapping value_head leaf eval → 1-sample rollout buys −0.073.** value_head at the leaf is statistically tied with greedy (p=0.63); a single Monte-Carlo rollout under the *same policy* gives massive lift. The value head's per-leaf scores aren't discriminating sibling subtrees.
+
+  **Lock-in mechanism** (closed loop, all observed in `iterations.csv`):
+
+  1. value_head at the leaf provides ≈zero search signal → MCTS K=40 with value_head produces tours essentially identical to greedy.
+  2. With ε=0 + step30, the resulting π_t targets collapse onto the policy's own argmax — `mean_entropy_pi` drops from 1.804 (iter 0) → 0.353 (iter 13) → 0.155 (iter 99) ≈ 1.17 effective actions out of 20.
+  3. CE distillation against (near-)one-hot targets matching the policy's own argmax = the model just gets *more confident* on actions it already picks (loss drops to 0.27) without changing direction.
+  4. Working model drifts post-iter 90 (greedy +0.023 vs best_model); gate correctly rejects every iter 91-99.
+
+  **Conclusion**: F.6.1 main's plateau is a leaf-evaluator failure, not an MCTS-recipe / lr / buffer / K issue. The next viable lever is either fixing the value head's leaf-discrimination (auxiliary value pretrain, whitening, hybrid leaf) or swapping leaf_eval back to rollout — both deferred behind cheaper interventions probed in F.6.1.3.
+
 - [ ] **F.6.1 From-scratch trajectory probe** *(scope reduced 2026-05-02 from 1000 → 100 iter; defaults locked 2026-05-06 by F.6.0.5 + F.6.0.6)*. Recipe locked: **100 iter** × M=1000 × **K=100** × `train_steps_per_iter=200` × `buffer_capacity=200_000` × **`--lr_model 5e-4`** × **`--weight_decay 0`** × **`--value_target_norm none`** × **`--dirichlet_epsilon 0`** × **`--leaf_eval value_head`** × `--gate_mode ttest` × val_seed=42. **Resume from F.6.0 winner's `iter-49.pt`** *(reconsider — F.6.0 winner used different lr/wd/value_target_norm/ε, so resume may not be apples-to-apples; from-scratch may be cleaner)*. **K=100 chosen** because the probe showed K=100 → K=200 gives only +33% MCTS-vs-greedy gap improvement at 2× cost; K=200 reserved for F.6.3 escalation.
 
   Per-iter wall-clock estimate (Modal A10):
@@ -516,6 +587,35 @@ The plan ([_plans/stage4_plan.md:455-470](../_plans/stage4_plan.md#L455-L470)) d
   Output: `outputs/tsp_20/stage4_main_fromscratch_<timestamp>/`.
 
   **Why scope-reduced:** treat F.6.1 as a trajectory proof-of-concept rather than a full convergence run. At 150 iter / 150K instances, F.6.1 is at ~12% of Stage 1's first epoch (1.28M) — too short to definitively answer the proposal sample-efficiency claim, but enough to see whether the from-scratch loop is visibly learning and at what rate. Decision: don't auto-scale to 1000 even if 100-iter shows promise; re-decide F.6.3 escalation based on data.
+
+- [x] **F.6.1.3 step10 + ε sweep (post-F.6.1 plateau breakthrough)** — **COMPLETE 2026-05-06.** Cheapest-first response to the F.6.1 main lock-in diagnostic above: keep `leaf_eval=value_head` (so the result is comparable to F.6.1 main on per-iter wall-clock) but narrow the σ_t stochastic window (step30 → step10, cutoff = ⌈0.1·N⌉ = 2 of 20 tour-steps) AND restore Dirichlet noise. Modal entrypoint: `run_f62_step10_eps_sweep` in `modal_run_train_alphazero.py`. Two parallel 100-iter from-scratch runs sharing F.6.1 main's recipe (K=40, M=1000, train_steps=200, buffer=5000, batch=512, lr=5e-4 const, wd=0, value_target_norm=none, gate=ttest gate_every=1, val_seed=42), differing only in `--temperature_schedule step10 --dirichlet_epsilon ε`.
+
+  | run_name (`f62_step10_*`) | ε | val_avg_cost(iter 99) | mean_entropy_pi(iter 99) | policy_loss | value_loss | pg_norm | vg_norm |
+  |---|---|---|---|---|---|---|---|
+  | `eps05_20260507T024345` | 0.05 | 3.8968 | 0.216 | 0.308 | 0.011 | 0.741 | 0.508 |
+  | `eps25_20260507T024345` | **0.25** | **3.8784** | **0.335** | 0.465 | 0.017 | 0.800 | 0.825 |
+
+  **Key finding**: ε=0.25 + step10 finishes at val_avg_cost=**3.8784**, beating F.6.1 main's iter-90 best of 3.893 by **−0.015** on the same val_seed=42 draw. Mean π_t entropy at iter 99 is **2.16× higher** than F.6.1 main (0.335 vs 0.155 nats), consistent with the diagnostic prediction: ε=0.25 keeps the visit distribution non-degenerate, so π_t carries more information than just the policy's own argmax. Per-iter wall increases ~25% (52.75s → 65.20s mcts_s) due to noise → more diverse trees → fewer tree-reuse cache hits.
+
+  ε=0.05 (3.897) lands roughly at F.6.1 main's iter-90 best with ~0.005 noise. The exploration→target-information mechanism is real but ε=0.05 is too low to fully halt the entropy collapse.
+
+  Modal app: `ap-1vX3EOYEBbAaHoRYkkAACz` (timestamp `20260507T024345`); ~2h wall-clock parallel; ~$15-20 in credits. W&B project: `am-alphagozero` (runs `933kn781` for ε=0.05, `meynsvp0` for ε=0.25).
+
+  **Diagnostic inheritance**: per-loss grad norms (added this session — see infrastructure entry below) recorded throughout. policy and value grad norms are within ~1× of each other at iter 99 (pg_norm=0.800, vg_norm=0.825 for ε=0.25), so λᵥ=1.0 is not mis-weighted at this regime. The value-grad VH-vs-shared split was added AFTER these runs finished; F.6.1.4 (resume) will be the first run with that telemetry.
+
+- [ ] **F.6.1.4 ε=0.25 +50 iter resume (in flight)** — extends `f62_step10_eps25_20260507T024345_*/iter-99.pt` for 50 more iterations with the new value-grad VH/shared split telemetry. Tests whether the trajectory keeps improving past iter 99 (would close the AM_S1 gap further) or has hit a new plateau (would suggest step10+ε=0.25 hit a different regime-limit). Modal entrypoint: `run_f62_eps25_resume50`. Same recipe as parent run; coach loads model + best_model + optimizer + lr_scheduler + RNG + sibling buffer.pt; resumes at iter 100 → 149. Output: `outputs/tsp_20/f62_step10_eps25_resume50_<timestamp>_*/iter-{100..149}.pt`. ~1.5-2h wall, ~$8-12 in credits.
+
+- [x] **Telemetry / infrastructure additions (2026-05-06)** — staged ahead of the F.6.1.4 resume so trajectory and post-F.6.1.3 runs all carry the new diagnostics:
+
+  1. **Per-loss gradient-norm logging** in `train_step_alphazero` ([trainer.py](src/am_baseline/training/trainer.py)). Replaced the single `total_loss.backward()` with two `torch.autograd.grad` traversals (one per loss; gradient is linear so combining them and writing into `.grad` is mathematically identical to the original path). New fields in the metrics dict: `policy_grad_norm`, `value_grad_norm`. Cost: ~2× backward traversal time, negligible vs MCTS self-play wall.
+
+  2. **Value-grad subspace split** for clean cosine-of-conflict diagnostic. Since `L_policy` is identically zero on `value_head` parameters, the dot product `⟨∇L_p, ∇L_v⟩` only sees the encoder+decoder "shared" subspace, but `value_grad_norm` includes the value_head-only contribution — so `cos(θ_full)` understates the true shared-subspace conflict. Two new metrics fix this: `value_grad_norm_vh` (value_head params only) and `value_grad_norm_shared` (encoder+decoder). Orthogonal-decomposition invariant verified: `value_grad_norm² = vh² + shared²` to within 1e-5 in the smoke. Then `cos(θ_shared) = ((grad_norm² − policy² − λᵥ²·value²) / (2·λᵥ)) / (policy · value_shared)` recovers the true angle on shared params. Smoke confirmed `cos_shared` was 3.8× larger in magnitude than `cos_full` at random init — non-trivial dilution.
+
+  3. **`step10` temperature schedule** in MCTSConfig and the C++ extension. Encoding `3 = step10` (alongside `0=const, 1=step30, 2=step50`); cutoff = ⌈0.1·N⌉. Wired in [mcts.py](src/am_baseline/search/mcts.py), [solver.py](src/am_baseline/search/mcts_cpp/solver.py), [mcts.hpp](src/am_baseline/search/mcts_cpp/mcts.hpp), [mcts.cpp](src/am_baseline/search/mcts_cpp/mcts.cpp), and `--temperature_schedule` choices in [train_alphazero.py](src/scripts/train_alphazero.py). C++ extension rebuilt locally; Modal image rebuilds automatically on next launch via `pip install -e . --no-deps`. AGZ-canonical analog: 30 plies of ~250 ≈ 12% — step10's ⌈0.1·N⌉ matches this scaling more closely than step30.
+
+  4. **`iterations.csv` schema extended** ([logging.py](src/am_baseline/training/logging.py)): added 5 new columns (`policy_grad_norm_mean`, `value_grad_norm_mean`, `grad_norm_mean`, `value_grad_norm_vh_mean`, `value_grad_norm_shared_mean`). Old files (F.6.1 main, F.6.1.3 ε-sweep) only have the original 11 columns; F.6.1.4 onward get all 16. Read by name (pandas), not column index, when stitching trajectories across schema versions. W&B per-step + per-iter series mirror the CSV columns.
+
+  5. **`val_stage4_mcts.py`** ([src/scripts/val_stage4_mcts.py](src/scripts/val_stage4_mcts.py)) — standalone validator for Stage 4 checkpoints with MCTS. Loads either `iter-{i}.pt` or `iter-{i}_accepted.pt` (auto-detects `model` + `best_model` keys), reads sibling `args.json` to recover the architecture/`value_target_norm`, and evaluates greedy + MCTS on a fixed-seed val set with optional `--match_train` (reads training-time MCTS recipe from args.json) and `--am_ckpt` (loads either Stage 1 canonical or the reference Kool release with auto key-remap; runs greedy + sampling x1280). Reports paired t-test diffs + fraction-better/worse counts. Used for the F.6.1 main post-mortem above.
 
 - [ ] **F.6.2 Pass conditions evaluation** (split — see plan F.6.2 in `_plans/stage4_plan.md` for full text).
   - **Trajectory-probe conditions** (should hold for the F.6.1 100-iter probe to be informative): (3') visible downward val_avg_cost trend (final < initial by ≥ 0.05 — much looser than ±0.001 noise band); (4) ≥1 gate accept (auto with `--gate_mode always`); F.6.0+F.6.1 trajectory smoothly continuous (sanity-check resume).

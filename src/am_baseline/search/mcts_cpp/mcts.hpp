@@ -25,6 +25,7 @@ struct Config {
   //   0 = None / 'const' (constant τ = temperature; Stage 2/3 default)
   //   1 = 'step30'       (τ = temperature for step < ceil(0.3*N), else 0)
   //   2 = 'step50'       (τ = temperature for step < ceil(0.5*N), else 0)
+  //   3 = 'step10'       (τ = temperature for step < ceil(0.1*N), else 0)
   int temperature_schedule = 0;
   double dirichlet_alpha = 0.3;
   double dirichlet_epsilon = 0.0;

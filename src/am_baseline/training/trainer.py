@@ -256,7 +256,16 @@ def train_step_alphazero(model, optimizer, batch, opts):
 
     Returns:
         dict of metrics: policy_loss, value_loss, total_loss,
-        mean_entropy_pi, mean_z, gradient_norm.
+        mean_entropy_pi, mean_z, gradient_norm,
+        policy_grad_norm, value_grad_norm.
+
+    Per-loss grad-norm accounting (added F.6.2): we compute ∂policy_loss/∂θ
+    and ∂value_loss/∂θ separately via two `torch.autograd.grad` traversals,
+    measure their norms, then write the combined gradient
+    ∂(policy + λᵥ·value)/∂θ into `.grad` slots manually. Gradient is linear
+    so this is mathematically identical to `total_loss.backward()` — but we
+    get the per-loss norms for free as a diagnostic. Costs ~2× backward
+    traversal time, which is negligible vs MCTS self-play wall time.
     """
     from am_baseline.training.coach import reconstruct_state
 
@@ -353,8 +362,69 @@ def train_step_alphazero(model, optimizer, batch, opts):
     total_loss = policy_loss + lambda_v * value_loss
 
     # ---- Backward + step --------------------------------------------------
+    # Per-loss grad-norm diagnostic: trace the policy and value losses
+    # back through the graph separately, measure each, then combine into
+    # `.grad` for the optimizer. retain_graph=True on the first call keeps
+    # the autograd graph alive for the second; the second drops it.
+    params = [p for p in model.parameters() if p.requires_grad]
+    policy_grads = torch.autograd.grad(
+        policy_loss, params, retain_graph=True, allow_unused=True,
+    )
+    value_grads = torch.autograd.grad(
+        value_loss, params, retain_graph=False, allow_unused=True,
+    )
+
+    def _grad_norm(grads):
+        norms = [g.detach().norm() for g in grads if g is not None]
+        if not norms:
+            return torch.zeros((), device=device)
+        return torch.norm(torch.stack(norms))
+
+    policy_grad_norm_t = _grad_norm(policy_grads)
+    value_grad_norm_t = _grad_norm(value_grads)
+
+    # Split value-loss gradient by parameter block (value_head only vs the
+    # encoder+decoder "shared" subspace) so the cosine of conflict between
+    # policy and value losses on shared params can be recovered from the
+    # logged norms. L_policy is identically zero on value_head params, so
+    # there is no analogous policy split — `policy_grad_norm == _shared`.
+    vh_param_ids = set()
+    if model.value_head is not None:
+        for vh_p in model.value_head.parameters():
+            if vh_p.requires_grad:
+                vh_param_ids.add(id(vh_p))
+    vh_norms_sq = []
+    shared_norms_sq = []
+    for p, vg in zip(params, value_grads):
+        if vg is None:
+            continue
+        n_sq = vg.detach().norm() ** 2
+        if id(p) in vh_param_ids:
+            vh_norms_sq.append(n_sq)
+        else:
+            shared_norms_sq.append(n_sq)
+    value_grad_norm_vh_t = (
+        torch.sqrt(torch.stack(vh_norms_sq).sum())
+        if vh_norms_sq else torch.zeros((), device=device)
+    )
+    value_grad_norm_shared_t = (
+        torch.sqrt(torch.stack(shared_norms_sq).sum())
+        if shared_norms_sq else torch.zeros((), device=device)
+    )
+
+    # Write combined gradient into .grad. Linearity of differentiation:
+    # ∂(policy_loss + λᵥ·value_loss)/∂θ = policy_grads[i] + λᵥ·value_grads[i].
     optimizer.zero_grad(set_to_none=True)
-    total_loss.backward()
+    for p, pg, vg in zip(params, policy_grads, value_grads):
+        if pg is None and vg is None:
+            continue
+        if pg is None:
+            g = lambda_v * vg
+        elif vg is None:
+            g = pg
+        else:
+            g = pg + lambda_v * vg
+        p.grad = g.detach()
 
     # Optional gradient clipping. We compute the unclipped grad-norm for
     # logging regardless of whether clipping is active.
@@ -382,4 +452,8 @@ def train_step_alphazero(model, optimizer, batch, opts):
         "mean_entropy_pi": float(entropy_pi.detach().cpu()),
         "mean_z": float(z_target.mean().detach().cpu()),
         "gradient_norm": float(grad_norm.detach().cpu() if torch.is_tensor(grad_norm) else grad_norm),
+        "policy_grad_norm": float(policy_grad_norm_t.detach().cpu()),
+        "value_grad_norm": float(value_grad_norm_t.detach().cpu()),
+        "value_grad_norm_vh": float(value_grad_norm_vh_t.detach().cpu()),
+        "value_grad_norm_shared": float(value_grad_norm_shared_t.detach().cpu()),
     }

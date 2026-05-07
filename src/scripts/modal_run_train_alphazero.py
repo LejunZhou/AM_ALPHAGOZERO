@@ -1050,6 +1050,317 @@ def run_f612_k40_buf5k_probe(timestamp: str = "") -> None:
     print("[modal] download results with: modal volume get am-alphagozero-volume outputs/")
 
 
+def _f61_args(
+    *,
+    run_name: str,
+    k: int = 40,
+    buffer_capacity: int = 5000,
+    lr_model: str = "5e-4",
+    lr_decay: str = "1.0",
+    temperature_schedule: str = "step30",
+    dirichlet_epsilon: str = "0.0",
+) -> list[str]:
+    """Shared F.6.1 main-run config builder. Defaults to F.6.0.6/F.6.0.7 winners.
+
+    Locked by the F.6.0.5 → F.6.1.1 ablation series:
+      lr=5e-4, wd=0, value_target_norm=none, ε=0, leaf_eval=value_head,
+      gate=ttest, gate_every=1, val_seed=42, M=1000, train_steps=200,
+      batch=512, n_iterations=100. K and buffer come from F.6.1.2 verdict.
+
+    `temperature_schedule` and `dirichlet_epsilon` are CLI-overridable so
+    F.6.2 step10 + ε-sweep variants can reuse this builder without
+    duplicating the rest of the recipe.
+    """
+    return [
+        "--graph_size", "20",
+        "--n_iterations", "100",
+        "--M_instances", "1000",
+        "--n_simulations_train", str(k),
+        "--train_steps_per_iter", "200",
+        "--buffer_capacity", str(buffer_capacity),
+        "--batch_size", "512",
+        "--gate_every", "1",
+        "--gate_mode", "ttest",
+        "--temperature_schedule", temperature_schedule,
+        "--val_size", "10000",
+        "--val_seed", "42",
+        "--leaf_eval", "value_head",
+        "--max_grad_norm", "1.0",
+        "--value_target_norm", "none",
+        "--lr_model", lr_model,
+        "--lr_decay", lr_decay,
+        "--weight_decay", "0.0",
+        "--dirichlet_epsilon", dirichlet_epsilon,
+        "--dirichlet_alpha_factor", "10.0",
+        "--wandb_project", "am-alphagozero",
+        "--wandb_mode", "online",
+        "--run_name", run_name,
+    ]
+
+
+@app.local_entrypoint()
+def run_f61_main(
+    timestamp: str = "",
+    k: str = "40",
+    buffer_capacity: str = "5000",
+) -> None:
+    """Phase F.6.1 main run — 100-iter trajectory probe at the F.6.0.5+F.6.0.6+F.6.1.1 winner recipe.
+
+    Settings (all locked by ablation series; only K and buffer are CLI-overridable
+    so the F.6.1.2 verdict can flow through without code edits):
+
+      lr=5e-4, lr_decay=1.0 (no decay), weight_decay=0,
+      value_target_norm=none, dirichlet_epsilon=0, leaf_eval=value_head,
+      gate=ttest, gate_every=1, M=1000, train_steps=200, batch=512,
+      val_seed=42, n_iterations=100, from-scratch (no --load_path).
+
+    Defaults: K=40, buffer_capacity=5000 (override via --k / --buffer-capacity).
+
+    Expected wall-clock: ~3.5-4.5 h Modal A10 single-job, ~$8-12 credits.
+    Target val_avg_cost: ≤ 3.85 by iter ~50-60 (Stage 1 ceiling).
+    """
+    from datetime import datetime, timezone
+    if not timestamp:
+        timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")
+
+    k_int = int(k)
+    buf_int = int(buffer_capacity)
+    run_name = f"f61_main_K{k_int}_buf{buf_int}_{timestamp}"
+    args = _f61_args(run_name=run_name, k=k_int, buffer_capacity=buf_int,
+                      lr_model="5e-4", lr_decay="1.0")
+
+    print(f"[modal] launching F.6.1 main run (K={k_int}, buf={buf_int}, lr=5e-4 const, 100 iter)")
+    print(f"  {run_name}")
+    h = train_alphazero_remote.spawn(*args)
+    print(f"\n[modal] awaiting {run_name} (function_call_id={h.object_id}) ...", flush=True)
+    h.get()
+    print(f"[modal] {run_name} done.", flush=True)
+    print("[modal] download results with: modal volume get am-alphagozero-volume outputs/")
+
+
+@app.local_entrypoint()
+def run_f61_main_lrdecay(
+    timestamp: str = "",
+    k: str = "40",
+    buffer_capacity: str = "5000",
+) -> None:
+    """Phase F.6.1-lrdecay variant — identical to run_f61_main but with
+    initial lr=1e-3 and per-iteration lr_decay=0.95.
+
+    lr trajectory: lr(0)=1e-3, lr(20)=3.6e-4, lr(50)=7.7e-5, lr(100)=5.9e-6.
+    Geometric mean over 100 iters ≈ 7.7e-5.
+
+    Question: does an aggressive AGZ-style schedule (high lr early, decay
+    fast) outperform the constant lr=5e-4 in F.6.1 main? Theory says high
+    lr early + decay = bigger early steps when buffer is small + small
+    later steps when policy refines. Could converge faster and tighter.
+
+    Risk: lr=1e-3 at random init is at the upper edge of stability for a
+    small transformer with no warmup; if early iters spike or diverge,
+    fall back to lr_model=5e-4.
+
+    Run this in PARALLEL with run_f61_main (one Modal app each, two A10s).
+
+    Expected wall-clock + cost: same as f61_main (~$8-12, ~4 h).
+    """
+    from datetime import datetime, timezone
+    if not timestamp:
+        timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")
+
+    k_int = int(k)
+    buf_int = int(buffer_capacity)
+    run_name = f"f61_main_lrdecay_K{k_int}_buf{buf_int}_{timestamp}"
+    args = _f61_args(run_name=run_name, k=k_int, buffer_capacity=buf_int,
+                      lr_model="1e-3", lr_decay="0.95")
+
+    print(f"[modal] launching F.6.1 lrdecay variant (K={k_int}, buf={buf_int}, lr=1e-3, decay=0.95/iter, 100 iter)")
+    print(f"  {run_name}")
+    h = train_alphazero_remote.spawn(*args)
+    print(f"\n[modal] awaiting {run_name} (function_call_id={h.object_id}) ...", flush=True)
+    h.get()
+    print(f"[modal] {run_name} done.", flush=True)
+    print("[modal] download results with: modal volume get am-alphagozero-volume outputs/")
+
+
+@app.local_entrypoint()
+def run_f61_tsp50_probe(timestamp: str = "") -> None:
+    """Phase F.6.1 TSP-50 probe — same recipe as F.6.1 K=20 winner but at TSP-50.
+
+    Settings: graph_size=50, K=50, ε=0.05, lr=5e-4 const, all other knobs
+    inherited from F.6.1 main recipe (M=1000, train_steps=200, batch=512,
+    buf=5000, gate_every=1, value_head, value_target_norm=none, wd=0,
+    temperature_schedule=step30, n_iterations=100, val_seed=42, from-scratch).
+
+    α = dirichlet_alpha_factor / N = 10/50 = 0.2 per action (vs 0.5 at TSP-20);
+    α·N = 10, matching AGZ effective concentration.
+
+    Question: does the F.6.1 recipe generalize to TSP-50? No prior Stage 4
+    TSP-50 result; AM-paper TSP-50 lands ~5.7-5.85 greedy.
+
+    Cost: ~$11-15 credits, ~5-7h wall-clock single-job (TSP-50 K=50 is
+    ~6.25× more sim compute per instance than TSP-20 K=20).
+    """
+    from datetime import datetime, timezone
+    if not timestamp:
+        timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")
+
+    args = [
+        "--graph_size", "50",
+        "--n_iterations", "100",
+        "--M_instances", "1000",
+        "--n_simulations_train", "50",
+        "--train_steps_per_iter", "200",
+        "--buffer_capacity", "5000",
+        "--batch_size", "512",
+        "--gate_every", "1",
+        "--gate_mode", "ttest",
+        "--temperature_schedule", "step30",
+        "--val_size", "10000",
+        "--val_seed", "42",
+        "--leaf_eval", "value_head",
+        "--max_grad_norm", "1.0",
+        "--value_target_norm", "none",
+        "--lr_model", "5e-4",
+        "--lr_decay", "1.0",
+        "--weight_decay", "0.0",
+        "--dirichlet_epsilon", "0.05",
+        "--dirichlet_alpha_factor", "10.0",
+        "--wandb_project", "am-alphagozero",
+        "--wandb_mode", "online",
+    ]
+    run_name = f"f61_tsp50_K50_eps05_{timestamp}"
+    args = args + ["--run_name", run_name]
+
+    print(f"[modal] launching F.6.1 TSP-50 probe (K=50, ε=0.05, lr=5e-4, 100 iter)")
+    print(f"  {run_name}")
+    h = train_alphazero_remote.spawn(*args)
+    print(f"\n[modal] awaiting {run_name} (function_call_id={h.object_id}) ...", flush=True)
+    h.get()
+    print(f"[modal] {run_name} done.", flush=True)
+    print("[modal] download results with: modal volume get am-alphagozero-volume outputs/")
+
+
+@app.local_entrypoint()
+def run_f62_step10_eps_sweep(timestamp: str = "") -> None:
+    """Phase F.6.2 — F.6.1 main recipe with step10 schedule and ε ∈ {0.05, 0.25}.
+
+    Two parallel 100-iter from-scratch runs. All settings inherited from
+    F.6.1 main (K=40, M=1000, train_steps=200, buffer_capacity=5000,
+    batch=512, lr=5e-4 const, wd=0, value_target_norm=none,
+    leaf_eval=value_head, gate=ttest gate_every=1, val_seed=42) — the
+    ONLY differences from `run_f61_main` are:
+      - --temperature_schedule step10  (cutoff = ⌈0.1·N⌉ = 2 for N=20;
+        narrower stochastic-action window than F.6.1 main's step30)
+      - --dirichlet_epsilon ∈ {0.05, 0.25}  (sweep)
+
+    Diagnostic motivation (from F.6.1 main iter-99 analysis):
+      - At K=40, value_head leaf eval was tied with greedy (Δ = +0.002).
+      - π_t entropy collapsed to 0.155 nats by iter 99 → near-one-hot targets
+        from the policy's own argmax, no improvement signal to distill.
+      - step30 added stochastic τ=1 sampling at first 6/20 steps; combined
+        with an uninformative value head, this seemed to hurt MCTS quality
+        rather than help (training-time MCTS = greedy + 0.008).
+
+    F.6.2 question: does narrowing the σ_t stochastic window (step10) +
+    AGZ-canonical exploration noise (ε=0.25) restore the improvement
+    signal? ε=0.05 is the warm-start-safe baseline (proven on Stage-1
+    warm-start probes); ε=0.25 is AGZ-canonical for from-scratch.
+
+    The trainer.py per-loss grad-norm logging from F.6.2's prep is also live
+    — iterations.csv now reports policy_grad_norm_mean / value_grad_norm_mean
+    / grad_norm_mean alongside the existing loss/entropy series.
+
+    Cost: ~$15-22 Modal credits, ~3.5-4.5h wall-clock parallel (2× A10).
+    """
+    from datetime import datetime, timezone
+    if not timestamp:
+        timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")
+
+    variants = [
+        ("f62_step10_eps05", "0.05"),
+        ("f62_step10_eps25", "0.25"),
+    ]
+    grid = []
+    for label_stem, eps_val in variants:
+        run_name = f"{label_stem}_{timestamp}"
+        args = _f61_args(
+            run_name=run_name,
+            k=40,
+            buffer_capacity=5000,
+            lr_model="5e-4",
+            lr_decay="1.0",
+            temperature_schedule="step10",
+            dirichlet_epsilon=eps_val,
+        )
+        grid.append((run_name, args))
+
+    print(f"[modal] launching {len(grid)} parallel F.6.2 step10 ε-sweep jobs (timestamp={timestamp})")
+    for label, _ in grid:
+        print(f"  {label}")
+
+    handles = {
+        label: train_alphazero_remote.spawn(*args) for label, args in grid
+    }
+    print(f"\n[modal] all {len(handles)} jobs spawned. Awaiting completion...")
+    for label, h in handles.items():
+        print(f"[modal] awaiting {label} (function_call_id={h.object_id}) ...", flush=True)
+        h.get()
+        print(f"[modal] {label} done.", flush=True)
+    print(f"\n[modal] all {len(handles)} F.6.2 step10 ε-sweep jobs complete.")
+    print("[modal] download results with: modal volume get am-alphagozero-volume outputs/")
+
+
+@app.local_entrypoint()
+def run_f62_eps25_resume50(timestamp: str = "") -> None:
+    """Resume f62_step10_eps25 from iter-99.pt for +50 iterations.
+
+    Same recipe as run_f62_step10_eps_sweep ε=0.25 (step10, K=40, M=1000,
+    train_steps=200, buffer=5000, batch=512, lr=5e-4 const, wd=0,
+    value_target_norm=none, leaf_eval=value_head, gate=ttest gate_every=1,
+    val_seed=42). Loads model + best_model + optimizer + lr_scheduler + RNG
+    from iter-99.pt and the sibling buffer.pt; coach resumes at iter 100
+    and runs through iter 149.
+
+    Picks up the value-grad split telemetry added after the original run
+    finished — iterations.csv on the resumed run will include
+    `value_grad_norm_vh_mean` + `value_grad_norm_shared_mean` so we can
+    compute cos(θ_shared) iter-by-iter.
+
+    Cost: ~$8-12 Modal credits, ~1.5-2h wall-clock single A10.
+    """
+    from datetime import datetime, timezone
+    if not timestamp:
+        timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")
+
+    resume_from = (
+        "outputs/tsp_20/"
+        "f62_step10_eps25_20260507T024345_20260507T024355/iter-99.pt"
+    )
+    run_name = f"f62_step10_eps25_resume50_{timestamp}"
+    args = _f61_args(
+        run_name=run_name,
+        k=40,
+        buffer_capacity=5000,
+        lr_model="5e-4",
+        lr_decay="1.0",
+        temperature_schedule="step10",
+        dirichlet_epsilon="0.25",
+    )
+    # Override n_iterations 100 -> 50 (resume runs +50 from iter 100 → 149).
+    idx = args.index("--n_iterations")
+    args[idx + 1] = "50"
+    args.extend(["--resume_from", resume_from])
+
+    print(f"[modal] launching F.6.2 ε=0.25 resume (+50 iter, target 100→149) from iter-99.pt")
+    print(f"  {run_name}")
+    print(f"  resume_from={resume_from}")
+    h = train_alphazero_remote.spawn(*args)
+    print(f"\n[modal] awaiting {run_name} (function_call_id={h.object_id}) ...", flush=True)
+    h.get()
+    print(f"[modal] {run_name} done.", flush=True)
+    print("[modal] download results with: modal volume get am-alphagozero-volume outputs/")
+
+
 @app.local_entrypoint()
 def run_all(timestamp: str = "") -> None:
     """Spawn the four F.4 + F.3 jobs in parallel on Modal A10.

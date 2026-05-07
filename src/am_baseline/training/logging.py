@@ -278,6 +278,8 @@ class MetricsLogger:
         self.iter_csv_writer.writerow([
             'iter', 'total_instances', 'val_avg_cost',
             'policy_loss_mean', 'value_loss_mean', 'mean_entropy_pi',
+            'policy_grad_norm_mean', 'value_grad_norm_mean', 'grad_norm_mean',
+            'value_grad_norm_vh_mean', 'value_grad_norm_shared_mean',
             'gated', 'accepted', 'mcts_wall_s', 'train_wall_s', 'buffer_size',
         ])
         self.iter_csv_file.flush()
@@ -297,6 +299,15 @@ class MetricsLogger:
         wandb.define_metric("policy_loss_mean", step_metric="iteration")
         wandb.define_metric("value_loss_mean", step_metric="iteration")
         wandb.define_metric("mean_entropy_pi", step_metric="iteration")
+        wandb.define_metric("policy_grad_norm_mean", step_metric="iteration")
+        wandb.define_metric("value_grad_norm_mean", step_metric="iteration")
+        wandb.define_metric("grad_norm_mean", step_metric="iteration")
+        wandb.define_metric("value_grad_norm_vh_mean", step_metric="iteration")
+        wandb.define_metric("value_grad_norm_shared_mean", step_metric="iteration")
+        wandb.define_metric("policy_grad_norm_step", step_metric="alphazero_train_step")
+        wandb.define_metric("value_grad_norm_step", step_metric="alphazero_train_step")
+        wandb.define_metric("value_grad_norm_vh_step", step_metric="alphazero_train_step")
+        wandb.define_metric("value_grad_norm_shared_step", step_metric="alphazero_train_step")
         wandb.define_metric("gated", step_metric="iteration")
         wandb.define_metric("accepted", step_metric="iteration")
         wandb.define_metric("mcts_wall_s", step_metric="iteration")
@@ -320,6 +331,11 @@ class MetricsLogger:
                 'value_loss': [],
                 'total_loss': [],
                 'mean_entropy_pi': [],
+                'policy_grad_norm': [],
+                'value_grad_norm': [],
+                'gradient_norm': [],
+                'value_grad_norm_vh': [],
+                'value_grad_norm_shared': [],
             }
             self._iter_step_count = 0
             self._iter_current = iter_idx
@@ -343,6 +359,11 @@ class MetricsLogger:
                 'value_loss_step': float(metrics.get('value_loss', 0.0)),
                 'total_loss_step': float(metrics.get('total_loss', 0.0)),
                 'mean_entropy_pi_step': float(metrics.get('mean_entropy_pi', 0.0)),
+                'policy_grad_norm_step': float(metrics.get('policy_grad_norm', 0.0)),
+                'value_grad_norm_step': float(metrics.get('value_grad_norm', 0.0)),
+                'grad_norm_step': float(metrics.get('gradient_norm', 0.0)),
+                'value_grad_norm_vh_step': float(metrics.get('value_grad_norm_vh', 0.0)),
+                'value_grad_norm_shared_step': float(metrics.get('value_grad_norm_shared', 0.0)),
                 # Stage-1-aligned aliases (kept on the `global_step` axis):
                 'global_step': int(self._alphazero_global_step),
                 'value_loss': float(metrics.get('value_loss', 0.0)),
@@ -371,21 +392,28 @@ class MetricsLogger:
         self._ensure_wandb_iter_axis()
 
         # Flush per-step accumulators into running means.
+        def _mean(key):
+            vals = (self._iter_step_accum or {}).get(key, [])
+            return sum(vals) / max(1, len(vals)) if vals else float('nan')
+
         if self._iter_current == iter and self._iter_step_count > 0:
-            acc = self._iter_step_accum or {}
-            policy_loss_mean = (
-                sum(acc.get('policy_loss', [])) / max(1, len(acc.get('policy_loss', [])))
-            )
-            value_loss_mean = (
-                sum(acc.get('value_loss', [])) / max(1, len(acc.get('value_loss', [])))
-            )
-            mean_entropy_pi = (
-                sum(acc.get('mean_entropy_pi', [])) / max(1, len(acc.get('mean_entropy_pi', [])))
-            )
+            policy_loss_mean = _mean('policy_loss')
+            value_loss_mean = _mean('value_loss')
+            mean_entropy_pi = _mean('mean_entropy_pi')
+            policy_grad_norm_mean = _mean('policy_grad_norm')
+            value_grad_norm_mean = _mean('value_grad_norm')
+            grad_norm_mean = _mean('gradient_norm')
+            value_grad_norm_vh_mean = _mean('value_grad_norm_vh')
+            value_grad_norm_shared_mean = _mean('value_grad_norm_shared')
         else:
             policy_loss_mean = float('nan')
             value_loss_mean = float('nan')
             mean_entropy_pi = float('nan')
+            policy_grad_norm_mean = float('nan')
+            value_grad_norm_mean = float('nan')
+            grad_norm_mean = float('nan')
+            value_grad_norm_vh_mean = float('nan')
+            value_grad_norm_shared_mean = float('nan')
 
         val_cell = float(val_avg_cost) if val_avg_cost is not None else ''
         gated_cell = int(bool(gated))
@@ -398,6 +426,8 @@ class MetricsLogger:
         self.iter_csv_writer.writerow([
             iter, int(total_instances), val_cell,
             policy_loss_mean, value_loss_mean, mean_entropy_pi,
+            policy_grad_norm_mean, value_grad_norm_mean, grad_norm_mean,
+            value_grad_norm_vh_mean, value_grad_norm_shared_mean,
             gated_cell, accepted_cell,
             float(mcts_wall_s), float(train_wall_s), int(buffer_size),
         ])
@@ -407,10 +437,12 @@ class MetricsLogger:
         print(
             'iter={} total_instances={} val_avg_cost={} '
             'policy_loss={:.4f} value_loss={:.4f} entropy={:.4f} '
+            'pg_norm={:.4f} vg_norm={:.4f} '
             'gated={} accepted={} mcts_s={:.2f} train_s={:.2f} buf={}'.format(
                 iter, int(total_instances),
                 f'{val_avg_cost:.6f}' if val_avg_cost is not None else 'NA',
                 policy_loss_mean, value_loss_mean, mean_entropy_pi,
+                policy_grad_norm_mean, value_grad_norm_mean,
                 gated_cell, accepted_cell, mcts_wall_s, train_wall_s, buffer_size,
             )
         )
@@ -422,6 +454,11 @@ class MetricsLogger:
             self.tb_logger.add_scalar('policy_loss_mean', policy_loss_mean, iter)
             self.tb_logger.add_scalar('value_loss_mean', value_loss_mean, iter)
             self.tb_logger.add_scalar('mean_entropy_pi', mean_entropy_pi, iter)
+            self.tb_logger.add_scalar('policy_grad_norm_mean', policy_grad_norm_mean, iter)
+            self.tb_logger.add_scalar('value_grad_norm_mean', value_grad_norm_mean, iter)
+            self.tb_logger.add_scalar('grad_norm_mean', grad_norm_mean, iter)
+            self.tb_logger.add_scalar('value_grad_norm_vh_mean', value_grad_norm_vh_mean, iter)
+            self.tb_logger.add_scalar('value_grad_norm_shared_mean', value_grad_norm_shared_mean, iter)
             self.tb_logger.add_scalar('mcts_wall_s', float(mcts_wall_s), iter)
             self.tb_logger.add_scalar('train_wall_s', float(train_wall_s), iter)
             self.tb_logger.add_scalar('buffer_size', int(buffer_size), iter)
@@ -435,6 +472,11 @@ class MetricsLogger:
                 'policy_loss_mean': policy_loss_mean,
                 'value_loss_mean': value_loss_mean,
                 'mean_entropy_pi': mean_entropy_pi,
+                'policy_grad_norm_mean': policy_grad_norm_mean,
+                'value_grad_norm_mean': value_grad_norm_mean,
+                'grad_norm_mean': grad_norm_mean,
+                'value_grad_norm_vh_mean': value_grad_norm_vh_mean,
+                'value_grad_norm_shared_mean': value_grad_norm_shared_mean,
                 'gated': gated_cell,
                 'mcts_wall_s': float(mcts_wall_s),
                 'train_wall_s': float(train_wall_s),

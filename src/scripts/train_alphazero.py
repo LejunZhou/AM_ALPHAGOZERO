@@ -77,9 +77,11 @@ def parse_opts(argv=None):
                              'decoder + value_head. Tests the "shared encoder is the noise '
                              'channel" hypothesis from F.3 v3-v5 plateau diagnosis.')
     parser.add_argument('--temperature_schedule', type=str, default='step30',
-                        choices=['const', 'step30', 'step50'],
+                        choices=['const', 'step10', 'step30', 'step50'],
                         help='Per-tour-step temperature schedule for action selection σ_t. '
-                             'Note: training target π_t is always raw τ=1 (decoupled per spec §4.2).')
+                             'step10/30/50 keep τ=cfg.temperature for first 10/30/50%% of '
+                             'tour-steps (⌈p·N⌉) and switch to τ=0 (argmax) afterwards. '
+                             'Training target π_t is always raw τ=1 (decoupled per spec §4.2).')
     parser.add_argument('--dirichlet_epsilon', type=float, default=0.25,
                         help='Dirichlet root-noise mixing weight (AGZ default 0.25).')
     parser.add_argument('--dirichlet_alpha_factor', type=float, default=10.0,
@@ -90,6 +92,10 @@ def parse_opts(argv=None):
                         help='L2 weight decay applied via the optimizer (AGZ canonical 1e-4).')
     parser.add_argument('--lr_model', type=float, default=1e-4,
                         help='Adam learning rate for the working model.')
+    parser.add_argument('--lr_decay', type=float, default=1.0,
+                        help='Per-iteration multiplicative lr decay. lr(iter k) = lr_model * lr_decay**k. '
+                             'Default 1.0 = no decay (Stage-4 default). Stage-1-style schedule uses 1.0; '
+                             'AGZ-style step-anneal (1e-2 → 1e-3 → 1e-4) is a separate ablation.')
     parser.add_argument('--leaf_eval', type=str, default='value_head',
                         choices=['value_head', 'rollout'],
                         help='MCTS leaf evaluator: AGZ value head (default) or AlphaGo-Lee-style rollout.')
