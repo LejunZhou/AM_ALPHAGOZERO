@@ -429,63 +429,31 @@ class MCTSCoach:
 >
 > Phases A-E (visit-dist exposure, replay buffer, self-play generator, coach orchestrator, temperature schedule) are needed for either variant — they remain unchanged.
 
-#### Warm-start variant (deviated from proposal — kept for the lr=1e-5 / freeze-encoder findings)
+#### Warm-start variant (F.1–F.5) — CLOSED 2026-05-02
 
-**F.1 New script `src/scripts/train_alphazero.py`** (~180 LOC).
-- CLI mirrors `train.py` plus Stage 4 flags:
-  - `--load_path` (path to Stage 1 checkpoint, **required**)
-  - `--n_iterations` (default 100)
-  - `--M_instances` (default 1000) — instances per iteration
-  - `--n_simulations_train` (default 50) — K during self-play
-  - `--buffer_capacity` (default 200000) — instance count
-  - `--train_steps_per_iter` (default 200) — minibatch updates per iteration
-  - `--batch_size` (default 512)
-  - `--gate_every` (default 5)
-  - **No `--gate_val_size`** — `RolloutBaseline.__init__` reads `opts.val_size` once at construction time and freezes the validation set; a dedicated `--gate_val_size` flag would be a silent no-op unless we monkey-patch `opts.val_size` before the baseline is built. Stage 4 reuses Stage 1's existing `--val_size` (default 10000) for the gating dataset; override with `--val_size 100` for smoke tests.
-  - `--temperature_schedule {const,step30,step50}` (default `step30` — closest to AGZ Methods §Self-play, scaled to TSP plies)
-  - `--dirichlet_epsilon` (default 0.25)
-  - `--dirichlet_alpha_factor` (default 10.0; α = factor / N)
-  - `--lambda_v` (default 1.0)
-  - `--weight_decay` (default 1e-4)
-  - `--lr_model` (default 1e-4)
-  - `--leaf_eval {value_head,rollout}` (default `value_head`)
-  - `--resume_from <path>` (resume from a checkpoint)
-- Loads Stage 1 checkpoint; constructs `MCTSCoach`; calls `coach.learn(opts.n_iterations)`.
+**Status:** infrastructure landed (F.1 CLI, F.2 smoke battery, F.5 plotter); pilot work (F.3 v1-v5 local + F.4 Modal batch a1/a2/b1/b2) ran 2026-04-30 → 2026-05-02 and is **superseded by F.6 as the proposal mainline**. Detailed retrospective + transferable findings live in [_progress/stage4_progress.md §Phase F.1–F.5](../_progress/stage4_progress.md). Headline: only `b2 (lr=1e-5)` beat Stage 1 (Δ=−0.00137, p<0.0001), and that lr finding does NOT transfer to from-scratch (F.6.0.5 below re-derived lr=5e-4 from first principles).
 
-**F.2 Smoke battery `src/scripts/smoke_alphazero.py`** (~200 LOC, totaling A1-A6).
-- A1 (Phase B): construct a 5-instance buffer, run `train_step_alphazero` once → finite loss, gradients flow.
-- A2 (Phase C): generate 10 instances with K=20, verify π_t shape + sum.
-- A3 (Phase E): self-play with `temperature_schedule='step30'`. Action-distribution σ_t entropy decays sharply at step ⌈0.3·N⌉=6 (collapses to one-hot thereafter); training-target π_t entropy stays bounded above zero throughout (because π_t is always τ=1 normalized, decoupled from σ_t per spec §4.2 choice B).
-- A4 (tree_reuse=True, production config): legality/support/finiteness checks on `pi_t` at each tour-step — sums to 1, **support(pi_t) ⊆ unvisited(s_t)** (subset; legal-but-unexplored actions may have N=0 → π=0), `argmax` is unvisited, no inf/nan, non-negative. No cumulative-count bound (tree reuse makes `Σ_t Σ_a N(s_t, a)` grow above K·N legitimately). A4-strict (tree_reuse=False, K=50): `Σ_a N(s_t, a) == K` at every step (one increment per simulation, no stored root-node visit).
-- A5: gating no-op when `gate_every > n_iterations` → no `epoch_callback` calls.
-- A6: 3 iterations end-to-end with M=10, K=20 → no NaN, val_avg_cost finite, checkpoint round-trips through `--resume_from`.
+**Infrastructure built (now reused by F.6 and Track 4):**
 
-**F.3 TSP-20 pilot run.**
-- Warm-start from `outputs/tsp_20/stage1_tsp20_canonical_20260423T103541/epoch-99.pt`.
-- Config: 20 iterations × M=1000 × K=50 × `train_steps_per_iter=100` × `batch_size=512` × `buffer_capacity=50_000` (~50-iter window, closer to AGZ's ~20-iter ratio than the 200K main-run default; surfaces staleness early if it exists).
-- Per-iteration wall-clock estimate (RTX 4060): MCTS ~30 s (extrapolated from Stage 3 TSP-20 K=20 cpp_batch bs=64 = 8.1 s; K=50 ≈ 20 s) + train ~10 s = ~40 s/iter. **Total ~15 min.**
-- Output: `outputs/tsp_20/stage4_pilot_<timestamp>/`.
-- **Pilot pass conditions** (must all hold to proceed to F.4):
-  - val_avg_cost at iter 20 is ≤ Stage 1's val_avg_cost (3.84443 from `_progress/stage1_progress.md` bs=2048, or 3.83943 from canonical bs=512) within noise.
-  - No NaN losses across all iterations.
-  - At least one gating call (gate_every=5, n_iterations=20 → 4 gates).
-  - Sample-efficiency curve trends downward (val_avg_cost vs iter monotone non-increasing within ±0.001 noise band).
+| sub-task | artifact | role going forward |
+|---|---|---|
+| F.1 | [src/scripts/train_alphazero.py](../src/scripts/train_alphazero.py) | Stage 4 launcher CLI; F.6 made `--load_path` optional for from-scratch. |
+| F.2 | [src/scripts/smoke_alphazero.py](../src/scripts/smoke_alphazero.py) | A1–A6 smoke battery; gates every Stage 4 code change. |
+| F.3 | [src/scripts/probe_mcts_quality.py](../src/scripts/probe_mcts_quality.py) | MCTS-vs-greedy buffer-quality probe; reused for F.6.0 mechanism analysis + F.6.1.6 vh-bias probe chain. |
+| F.4 (Modal batch) | [src/scripts/modal_run_train_alphazero.py](../src/scripts/modal_run_train_alphazero.py) + [src/scripts/compare_stage1_vs_stage4.py](../src/scripts/compare_stage1_vs_stage4.py) | Modal launcher pattern + apples-to-apples seed=42 paired-eval comparator. |
+| F.5 | [src/scripts/plot_stage4.py](../src/scripts/plot_stage4.py) | Sample-efficiency plotter (log-x Stage1 vs Stage4 + Gurobi/Stage1/Stage3-K400 horizontals). Re-pointed at F.6's output dir for the proposal-aligned headline plot. |
 
-**F.4 TSP-20 main run** (after pilot passes).
-- Same recipe scaled up: 100 iterations × M=1000 × K=100 × `train_steps_per_iter=200` × `batch_size=512`.
-- Per-iteration wall-clock: MCTS ~60 s (K=100 cpp_batch bs=64 extrapolated) + train ~20 s = ~80 s/iter. **Total ~2.2 h.**
-- Output: `outputs/tsp_20/stage4_main_<timestamp>/`.
-- Gates every 5 iterations → 20 gating opportunities.
+**Transferable findings — five lessons load-bearing for future work** (full details in progress doc):
 
-**F.5 Headline plot** — `src/scripts/plot_stage4.py` (~80 LOC).
-- Reads `iterations.csv` from F.4 OR F.6 (see below) plus `outputs/tsp_20/stage1_tsp20_canonical_*/epochs.csv` from Stage 1.
-- Output: `outputs/stage4/figures/sample_efficiency_tsp20.png` — `x = total_instances` (log scale), `y = val_avg_cost`, two curves: Stage 1 REINFORCE (epoch checkpoints) vs Stage 4 (per-iteration).
-- Annotate with horizontal lines: Gurobi optimum (3.8279), Stage 1 final val_avg_cost, Stage 3 K=400 rollout MCTS (3.8312).
-- **For the proposal-aligned headline plot, F.5 should be re-run with F.6's output dir** (from-scratch Stage 4) once F.6 has converged enough to make the claim meaningful.
-
-**Wall-clock for warm-start variant:** ~15 min pilot + ~2.2 h main + plot = **~2.5 h compute total.**
+1. **AGZ-canonical exploration (ε=0.25 + step30 + τ=1) is toxic on a converged warm-start.** Probe: MCTS-K=50-vh-step30+ε=0.25 produces tours +0.246 worse than greedy θ★. Memory: `project_alphagozero_warmstart_exploration.md`. **Does NOT transfer to from-scratch** — F.6.0's 12-variant grid found ε=0.25 in the rollout winner cluster from random init.
+2. **Bug fix commit `419a857`:** `make_self_play_config` was hardcoding `leaf_eval`/`dirichlet_*`/`temperature_schedule` and ignoring CLI flags. Production bug; would have bitten F.6.
+3. **Stage 1 is at the TSP-20 architectural ceiling.** Even strong MCTS (K=200 rollout) beats greedy on only 39% of instances; the other 61% tie or lose. Motivates TSP-50 escalation (now Track 4).
+4. **lr=1e-5 is a warm-start-specific fix.** Adam at lr=1e-4 overshoots from a converged checkpoint, but from random init there is no converged checkpoint to overshoot from. F.6.0.5 derived **lr=5e-4** for from-scratch via CE-distillation gradient analysis. Memory: `project_lr_fairness_for_stage4.md`.
+5. **Pin `--val_seed` for cross-run comparison.** Pre-F.6 runs each rolled a fresh 10K val draw with no seed → SEM ~0.003, per-run numbers not directly comparable. F.6 pins `--val_seed 42` at the source.
 
 #### Proposal-aligned variant (NEW — added 2026-05-02 after discrepancy review)
+
+> **Execution outcome (2026-05-13).** F.6.0 → F.6.0.5 → F.6.0.6 → F.6.0.7-1.1 → F.6.1 → F.6.1.3 → F.6.1.4 → F.6.1.4.b → F.6.1.4.c → F.6.1.6 → bottleneck-probe chain → lv0 ablation all executed across 2026-05-02 → 2026-05-13. Retrospective + transferable findings in [_progress/stage4_progress.md §Phase F.6](../_progress/stage4_progress.md). Headline outcomes: (a) F.6.0.5 re-derived `lr=5e-4, wd=0, value_target_norm=none` from CE-gradient analysis (lr=1e-4 was Stage-1-inherited, not appropriate); (b) F.6.1 hit a 3.92 plateau diagnosed via bottleneck-probe chain as a **value_head leaf-eval structural bias** (RMS 0.074 at every step ≥ 2); (c) F.6.1.4 → F.6.1.4.c lr=1e-4 unlock chain reached val 3.8498 (gap to AM_S1 greedy ~0.008) at 225 iter ≈ 225K instances ≈ 18% of Stage 1's budget; (d) lv0 ablation (`leaf_eval=rollout` + `λᵥ=0` at training time) reached **3.8486 — beats Stage 1 canonical greedy by 0.01** and closes the proposal sample-efficiency claim at TSP-20. The plan-file design text below remains intact as the pre-execution archival record.
 
 **F.6 From-scratch TSP-20 main run** (aligned with `proposal.md` Stage 4 expected outcomes lines 133-142).
 
@@ -510,138 +478,52 @@ class MCTSCoach:
 
 Decision rule for picking F.6.1 defaults: **lowest val_avg_cost at iter 50 wins** (or steepest decline if multiple variants tie within ±0.001 noise band).
 
-**F.6.0.5 Learning-rate re-derivation for Stage-4 CE distillation** *(added 2026-05-03 in response to F.6.0 results — winner stuck at val_avg_cost=3.9338, ~0.094 above Stage 1's 3.83943).*
+**F.6.1 From-scratch trajectory probe.** *(Scope reduced 2026-05-02: 100 iter, not 1000 — treating Stage 4 from-scratch as a proof-of-concept trajectory check rather than a full convergence run.)*
+- Recipe: **100 iterations** × M=1000 × **K=100** × `train_steps_per_iter=200` × `buffer_capacity=200_000` × `lr_model=1e-4` (later superseded by Stage 5 §A recipe lockdown — lr=5e-4 / wd=0 / value_target_norm=none) × `leaf_eval` and `dirichlet_epsilon` per F.6.0 winner × `gate_mode={ttest or always per F.6.0}`.
+- **Resume from F.6.0 winner's `iter-49.pt`** to avoid re-running the first 50 iters under the winning recipe.
+- **K=100 chosen** (vs K=200 originally proposed). Probe ([_progress/stage4_progress.md](../_progress/stage4_progress.md)) showed K=100 → K=200 gives only +33% MCTS-vs-greedy gap improvement at 2× cost.
 
-The F.6 setup pinned `lr_model=1e-4` (Stage 1's default) for apples-to-apples sample-efficiency comparison. F.6.0's slow convergence motivates re-deriving lr from the gradient calculation, since Stage 1 (REINFORCE) and Stage 4 (CE distillation) have qualitatively different gradient regimes.
+**F.6.2 Pass conditions evaluation (trajectory-probe / convergence claim only).** F.6.1 at 100 iter is a **trajectory probe** demonstrating the proposal Stage 4 expected outcome:
+- (3') `val_avg_cost` curve shows visible downward trend across F.6.1 iters (final < initial by ≥ 0.05).
+- (4) At least one gate accept (criterion 4 — automatic with `--gate_mode always`).
+- F.6.0 + F.6.1 trajectory smoothly continuous (sanity-check the resume worked).
 
-*Gradient regime comparison ([trainer.py:307-324](../src/am_baseline/training/trainer.py#L307) for Stage 4; [trainer.py:120-225](../src/am_baseline/training/trainer.py#L120) for Stage 1):*
+> **Definitive claim conditions moved to Stage 5** ([`_plans/stage5_plan.md`](stage5_plan.md) §Acceptance criteria): (1c) sample efficiency at matched x; (2) ultimate quality ≤ 3.8312; (3) strict monotonicity within ±0.001. These require recipe-tuning depth, lr-schedule chains, ablation analysis, and TSP-50 scaling that fall under proposal Stage 5 ("Systematic Experiments and Ablations").
 
-- **Stage 4 CE policy gradient on logits:** ∂L_policy/∂ℓ_j = p_j − π_j^target. **Bounded** — each component ∈ [−1, 1]; per-row L2 ≤ √2. Per-element grad scale O(1).
-- **Stage 1 REINFORCE policy gradient on logits:** ∂L_reinforce/∂ℓ^(t)_j = (L_tour − b_l)·(1[a_t=j] − p_j). **Advantage-scaled** — magnitude grows with |cost − baseline|, summed over N tour-steps.
-- Empirical match ([probe_grad_norm.py](../src/scripts/probe_grad_norm.py), n=30, random init, F.6.0-scale): Stage 4 grad-norm mean = **3.76**, Stage 1 = **90.87**. Ratio ~24× consistent with O(1) vs O(advantage·N) prediction. Local production-batch proxy (`batch_size=512`, 10 CPU steps, 2026-05-03): Stage 4 mean = **5.20**, Stage 1 = **35.37**. Both regimes still exceed `max_grad_norm=1.0`, so raw gradient scale is not a reason to lower Stage 4 LR.
-
-*Why lr=1e-4 is conservative for Stage 4:*
-
-Both regimes use Adam ([coach.py:857-861](../src/am_baseline/training/coach.py#L857)) and `max_grad_norm=1.0`. The clip is active in the probes, so it is not a raw-gradient no-op. But because it is active for both regimes, and Adam is approximately scale-invariant to uniform gradient magnitude (uniform `g → c·g` rescales `m → c·m`, `v → c²·v`, leaving `lr · m̂/√v̂` close to unchanged), the practical control knob is still the optimizer step size and update budget, not the unnormalized Stage 1 vs Stage 4 grad-norm ratio. **Per-step parameter movement is governed mainly by `lr` in both regimes.**
-
-Budget arithmetic:
-```
-Stage 1 full convergence:  ~250,000 grad steps × lr=1e-4  ⇒ ~25 units parameter drift
-Stage 4 F.6.0:              10,000 grad steps × lr=1e-4  ⇒ ~ 1 unit
-                                                          ⇒ Stage 4 is at ~4% of Stage 1's drift
-```
-
-Stage 4 distillation is structurally **supervised CE on a transformer**. Reference Adam lrs: BERT-base 1e-4 (with warmup), nanoGPT 6e-4, ViT classification 1e-3. **lr=1e-4 sits at the conservative end** of this range. To match Stage 1's 25-unit drift budget within F.6.1's added 20K steps (30K total), required lr ≈ 25/30,000 ≈ **8.3e-4**.
-
-*Recommendation:* **lr=5e-4 for F.6.1** (geometric mean of principled range 3e-4 – 1e-3, halfway between Stage-1-inheritance and budget-matching). 5× faster expected convergence than F.6.0, with margin below Adam stability ceiling for noisy bootstrapping CE targets. Clip=1.0 retained (catches outliers without binding typical steps under Adam scale-invariance).
-
-*Validation — narrow 3-variant Modal smoke (`run_f605_lr_validation`, ~$8-12, ~1.7 h parallel):*
-
-Hold-fixed at F.6.0 winner config: leaf_eval=rollout, ε=0.25, gate_mode=ttest, K=100, M=1000, train_steps_per_iter=200, buffer=200K, batch_size=512, val_seed=42, max_grad_norm=1.0, **n_iterations=25** (half of F.6.0 — Adam typically discriminates lr scales by step 1k-2k = iter 5-10).
-
-V3 was added 2026-05-04 to disentangle the **weight_decay** confound between regimes: Stage 1 ([train.py:85-92](../src/scripts/train.py#L85-L92)) uses Adam with no `weight_decay` argument → PyTorch default `wd=0` (matches AM-paper convention). Stage 4 ([coach.py:857-861](../src/am_baseline/training/coach.py#L857-L861)) uses `weight_decay=1e-4` (AGZ-canonical L2). Theoretical impact at this scale is below the val_avg_cost noise floor (Adam-coupled L2 contribution ≈ `lr · wd · θ ≈ 5e-8` per step → ~`2.5e-4` cumulative over 5K steps), but verifying empirically removes the apples-to-apples objection.
-
-| variant | lr | weight_decay | role |
-|---|---|---|---|
-| V1 (control) | 1e-4 | 1e-4 | F.6.0-winner replication; sanity that V2/V3 is comparable to F.6.0 |
-| V2 (analytical) | 5e-4 | 1e-4 | first-principles recommendation at Stage-4 wd convention |
-| V3 (apples-to-apples) | 5e-4 | 0 | most apples-to-apples with Stage 1 (lr-only intervention removes wd confound) |
-
-*Pass criteria — two-step decision rule for F.6.1:*
-
-**Step 1 (lr decision):** V2 OR V3 reaches val_avg_cost(iter 25) ≤ V1 − 0.02, AND that variant's trajectory is monotone-decreasing without per-iter regression > 0.05, AND that variant's final policy_loss within 30% of V1's (no divergence).
-
-If neither V2 nor V3 passes Step 1: drop F.6.1 to **lr=3e-4, wd=1e-4** and document failure mode. Don't run additional variants — go straight to F.6.1.
-
-**Step 2 (wd decision, only if Step 1 passed):** compare V3 vs V2 directly:
-- |V3 − V2| < 0.005 → wd doesn't confound at this scale. Adopt **V2 settings (lr=5e-4, wd=1e-4)** for F.6.1 to keep AGZ-canonical L2.
-- V3 < V2 by ≥ 0.01 → wd=0 helps materially. Adopt **V3 settings (lr=5e-4, wd=0)** for F.6.1; document Stage 4 should drop AGZ-canonical L2 in favor of Stage-1/AM-paper convention.
-- V3 > V2 by ≥ 0.01 → wd=1e-4 helps materially (rare). Adopt V2 settings; document the win.
-
-*If F.6.1 succeeds:* F.6.1 default lr (and possibly wd) changes per the decision rule, superseding the lr=1e-4 fixed-by-F.6-setup rule. The proposal claim should then be worded as a regime-appropriate Stage 4 optimizer choice, not "identical LR to Stage 1." Keep `1e-4` as the control curve and treat `1e-3` as an LR ablation unless it clears the same stability checks.
-
-**F.6.1 From-scratch trajectory probe.** *(Scope reduced 2026-05-02: 100 iter, not 1000 — treating Stage 4 from-scratch as a proof-of-concept trajectory check rather than a full convergence run. Decision: don't auto-scale to 1000 even if 100 iter shows promise; re-decide based on data.)*
-- Recipe: **100 iterations** × M=1000 × **K=100** × `train_steps_per_iter=200` × `buffer_capacity=200_000` × `lr_model={pending F.6.0.5 Step 1; 5e-4 if V2 or V3 passes, 3e-4 fallback}` × `weight_decay={pending F.6.0.5 Step 2; 1e-4 if V2 wins or V2≈V3, 0 if V3 wins by ≥0.01}` × `leaf_eval={value_head or rollout per F.6.0}` × `dirichlet_epsilon={0.0 / 0.05 / 0.25 per F.6.0}` × `gate_mode={ttest or always per F.6.0}`.
-- **Resume from F.6.0 winner's `iter-49.pt`** to avoid re-running the first 50 iters under the winning recipe. Combined trajectory after F.6.1 = 50 (F.6.0) + 100 (F.6.1) = **150 iter, ~150K instances total**.
-- **K=100 chosen** (vs K=200 originally proposed). Probe ([_progress/stage4_progress.md:115-127](../_progress/stage4_progress.md#L115-L127)) showed K=100 → K=200 gives only +33% MCTS-vs-greedy gap improvement at 2× cost; from random init the policy itself is the early-iter bottleneck, not MCTS depth. K=200 reserved for F.6.3 escalation if 100-iter trajectory shows promise but hasn't converged.
-- Per-iter wall-clock estimate (Modal A10):
-  - K=100 value_head: ~20 s/iter → **100 iter ≈ 33 min, ~$0.30-0.50 in credits**.
-  - K=100 rollout: ~130 s/iter → **100 iter ≈ 3.6 h, ~$2-3 in credits**.
-- Output: `outputs/tsp_20/stage4_main_fromscratch_<timestamp>/`.
-- Persist iter-*.pt every 25 iters at this scale.
-
-**Scope-reduction implication for F.6.2 acceptance criteria:** at 150 iter / 150K total instances, F.6.1 is at ~12% of Stage 1's first epoch (1.28M instances). Criteria 1c (sample efficiency at val ≤ 3.83943) and 2 (ultimate quality val ≤ 3.8312) are unlikely to be definitively satisfied — both need convergence which from random init likely takes 500-2000+ iters. F.6.1 at this scope answers a different question: **"is the from-scratch loop visibly learning, and at what rate?"** Pass criteria 1c/2 are deferred to F.6.3 if escalation is warranted.
-
-**F.6.2 Pass conditions evaluation.** With F.6.1 scoped to 100 iter (150 iter combined with F.6.0 resume = 150K instances), this is a **trajectory probe** rather than a final-claim run. Conditions are split into "should hold for the probe to be informative" and "would be needed for a definitive proposal claim":
-
-*Trajectory-probe conditions (F.6.1 at 100 iter):*
-- (3') `val_avg_cost` curve shows visible downward trend across F.6.1 iters (e.g., final < initial by ≥ 0.05 — much looser than the strict ±0.001 noise band; 100 iter is too short to expect strict monotonicity).
-- (4) At least one gate accept (criterion 4 — automatic with `--gate_mode always`; with `--gate_mode ttest` may not fire at this scale).
-- F.6.0 winner trajectory + F.6.1 trajectory smoothly continuous (sanity-check the resume worked).
-
-*Definitive claim conditions (deferred to F.6.3 if 100-iter trajectory warrants):*
-- (1c) Sample efficiency: at any matched cumulative-instances-seen, F.6.1's val_avg_cost ≤ Stage 1's val_avg_cost. Compare via F.5 plot.
-- (2) Ultimate quality: val_avg_cost ≤ 3.8312 (Stage 3 K=400 rollout).
-- (3) Strict monotonicity within ±0.001 noise band.
-
-**F.6.3 Optional escalation paths if F.6.1's 100-iter trajectory shows promise.**
-- **F.6.3.a Continue to 1000 iters at K=100** (resume from F.6.1 final) — ~6 h value_head / ~36 h rollout, ~$3-25 in credits. Tests whether the 100-iter trend continues to convergence.
-- **F.6.3.b Step up to K=200** (resume from F.6.1 final, recipe = F.6.0 winner with K=200) — tests whether stronger MCTS targets accelerate convergence at the cost of 2× per-iter wall-clock.
-- **F.6.3.c TSP-50 hoist** — pivot to a graph size where Stage 1's REINFORCE baseline is weaker, providing more headroom for AGZ sample efficiency to dominate. Requires a Stage 1 TSP-50 warm-start checkpoint (or accepts an even-longer-from-scratch run).
-- Document any of these as Stage 4 negative result acceptable per proposal closing remark ("If Stage 4 (full loop) shows improvement but not sample efficiency, that's still a publishable negative result about the computational tradeoff.")
-
-**Wall-clock for proposal-aligned variant (F.6.0 + 100-iter F.6.1 only, no escalation):** F.6.0 ~3.3 h (12-job grid in parallel; longest variant is K=100 rollout) + F.6.1 ~33 min (value_head) or ~3.6 h (rollout) + headline plot ≈ **~4-7 h Modal A10 total (≈ $11-18 in credits)**.
+**F.6.3 Optional escalations** (continue to 1000 iters, K=200, TSP-50 hoist) — moved to Stage 5.
 
 **Dependencies:** Phases A, B, C, D, E. F.1 CLI is reused (drop `--load_path`). F.5 plot is reused (re-pointed to F.6.1's output dir).
 
 ---
 
-### Phase G — TSP-20 ablations (~6-10 h compute, optional)
+### Phase G — Ablations (moved to Stage 5)
 
-**Goal:** Measure the most-uncertain knobs. All run on TSP-20 with same warm-start. Each is a Stage 5 prerequisite.
-
-| Ablation | Levers | Compute | Why |
-|---|---|---|---|
-| **G.1** Leaf eval: `rollout` vs `value_head` | F.4 recipe with `leaf_eval='rollout'` | ~3 h | The defining AlphaGo-Zero choice; head-to-head test |
-| **G.2** Buffer capacity | 50K vs 200K vs 500K | 3× ~2 h | Catastrophic forgetting check |
-| **G.3** Dirichlet ε ∈ {0, 0.15, 0.25, 0.4} | 4 small TSP-20 runs (50 iter) | 4× ~1 h | Optimal exploration mass |
-| **G.4** Temperature schedule + target coupling: `const`, `step30` (default), `step50`; AND **strict-AGZ** (training target π_t uses same τ_t as σ_t — one-hot late targets) vs **decoupled** (π_t always τ=1 — F.4 default, choice B) | small TSP-20 runs | 4× ~1 h | Schedule efficacy + late-game distillation signal richness (TSP-20's deterministic late steps may make strict-AGZ one-hot a wasted signal vs richer τ=1 raw visits) |
-| **G.5** Gating cadence: gate every 1/5/10 | 3 small runs | 3× ~1 h | Interaction with reject-policy |
-| **G.6** Best-so-far per-instance value normalization (replaces original "cost-to-go vs broadcast z" — cost-to-go is now the F.4 default) | $z_t = (\text{tour\_cost} − \text{lengths}_t) / \min_\text{seen} \text{tour\_cost}(x)$ | ~1 h | Value-target normalization shape; tracks instance-level best instead of model's `bl_val` |
-| **G.7** Symmetry augmentation at leaf eval | random 2D rotation+flip of coords pre-encoder | ~1 h | AGZ Methods §Search algorithm: dihedral aug at every leaf eval (8-fold). TSP analog is continuous SO(2) × {flip} |
-| **G.8** Optimizer: Adam vs SGD+momentum 0.9 | F.4 recipe with SGD+momentum, lr=1e-3 | ~3 h | AGZ canonical optimizer; checks whether Adam-from-warmstart is leaving signal on the table |
-| **G.9** Learning-rate ablation (Adam): lr ∈ {1e-3, 1e-4 (F.6 default), 1e-5} | F.6.1 recipe at three lr values, from-scratch | 3× ~6 h | F.6 fixes lr=1e-4 for apples-to-apples vs Stage 1; b2 warm-start finding (lr=1e-5 beats lr=1e-4) suggests revisiting lr is worth a sweep. **NOT a fair Stage 4 sample-efficiency claim — purely informational.** If lr=1e-5 wins from-scratch too, plan revision required to match Stage 1 at lr=1e-5 also (or document the scope of comparison clearly). |
-
-Run only the ablations relevant to the user's interpretation of F.4 results. **G.1 is highest priority** as the explicit AlphaGo-Lee-vs-Zero head-to-head; **G.4** (temperature) and **G.7** (symmetry) are the cheapest paths to AGZ-canonical fidelity.
-
-**Wall-clock:** 6-10 h on RTX 4060 (parallelizable on Modal).
-
-**Dependencies:** Phase F closed.
+Most of Phase G was absorbed into F.6.0/F.6.1.3-1.6/lv0 and migrated to Stage 5. The remaining open items (G.4 partial strict-AGZ coupling, G.6 best-so-far per-instance norm, G.7 symmetry aug, G.8 SGD+momentum, G.9 partial) are tracked under [`_plans/stage5_plan.md` §Remaining open items](stage5_plan.md).
 
 ---
 
 ## Acceptance criteria for Stage 4 closure
 
-**TSP-20 warm-start variant (Phase F.4) — diagnostic / sanity, not the proposal deliverable:**
+The proposal-aligned Stage 4 deliverable is **"the self-improvement loop converges: tour quality improves over successive iterations"** (proposal.md:134). The remaining proposal Stage 4 bullets — sample efficiency, ultimate quality — require the recipe-tuning depth and scaling work captured under Stage 5.
 
-1a. ✅ **Marginal improvement (warm-start signal).** Stage 4's final val_avg_cost is strictly better than its starting checkpoint by ≥ 0.001: `val_avg_cost(θ_iter100) ≤ 3.83843` (Stage 1 final 3.83943 minus 0.001 noise band). This is the AGZ-loop-improves-on-REINFORCE test for the warm-start variant. **Status (2026-05-02): PASSED by Modal b2 run with lr=1e-5 — 3.83485 vs 3.83622 baseline, p<0.0001, t=−7.08.**
+**TSP-20 from-scratch variant (Phase F.6.0 + F.6.1) — proposal Stage 4 convergence claim:**
 
-1b. ⚠️ **Strict total sample efficiency** (proposal-headline claim, requires careful interpretation under warm-start). The combined (Stage 1 + Stage 4) sample-efficiency curve, plotted with x-axis = cumulative training instances seen across both stages, should reach Stage 1's final val_avg_cost (3.83943) at total instances < 128M (Stage 1 alone). Because Stage 4 warm-starts from the Stage 1 endpoint, this is trivially true at x = 128M + 1 (Stage 4 has only added improvements). The *meaningful* form for the warm-start variant is: at any matched x in the overlap region, Stage 1 + Stage 4 ≤ Stage 1 alone. **Strict from-scratch sample efficiency** is now F.6 (proposal-aligned variant), not Stage 5.
+1. **Self-improvement / loop converges.** F.6.1 val_avg_cost curve over iterations shows a visible downward trend across the 100-iter probe (final < initial by ≥ 0.05). **Status: SATISFIED** — F.6.1 K=40 const went from random-init to ~3.92 plateau over 100 iters.
 
-**TSP-20 from-scratch variant (Phase F.6) — the actual proposal Stage 4 deliverable:**
+2. **Gating fires.** `gating_baseline.epoch_callback` returns `True` at least once. **Status: SATISFIED** — multiple gate accepts across F.6.0 and F.6.1 under `gate_every=1`.
 
-These are the criteria from `proposal.md` Stage 4 expected outcomes that warm-start cannot satisfy.
+3. **Resume continuity.** F.6.0 winner trajectory + F.6.1 trajectory smoothly continuous (sanity-check the F.6.0 → F.6.1 resume worked). **Status: SATISFIED.**
 
-1c. **Sample efficiency (proposal headline).** F.6.1's val_avg_cost reaches Stage 1's quality (≤ 3.83943) at fewer cumulative-instances-seen than Stage 1's 128M. Plot via F.5 against Stage 1's `epochs.csv`. **Pending F.6 run.**
+**TSP-20 warm-start variant (Phase F.1–F.5) — diagnostic / sanity, not the proposal deliverable:**
 
-2. **Ultimate quality.** Stage 4 final greedy val_avg_cost ≤ 3.8312 (Stage 3 K=400 rollout MCTS) — i.e., Stage 4's network alone (no MCTS at test time) matches Stage 3's search-augmented Stage 1 result. Equivalently, Stage 4 collapses the test-time gap between greedy and MCTS-K=400 rollout to within noise. **Pending F.6 run.** *(Warm-start b2 reached 3.83485, still 0.0036 above this target.)*
+- ✅ Marginal improvement (warm-start signal). Status (2026-05-02): Modal b2 lr=1e-5 reached 3.83485 vs 3.83622 baseline, p<0.0001 — first ever gate accept across 7 attempts. Warm-start finding does NOT transfer to from-scratch (see [_progress/stage4_progress.md §Phase F.1-F.5](../_progress/stage4_progress.md)).
 
-3. **Self-improvement.** val_avg_cost curve over iterations is monotone non-increasing within a ±0.001 noise band. *(Warm-start b2: ✅ for first 12 iters; F.6 needs to demonstrate over much longer horizon.)*
-
-4. **Gating fires.** `gating_baseline.epoch_callback` returns `True` at least once over the gating events. *(Warm-start b2: ✅ first ever accept at iter 9; F.6 satisfies trivially with `--gate_mode always`.)*
-
-**Reach (Stage 5 stretch):**
-- TSP-20 final greedy val_avg_cost ≤ 3.8298 (= 0.05% gap vs Gurobi optimum 3.8279) — proposal target.
+**Moved to Stage 5** ([`_plans/stage5_plan.md` §Acceptance criteria](stage5_plan.md)):
+- (1c) Sample efficiency at matched cumulative-instances-seen. Status at partition: **SATISFIED at TSP-20 via lv0 chain** (3.8486 at 200K instances vs Stage 1's 128M).
+- (2) Ultimate quality ≤ 3.8312 (Stage 3 K=400 rollout). Status at partition: **PARTIAL** — satisfied at K=200 rollout (3.8329), not at greedy (3.8486).
+- (3) Strict monotonicity within ±0.001 noise band — Stage 5 stretch (requires step-decay 400-iter or beyond).
+- Reach: TSP-20 final greedy ≤ 3.8298 (= 0.05% gap vs Gurobi 3.8279).
+- TSP-50 parity (≤ 5.7999) — in flight under Stage 5 Track A lv0 K=50 chain.
 
 ---
 
@@ -730,8 +612,10 @@ End-to-end test, run in order:
 - **From-scratch training** (canonical "AlphaGo Zero" comparison) — does the Stage 1 warm-start advantage matter at convergence?
 - **Window-scaled replay buffer** à la KataGo (`ref/KataGo-master/SelfplayTraining.md`).
 - **Mixed leaf-eval schedule** — start with rollout, switch to value_head once off-policy R² > 0.99 (Stage 3 E.1 was 0.9949 already, so the threshold may be hit immediately).
-- **Best-so-far per-instance value normalization** (G.6 above) — $z_t = (\text{tour\_cost} - \text{lengths}_t) / \min_\text{seen}\text{tour\_cost}(x)$, replacing $\text{bl\_val}$ with the per-instance running optimum. Stationary across iterations, no model dependency. (Note: the *broadcast-z vs per-state cost-to-go* question is resolved — per-state V_CURRENT cost-to-go is the F.4 default; broadcast-z would double-count path cost against the existing leaf evaluator. Do not revive.)
+- **Best-so-far per-instance value normalization** (G.6) — replaces `bl_val` with the per-instance running optimum; stationary across iterations.
 - **Multi-model arena** — pit each gating-accepted model against all prior accepted models (TrueSkill ranking) for an Elo-curve headline matching AlphaGo Zero's published figure.
+
+All of the above are tracked under [`_plans/stage5_plan.md`](stage5_plan.md).
 
 ---
 
