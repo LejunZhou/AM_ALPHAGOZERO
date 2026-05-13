@@ -1055,6 +1055,8 @@ def _f61_args(
     lr_decay_step_size: int = 1,
     temperature_schedule: str = "step30",
     dirichlet_epsilon: str = "0.0",
+    leaf_eval: str = "value_head",
+    lambda_v: str = "1.0",
     n_simulations_schedule: str = "const",
     n_simulations_first: int = 5,
     n_simulations_late: int = 10,
@@ -1084,9 +1086,10 @@ def _f61_args(
         "--temperature_schedule", temperature_schedule,
         "--val_size", "10000",
         "--val_seed", "42",
-        "--leaf_eval", "value_head",
+        "--leaf_eval", leaf_eval,
         "--max_grad_norm", "1.0",
         "--value_target_norm", "none",
+        "--lambda_v", lambda_v,
         "--lr_model", lr_model,
         "--lr_decay", lr_decay,
         "--weight_decay", "0.0",
@@ -1317,6 +1320,367 @@ def run_f62_step10_eps_sweep(timestamp: str = "") -> None:
         h.get()
         print(f"[modal] {label} done.", flush=True)
     print(f"\n[modal] all {len(handles)} F.6.2 step10 ε-sweep jobs complete.")
+    print("[modal] download results with: modal volume get am-alphagozero-volume outputs/")
+
+
+@app.local_entrypoint()
+def run_rollout_lambda_ablation(
+    timestamp: str = "",
+    n_iterations: str = "50",
+    include_weak: bool = False,
+) -> None:
+    """Rollout-teacher value-loss ablation.
+
+    Runs leaf_eval=rollout, K=40, step10, epsilon=0.25, raw value targets,
+    and F.6.1 optimizer/replay defaults. The primary axis is lambda_v:
+    0.0 for policy-only distillation, 1.0 for the AGZ-style value-loss
+    control, and optionally 0.1 for weak auxiliary regularization.
+    """
+    from datetime import datetime, timezone
+    if not timestamp:
+        timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")
+
+    n_iter = int(n_iterations)
+    variants = [
+        ("rollout_lv0", "0.0"),
+        ("rollout_lv1", "1.0"),
+    ]
+    if include_weak:
+        variants.insert(1, ("rollout_lv01", "0.1"))
+
+    grid = []
+    for label_stem, lambda_val in variants:
+        run_name = f"{label_stem}_K40_step10_eps25_{n_iter}iter_{timestamp}"
+        args = _f61_args(
+            run_name=run_name,
+            k=40,
+            buffer_capacity=5000,
+            lr_model="5e-4",
+            lr_decay="1.0",
+            temperature_schedule="step10",
+            dirichlet_epsilon="0.25",
+            leaf_eval="rollout",
+            lambda_v=lambda_val,
+        )
+        idx = args.index("--n_iterations")
+        args[idx + 1] = str(n_iter)
+        grid.append((run_name, args))
+
+    print(f"[modal] launching {len(grid)} rollout lambda_v ablation jobs (timestamp={timestamp})")
+    for label, args in grid:
+        lambda_idx = args.index("--lambda_v")
+        print(f"  {label} (lambda_v={args[lambda_idx + 1]})")
+
+    handles = {
+        label: train_alphazero_remote.spawn(*args) for label, args in grid
+    }
+    print(f"\n[modal] all {len(handles)} rollout-lambda jobs spawned. Awaiting completion...")
+    for label, h in handles.items():
+        print(f"[modal] awaiting {label} (function_call_id={h.object_id}) ...", flush=True)
+        h.get()
+        print(f"[modal] {label} done.", flush=True)
+    print(f"\n[modal] all {len(handles)} rollout lambda_v ablation jobs complete.")
+    print("[modal] download results with: modal volume get am-alphagozero-volume outputs/")
+
+
+@app.local_entrypoint()
+def run_rollout_lv0_resume50_to_iter99(timestamp: str = "") -> None:
+    """Resume the rollout lambda_v=0 ablation for +50 more iters (iter 50 -> 99).
+
+    Pairs with run_rollout_lambda_ablation's lv0 variant (W&B `1syc0kk8`,
+    name `rollout_lv0_K40_step10_eps25_50iter_20260509T102959_...`). After
+    50 iters lv0 reached val_avg_cost = 3.879 with non-saturated downward
+    slope. This +50 iter resume tests whether leaf_eval=rollout + lambda_v=0
+    breaks 3.85 and approaches Stage 1 canonical greedy (3.83943).
+
+    Same recipe verbatim from _f61_args plus rollout-ablation overrides:
+    leaf_eval=rollout, lambda_v=0.0, K=40, step10, eps=0.25,
+    value_target_norm=none, lr=5e-4 const, wd=0, buffer=5000, batch=512,
+    train_steps=200, val_seed=42, gate=ttest gate_every=1, M=1000,
+    mcts_batch_size=1000.
+
+    Cost: ~$8-12 Modal credits, ~1.2h wall on A10.
+    """
+    from datetime import datetime, timezone
+    if not timestamp:
+        timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")
+
+    resume_from = (
+        "outputs/tsp_20/"
+        "rollout_lv0_K40_step10_eps25_50iter_20260509T102959_20260509T103008/"
+        "iter-49.pt"
+    )
+    run_name = f"rollout_lv0_resume50_to99_{timestamp}"
+    args = _f61_args(
+        run_name=run_name,
+        k=40,
+        buffer_capacity=5000,
+        lr_model="5e-4",
+        lr_decay="1.0",
+        temperature_schedule="step10",
+        dirichlet_epsilon="0.25",
+        leaf_eval="rollout",
+        lambda_v="0.0",
+    )
+    # Override n_iterations 100 -> 50 (resume runs +50 from iter 50 -> 99).
+    idx = args.index("--n_iterations")
+    args[idx + 1] = "50"
+    args.extend(["--resume_from", resume_from])
+
+    print(f"[modal] launching rollout lambda_v=0 resume (+50 iter, target 50->99) from iter-49.pt")
+    print(f"  {run_name}")
+    print(f"  resume_from={resume_from}")
+    h = train_alphazero_remote.spawn(*args)
+    print(f"\n[modal] awaiting {run_name} (function_call_id={h.object_id}) ...", flush=True)
+    h.get()
+    print(f"[modal] {run_name} done.", flush=True)
+    print("[modal] download results with: modal volume get am-alphagozero-volume outputs/")
+
+
+@app.local_entrypoint()
+def run_rollout_lv0_resume100_lr1e4_to_iter199(timestamp: str = "") -> None:
+    """Resume the rollout lambda_v=0 chain at lr=1e-4 for +100 iters (iter 100->199).
+
+    Continuation of run_rollout_lv0_resume50_to_iter99 (W&B `d8uyrrm1`,
+    val_avg_cost=3.8607 at iter 99). At constant lr=5e-4 the recipe saturated
+    around iter 70-90 with slope -0.0005/iter (vs -0.010/iter early). Mirrors
+    the F.6.1.4.b lever (lr 5e-4 -> 1e-4) that broke F.6.1.4's iter-127
+    plateau and dropped val 3.8665 -> 3.8514 in 35 iters.
+
+    Same recipe: leaf_eval=rollout, lambda_v=0, K=40, step10, epsilon=0.25,
+    value_target_norm=none, wd=0, buffer=5000, batch=512, train_steps=200,
+    val_seed=42, gate=ttest gate_every=1, M=1000, mcts_batch_size=1000.
+    Only knob change: lr_model 5e-4 -> 1e-4.
+
+    train_alphazero.py's lr-override-on-resume (added 2026-05-07) applies
+    --lr_model AFTER coach.load_checkpoint so the optimizer's loaded lr +
+    LambdaLR base_lrs are overwritten to 1e-4.
+
+    Cost: ~$15-20 Modal credits, ~2.2h wall on A10 (100 iter x ~80s/iter).
+    """
+    from datetime import datetime, timezone
+    if not timestamp:
+        timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")
+
+    resume_from = (
+        "outputs/tsp_20/"
+        "rollout_lv0_resume50_to99_20260510T001900_20260510T001908/"
+        "iter-99.pt"
+    )
+    run_name = f"rollout_lv0_resume100_lr1e4_to199_{timestamp}"
+    args = _f61_args(
+        run_name=run_name,
+        k=40,
+        buffer_capacity=5000,
+        lr_model="1e-4",                  # KEY: dropped from 5e-4
+        lr_decay="1.0",
+        temperature_schedule="step10",
+        dirichlet_epsilon="0.25",
+        leaf_eval="rollout",
+        lambda_v="0.0",
+    )
+    # Override n_iterations 100 -> 100 (already correct from _f61_args default; this
+    # asserts intent); resume runs +100 from iter 100 -> 199.
+    idx = args.index("--n_iterations")
+    args[idx + 1] = "100"
+    args.extend(["--resume_from", resume_from])
+
+    print(f"[modal] launching rollout lambda_v=0 +100 iter resume at lr=1e-4 (target 100->199) from iter-99.pt")
+    print(f"  {run_name}")
+    print(f"  resume_from={resume_from}")
+    print(f"  lr override: 5e-4 -> 1e-4 (applied AFTER load_checkpoint)")
+    h = train_alphazero_remote.spawn(*args)
+    print(f"\n[modal] awaiting {run_name} (function_call_id={h.object_id}) ...", flush=True)
+    h.get()
+    print(f"[modal] {run_name} done.", flush=True)
+    print("[modal] download results with: modal volume get am-alphagozero-volume outputs/")
+
+
+@app.local_entrypoint()
+def run_tsp50_lv0_K50_50iter(timestamp: str = "") -> None:
+    """TSP-50 lv0 from-scratch probe — 50 iters at K=50 (Track 4 Phase A+B initial).
+
+    First TSP-50 run with the lv0 winner recipe (leaf_eval=rollout, lambda_v=0)
+    that landed in the rollout_value_ablation chain at TSP-20 (lv0 chain best
+    3.8486 at iter 197; greedy 0.007 better than F.6.1.6 vh+lambda_v=1).
+
+    Reference points (TSP-50, val_seed=42):
+      Stage 1 canonical (123x2qr5 AM+value greedy): 5.7999
+      Stage 0 pretrained TSP-50 greedy:             5.7955
+      Stage 4 best so far (muckiyvi vh+lambda_v=1, K=50, eps=0.05, 100 iter):
+        best 6.060 @ iter 95
+      Gurobi TSP-50 (1000 inst seed=1234):          5.6987
+
+    Recipe: lv0 winner verbatim from `_f61_args` plus:
+      leaf_eval=rollout, lambda_v=0.0, K=50 (per user's "speed first" choice;
+      Phase B may bump to K=100 if K=50 saturates noisily), step10, eps=0.25,
+      value_target_norm=none, lr=5e-4 const, wd=0, buffer=5000, batch=512,
+      train_steps=200, M=1000, val_seed=42, gate=ttest gate_every=1.
+
+    `mcts_batch_size=1000` set explicitly to assert the production
+    cross-instance parallelism (default per F.6.1.4.c sweep, but lifted from
+    CLI default into the entrypoint args for clarity).
+
+    Wall estimate: K=50 rollout at TSP-50 ~= 2.5x TSP-20 K=50 rollout per iter
+    ~= 100-150 s/iter on A10. 50 iters = 1.5-2 h. Cost: ~$8-15 Modal credits.
+
+    Goals (50-iter probe):
+      - Verify lv0 recipe transfers to TSP-50 (no OOM, val_avg_cost descending).
+      - Beat existing Stage 4 best 6.060 in 50 iters.
+      - If trajectory still descending at iter 49, escalate to lr=1e-4 resume
+        +100 iters (mirroring TSP-20 lv0 chain).
+    """
+    from datetime import datetime, timezone
+    if not timestamp:
+        timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")
+
+    run_name = f"tsp50_lv0_K50_50iter_{timestamp}"
+    args = _f61_args(
+        run_name=run_name,
+        k=50,
+        buffer_capacity=5000,
+        lr_model="5e-4",
+        lr_decay="1.0",
+        temperature_schedule="step10",
+        dirichlet_epsilon="0.25",
+        leaf_eval="rollout",
+        lambda_v="0.0",
+    )
+    # Patch graph_size 20 -> 50 (mirrors run_tsp50_k_compare_20iter pattern).
+    idx_g = args.index("--graph_size")
+    args[idx_g + 1] = "50"
+    # Override n_iterations 100 -> 50.
+    idx_n = args.index("--n_iterations")
+    args[idx_n + 1] = "50"
+    # Assert production-scale cross-instance parallelism.
+    args.extend(["--mcts_batch_size", "1000"])
+
+    print(f"[modal] launching TSP-50 lv0 from-scratch (K=50, 50 iter, leaf=rollout, lambda_v=0)")
+    print(f"  {run_name}")
+    print(f"  graph_size=50  K=50  lr=5e-4  mcts_batch_size=1000")
+    h = train_alphazero_remote.spawn(*args)
+    print(f"\n[modal] awaiting {run_name} (function_call_id={h.object_id}) ...", flush=True)
+    h.get()
+    print(f"[modal] {run_name} done.", flush=True)
+    print("[modal] download results with: modal volume get am-alphagozero-volume outputs/")
+
+
+@app.local_entrypoint()
+def run_tsp50_lv0_resume_from_iter15_trackA(timestamp: str = "") -> None:
+    """Resume TSP-50 lv0 from `oxjyj70e` iter-15.pt for +34 iters (target iter 49).
+
+    Continues the `oxjyj70e` (Fix #5) trajectory where it was stopped at
+    iter 15 (best val 6.4959 at iter 8). The new code state has Track A
+    (per-row state.i in decoder + merged step groups in rollout/eval),
+    which dropped the M=1000 Modal probe wall from ~850s -> 435s = -49%
+    on a trained checkpoint.
+
+    Same recipe verbatim from `_f61_args` (lv0 winner: leaf_eval=rollout,
+    lambda_v=0.0, K=50, step10, eps=0.25, value_target_norm=none,
+    lr=5e-4 const, wd=0, buffer=5000, batch=512, train_steps=200,
+    val_seed=42, gate=ttest gate_every=1, M=1000, mcts_batch_size=1000).
+
+    Resume target: complete the 50-iter trajectory (iter 16..49 = 34 more
+    iters). At Track A's expected 7-8 min/iter on A10 -> ~4-5h wall,
+    ~$15-20 Modal credits.
+    """
+    from datetime import datetime, timezone
+    if not timestamp:
+        timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")
+
+    resume_from = (
+        "outputs/tsp_50/"
+        "tsp50_lv0_K50_50iter_20260511T051358_20260511T051406/"
+        "iter-15.pt"
+    )
+    run_name = f"tsp50_lv0_K50_resume34_from_iter15_trackA_{timestamp}"
+    args = _f61_args(
+        run_name=run_name,
+        k=50,
+        buffer_capacity=5000,
+        lr_model="5e-4",
+        lr_decay="1.0",
+        temperature_schedule="step10",
+        dirichlet_epsilon="0.25",
+        leaf_eval="rollout",
+        lambda_v="0.0",
+    )
+    # Patch graph_size 20 -> 50.
+    idx_g = args.index("--graph_size")
+    args[idx_g + 1] = "50"
+    # +34 iters to reach iter 49 (oxjyj70e ran iter 0..15).
+    idx_n = args.index("--n_iterations")
+    args[idx_n + 1] = "34"
+    args.extend(["--mcts_batch_size", "1000"])
+    args.extend(["--resume_from", resume_from])
+
+    print(f"[modal] launching TSP-50 lv0 resume from iter-15.pt (+34 iter, target iter 49) with Track A")
+    print(f"  {run_name}")
+    print(f"  resume_from={resume_from}")
+    print(f"  graph_size=50  K=50  lr=5e-4  mcts_batch_size=1000")
+    h = train_alphazero_remote.spawn(*args)
+    print(f"\n[modal] awaiting {run_name} (function_call_id={h.object_id}) ...", flush=True)
+    h.get()
+    print(f"[modal] {run_name} done.", flush=True)
+    print("[modal] download results with: modal volume get am-alphagozero-volume outputs/")
+
+
+@app.local_entrypoint()
+def run_tsp50_lv0_resume50_to_iter99_trackA(timestamp: str = "") -> None:
+    """Continue TSP-50 lv0 chain from `1wpkngg9` iter-49.pt for +50 iters (target iter 99).
+
+    Continuation of the Track A run `1wpkngg9` (oxjyj70e iter-15 -> Track A
+    iter-49) which finished at val_avg_cost=6.1338 (best 6.1406 at iter 43),
+    0.08 above the Stage 4 prior best muckiyvi 6.060 at 100 iters. This
+    +50 iter resume keeps lr=5e-4 const (no decay) and same lv0 recipe to
+    see if more iters at the same rate close the gap to muckiyvi 6.060 and
+    approach Stage 1 5.80.
+
+    Same recipe verbatim (lv0: leaf_eval=rollout, lambda_v=0.0, K=50,
+    step10, eps=0.25, value_target_norm=none, lr=5e-4 const, wd=0,
+    buffer=5000, batch=512, train_steps=200, val_seed=42, gate=ttest
+    gate_every=1, M=1000, mcts_batch_size=1000).
+
+    Wall: Track A held ~5 min/iter through iter 16-49. Expect 50 iters in
+    ~4-5h on A10, ~$15-20 Modal credits.
+    """
+    from datetime import datetime, timezone
+    if not timestamp:
+        timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")
+
+    resume_from = (
+        "outputs/tsp_50/"
+        "tsp50_lv0_K50_resume34_from_iter15_trackA_20260511T093124_20260511T093133/"
+        "iter-49.pt"
+    )
+    run_name = f"tsp50_lv0_K50_resume50_to99_trackA_{timestamp}"
+    args = _f61_args(
+        run_name=run_name,
+        k=50,
+        buffer_capacity=5000,
+        lr_model="5e-4",
+        lr_decay="1.0",
+        temperature_schedule="step10",
+        dirichlet_epsilon="0.25",
+        leaf_eval="rollout",
+        lambda_v="0.0",
+    )
+    idx_g = args.index("--graph_size")
+    args[idx_g + 1] = "50"
+    # +50 iters to reach iter 99 (1wpkngg9 finished at iter 49).
+    idx_n = args.index("--n_iterations")
+    args[idx_n + 1] = "50"
+    args.extend(["--mcts_batch_size", "1000"])
+    args.extend(["--resume_from", resume_from])
+
+    print(f"[modal] launching TSP-50 lv0 resume from 1wpkngg9 iter-49.pt (+50 iter, target iter 99)")
+    print(f"  {run_name}")
+    print(f"  resume_from={resume_from}")
+    print(f"  graph_size=50  K=50  lr=5e-4 const  mcts_batch_size=1000")
+    h = train_alphazero_remote.spawn(*args)
+    print(f"\n[modal] awaiting {run_name} (function_call_id={h.object_id}) ...", flush=True)
+    h.get()
+    print(f"[modal] {run_name} done.", flush=True)
     print("[modal] download results with: modal volume get am-alphagozero-volume outputs/")
 
 

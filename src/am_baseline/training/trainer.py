@@ -252,11 +252,13 @@ def train_step_alphazero(model, optimizer, batch, opts):
             state_i (int), coords (B, N, 2), visited (B, N) bool,
             first_a / prev_a (B,), lengths (B,), pi (B, N), z (B,).
         opts: object exposing `lambda_v` (value-loss weight, default 1.0)
-            and `device`. `max_grad_norm` is honored if present (>0).
+            and `device`. `lambda_v=0` keeps value_loss as a metric but skips
+            value-head/backbone value gradients. `max_grad_norm` is honored if
+            present (>0).
 
     Returns:
         dict of metrics: policy_loss, value_loss, total_loss,
-        mean_entropy_pi, mean_z, gradient_norm,
+        mean_entropy_pi, mean_entropy_policy, mean_z, gradient_norm,
         policy_grad_norm, value_grad_norm.
 
     Per-loss grad-norm accounting (added F.6.2): we compute ∂policy_loss/∂θ
@@ -306,6 +308,10 @@ def train_step_alphazero(model, optimizer, batch, opts):
     else:
         raise ValueError(f"Unknown value_target_norm: {norm_mode!r}")
 
+    lambda_v = float(getattr(opts, "lambda_v", 1.0))
+    if lambda_v < 0.0:
+        raise ValueError(f"lambda_v must be non-negative, got {lambda_v}")
+
     # ---- Forward ----------------------------------------------------------
     # Critical (plan B.2): gradient must flow through the same compute graph
     # used during self-play. encode + precompute_decoder are called INSIDE
@@ -336,7 +342,13 @@ def train_step_alphazero(model, optimizer, batch, opts):
             "train_step_alphazero requires model.value_head to be enabled "
             "(value_enabled=True at construction)."
         )
-    v = model.value_head(glimpse)                          # (B,)
+    if lambda_v == 0.0:
+        # Policy-only rollout-teacher ablation: keep value_loss observable, but
+        # do not build or backpropagate a value graph through the shared model.
+        with torch.no_grad():
+            v = model.value_head(glimpse.detach())          # (B,)
+    else:
+        v = model.value_head(glimpse)                       # (B,)
 
     # ---- Policy distillation cross-entropy --------------------------------
     # log_p has -inf at masked positions (the decoder writes -inf into
@@ -347,6 +359,8 @@ def train_step_alphazero(model, optimizer, batch, opts):
     # correct cross-entropy under the legality mask.
     log_p_safe = torch.where(mask, torch.zeros_like(log_p), log_p)
     policy_loss = -(pi_target * log_p_safe).sum(dim=-1).mean()
+    p_policy = torch.where(mask, torch.zeros_like(log_p), log_p.exp())
+    entropy_policy = -(p_policy * log_p_safe).sum(dim=-1).mean()
 
     # ---- Value loss -------------------------------------------------------
     # `z_target` was computed above per `opts.value_target_norm` — see comment
@@ -358,7 +372,6 @@ def train_step_alphazero(model, optimizer, batch, opts):
     value_loss = F.mse_loss(v, z_target)
 
     # ---- Total loss -------------------------------------------------------
-    lambda_v = float(getattr(opts, "lambda_v", 1.0))
     total_loss = policy_loss + lambda_v * value_loss
 
     # ---- Backward + step --------------------------------------------------
@@ -367,12 +380,18 @@ def train_step_alphazero(model, optimizer, batch, opts):
     # `.grad` for the optimizer. retain_graph=True on the first call keeps
     # the autograd graph alive for the second; the second drops it.
     params = [p for p in model.parameters() if p.requires_grad]
-    policy_grads = torch.autograd.grad(
-        policy_loss, params, retain_graph=True, allow_unused=True,
-    )
-    value_grads = torch.autograd.grad(
-        value_loss, params, retain_graph=False, allow_unused=True,
-    )
+    if lambda_v == 0.0:
+        policy_grads = torch.autograd.grad(
+            policy_loss, params, retain_graph=False, allow_unused=True,
+        )
+        value_grads = tuple(None for _ in params)
+    else:
+        policy_grads = torch.autograd.grad(
+            policy_loss, params, retain_graph=True, allow_unused=True,
+        )
+        value_grads = torch.autograd.grad(
+            value_loss, params, retain_graph=False, allow_unused=True,
+        )
 
     def _grad_norm(grads):
         norms = [g.detach().norm() for g in grads if g is not None]
@@ -450,6 +469,7 @@ def train_step_alphazero(model, optimizer, batch, opts):
         "value_loss": float(value_loss.detach().cpu()),
         "total_loss": float(total_loss.detach().cpu()),
         "mean_entropy_pi": float(entropy_pi.detach().cpu()),
+        "mean_entropy_policy": float(entropy_policy.detach().cpu()),
         "mean_z": float(z_target.mean().detach().cpu()),
         "gradient_norm": float(grad_norm.detach().cpu() if torch.is_tensor(grad_norm) else grad_norm),
         "policy_grad_norm": float(policy_grad_norm_t.detach().cpu()),

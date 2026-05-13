@@ -277,9 +277,12 @@ class MetricsLogger:
         self.iter_csv_writer = csv.writer(self.iter_csv_file)
         self.iter_csv_writer.writerow([
             'iter', 'total_instances', 'val_avg_cost',
-            'policy_loss_mean', 'value_loss_mean', 'mean_entropy_pi',
+            'policy_loss_mean', 'value_loss_mean',
+            'mean_entropy_pi', 'mean_entropy_policy',
             'policy_grad_norm_mean', 'value_grad_norm_mean', 'grad_norm_mean',
             'value_grad_norm_vh_mean', 'value_grad_norm_shared_mean',
+            'mcts_delta_vs_greedy_mean', 'mcts_win_rate_vs_greedy',
+            'greedy_cost_mean', 'mcts_cost_mean',
             'gated', 'accepted', 'mcts_wall_s', 'train_wall_s', 'buffer_size',
         ])
         self.iter_csv_file.flush()
@@ -299,11 +302,16 @@ class MetricsLogger:
         wandb.define_metric("policy_loss_mean", step_metric="iteration")
         wandb.define_metric("value_loss_mean", step_metric="iteration")
         wandb.define_metric("mean_entropy_pi", step_metric="iteration")
+        wandb.define_metric("mean_entropy_policy", step_metric="iteration")
         wandb.define_metric("policy_grad_norm_mean", step_metric="iteration")
         wandb.define_metric("value_grad_norm_mean", step_metric="iteration")
         wandb.define_metric("grad_norm_mean", step_metric="iteration")
         wandb.define_metric("value_grad_norm_vh_mean", step_metric="iteration")
         wandb.define_metric("value_grad_norm_shared_mean", step_metric="iteration")
+        wandb.define_metric("mcts_delta_vs_greedy_mean", step_metric="iteration")
+        wandb.define_metric("mcts_win_rate_vs_greedy", step_metric="iteration")
+        wandb.define_metric("greedy_cost_mean", step_metric="iteration")
+        wandb.define_metric("mcts_cost_mean", step_metric="iteration")
         wandb.define_metric("policy_grad_norm_step", step_metric="alphazero_train_step")
         wandb.define_metric("value_grad_norm_step", step_metric="alphazero_train_step")
         wandb.define_metric("value_grad_norm_vh_step", step_metric="alphazero_train_step")
@@ -331,6 +339,7 @@ class MetricsLogger:
                 'value_loss': [],
                 'total_loss': [],
                 'mean_entropy_pi': [],
+                'mean_entropy_policy': [],
                 'policy_grad_norm': [],
                 'value_grad_norm': [],
                 'gradient_norm': [],
@@ -359,6 +368,7 @@ class MetricsLogger:
                 'value_loss_step': float(metrics.get('value_loss', 0.0)),
                 'total_loss_step': float(metrics.get('total_loss', 0.0)),
                 'mean_entropy_pi_step': float(metrics.get('mean_entropy_pi', 0.0)),
+                'mean_entropy_policy_step': float(metrics.get('mean_entropy_policy', 0.0)),
                 'policy_grad_norm_step': float(metrics.get('policy_grad_norm', 0.0)),
                 'value_grad_norm_step': float(metrics.get('value_grad_norm', 0.0)),
                 'grad_norm_step': float(metrics.get('gradient_norm', 0.0)),
@@ -374,7 +384,11 @@ class MetricsLogger:
     def log_iteration(self, iter, total_instances, val_avg_cost,
                       gated=False, accepted=None,
                       mcts_wall_s=0.0, train_wall_s=0.0,
-                      buffer_size=0, lr=None):
+                      buffer_size=0, lr=None,
+                      mcts_delta_vs_greedy_mean=None,
+                      mcts_win_rate_vs_greedy=None,
+                      greedy_cost_mean=None,
+                      mcts_cost_mean=None):
         """Stage 4 per-iteration logger. Flushes per-step running means from
         `log_alphazero_step` into one CSV row + one W&B point.
 
@@ -400,6 +414,7 @@ class MetricsLogger:
             policy_loss_mean = _mean('policy_loss')
             value_loss_mean = _mean('value_loss')
             mean_entropy_pi = _mean('mean_entropy_pi')
+            mean_entropy_policy = _mean('mean_entropy_policy')
             policy_grad_norm_mean = _mean('policy_grad_norm')
             value_grad_norm_mean = _mean('value_grad_norm')
             grad_norm_mean = _mean('gradient_norm')
@@ -409,6 +424,7 @@ class MetricsLogger:
             policy_loss_mean = float('nan')
             value_loss_mean = float('nan')
             mean_entropy_pi = float('nan')
+            mean_entropy_policy = float('nan')
             policy_grad_norm_mean = float('nan')
             value_grad_norm_mean = float('nan')
             grad_norm_mean = float('nan')
@@ -421,13 +437,29 @@ class MetricsLogger:
             accepted_cell = ''
         else:
             accepted_cell = int(bool(accepted))
+        mcts_delta_cell = (
+            float(mcts_delta_vs_greedy_mean)
+            if mcts_delta_vs_greedy_mean is not None else ''
+        )
+        mcts_win_cell = (
+            float(mcts_win_rate_vs_greedy)
+            if mcts_win_rate_vs_greedy is not None else ''
+        )
+        greedy_cost_cell = (
+            float(greedy_cost_mean) if greedy_cost_mean is not None else ''
+        )
+        mcts_cost_cell = (
+            float(mcts_cost_mean) if mcts_cost_mean is not None else ''
+        )
 
         # CSV
         self.iter_csv_writer.writerow([
             iter, int(total_instances), val_cell,
-            policy_loss_mean, value_loss_mean, mean_entropy_pi,
+            policy_loss_mean, value_loss_mean,
+            mean_entropy_pi, mean_entropy_policy,
             policy_grad_norm_mean, value_grad_norm_mean, grad_norm_mean,
             value_grad_norm_vh_mean, value_grad_norm_shared_mean,
+            mcts_delta_cell, mcts_win_cell, greedy_cost_cell, mcts_cost_cell,
             gated_cell, accepted_cell,
             float(mcts_wall_s), float(train_wall_s), int(buffer_size),
         ])
@@ -438,11 +470,14 @@ class MetricsLogger:
             'iter={} total_instances={} val_avg_cost={} '
             'policy_loss={:.4f} value_loss={:.4f} entropy={:.4f} '
             'pg_norm={:.4f} vg_norm={:.4f} '
+            'mcts_delta={} mcts_win={} '
             'gated={} accepted={} mcts_s={:.2f} train_s={:.2f} buf={}'.format(
                 iter, int(total_instances),
                 f'{val_avg_cost:.6f}' if val_avg_cost is not None else 'NA',
                 policy_loss_mean, value_loss_mean, mean_entropy_pi,
                 policy_grad_norm_mean, value_grad_norm_mean,
+                f'{mcts_delta_vs_greedy_mean:.6f}' if mcts_delta_vs_greedy_mean is not None else 'NA',
+                f'{mcts_win_rate_vs_greedy:.3f}' if mcts_win_rate_vs_greedy is not None else 'NA',
                 gated_cell, accepted_cell, mcts_wall_s, train_wall_s, buffer_size,
             )
         )
@@ -454,6 +489,7 @@ class MetricsLogger:
             self.tb_logger.add_scalar('policy_loss_mean', policy_loss_mean, iter)
             self.tb_logger.add_scalar('value_loss_mean', value_loss_mean, iter)
             self.tb_logger.add_scalar('mean_entropy_pi', mean_entropy_pi, iter)
+            self.tb_logger.add_scalar('mean_entropy_policy', mean_entropy_policy, iter)
             self.tb_logger.add_scalar('policy_grad_norm_mean', policy_grad_norm_mean, iter)
             self.tb_logger.add_scalar('value_grad_norm_mean', value_grad_norm_mean, iter)
             self.tb_logger.add_scalar('grad_norm_mean', grad_norm_mean, iter)
@@ -462,6 +498,18 @@ class MetricsLogger:
             self.tb_logger.add_scalar('mcts_wall_s', float(mcts_wall_s), iter)
             self.tb_logger.add_scalar('train_wall_s', float(train_wall_s), iter)
             self.tb_logger.add_scalar('buffer_size', int(buffer_size), iter)
+            if mcts_delta_vs_greedy_mean is not None:
+                self.tb_logger.add_scalar(
+                    'mcts_delta_vs_greedy_mean',
+                    float(mcts_delta_vs_greedy_mean),
+                    iter,
+                )
+            if mcts_win_rate_vs_greedy is not None:
+                self.tb_logger.add_scalar(
+                    'mcts_win_rate_vs_greedy',
+                    float(mcts_win_rate_vs_greedy),
+                    iter,
+                )
 
         # W&B
         if self.wandb_run is not None:
@@ -472,6 +520,7 @@ class MetricsLogger:
                 'policy_loss_mean': policy_loss_mean,
                 'value_loss_mean': value_loss_mean,
                 'mean_entropy_pi': mean_entropy_pi,
+                'mean_entropy_policy': mean_entropy_policy,
                 'policy_grad_norm_mean': policy_grad_norm_mean,
                 'value_grad_norm_mean': value_grad_norm_mean,
                 'grad_norm_mean': grad_norm_mean,
@@ -482,6 +531,14 @@ class MetricsLogger:
                 'train_wall_s': float(train_wall_s),
                 'buffer_size': int(buffer_size),
             }
+            if mcts_delta_vs_greedy_mean is not None:
+                payload['mcts_delta_vs_greedy_mean'] = float(mcts_delta_vs_greedy_mean)
+            if mcts_win_rate_vs_greedy is not None:
+                payload['mcts_win_rate_vs_greedy'] = float(mcts_win_rate_vs_greedy)
+            if greedy_cost_mean is not None:
+                payload['greedy_cost_mean'] = float(greedy_cost_mean)
+            if mcts_cost_mean is not None:
+                payload['mcts_cost_mean'] = float(mcts_cost_mean)
             if val_avg_cost is not None:
                 payload['val_avg_cost_iter'] = float(val_avg_cost)
                 # Sample-efficiency series: x = total_instances, y = val cost.

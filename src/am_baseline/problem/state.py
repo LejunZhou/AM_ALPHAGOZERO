@@ -16,7 +16,14 @@ class StateTSP(NamedTuple):
     visited_: torch.Tensor  # (batch, 1, n) bool mask
     lengths: torch.Tensor   # (batch, 1)
     cur_coord: torch.Tensor # (batch, 1, 2) or None
-    i: torch.Tensor         # scalar step counter
+    # Step counter. Two shapes are supported (Track A 2026-05-11):
+    #   - scalar (1,)  : all rows share the same step (non-MCTS callers,
+    #                    training-time decode, selection-path eval_many).
+    #   - per-row (B,) : rows are at heterogeneous steps (rollout_many fast
+    #                    path; eval_many_arrays after merging step groups).
+    # Per-row callers must use the Decoder fast paths in `_get_step_context`
+    # which branch on `state.i.numel()`.
+    i: torch.Tensor
 
     @property
     def visited(self):
@@ -24,6 +31,11 @@ class StateTSP(NamedTuple):
 
     def __getitem__(self, key):
         assert torch.is_tensor(key) or isinstance(key, slice)
+        # Slice `i` only when it is per-row (B,); leave scalar `i` alone so
+        # the non-MCTS callers preserve their existing semantics.
+        new_i = self.i
+        if self.i.numel() > 1:
+            new_i = self.i[key]
         return self._replace(
             ids=self.ids[key],
             first_a=self.first_a[key],
@@ -31,6 +43,7 @@ class StateTSP(NamedTuple):
             visited_=self.visited_[key],
             lengths=self.lengths[key],
             cur_coord=self.cur_coord[key] if self.cur_coord is not None else None,
+            i=new_i,
         )
 
     @staticmethod
@@ -61,7 +74,14 @@ class StateTSP(NamedTuple):
         if self.cur_coord is not None:
             lengths = self.lengths + (cur_coord - self.cur_coord).norm(p=2, dim=-1)
 
-        first_a = prev_a if self.i.item() == 0 else self.first_a
+        # Per-row-safe first_a selection: rows where i==0 take prev_a as the
+        # tour starting node; rows where i>=1 keep the existing first_a.
+        # `torch.where` broadcasts correctly whether self.i is scalar (1,) or
+        # per-row (B,) — for scalar, the condition is a single bool that selects
+        # the whole tensor (preserving the original `prev_a if i==0 else first_a`
+        # semantics bit-for-bit).
+        i_is_zero = (self.i.view(-1, 1) == 0)
+        first_a = torch.where(i_is_zero, prev_a, self.first_a)
 
         visited_ = self.visited_.scatter(-1, prev_a[:, :, None], True)
 

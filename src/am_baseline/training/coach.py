@@ -1101,6 +1101,12 @@ class MCTSCoach:
                 self.device,
                 mcts_batch_size=int(getattr(opts, 'mcts_batch_size', 64)),
             )
+            greedy_costs = np.array([float(r.bl_val) for r in records], dtype=np.float64)
+            mcts_costs = np.array([float(r.tour_cost) for r in records], dtype=np.float64)
+            mcts_delta_vs_greedy_mean = float(np.mean(mcts_costs - greedy_costs))
+            mcts_win_rate_vs_greedy = float(np.mean(mcts_costs < greedy_costs - 1e-9))
+            greedy_cost_mean = float(np.mean(greedy_costs))
+            mcts_cost_mean = float(np.mean(mcts_costs))
             for r in records:
                 self.buffer.push_instance(r.coords, r.bl_val, r.tour_cost, r.per_step)
             self.total_instances_seen += int(opts.M_instances)
@@ -1156,6 +1162,10 @@ class MCTSCoach:
                 train_wall_s=t2 - t1,
                 buffer_size=int(len(self.buffer)),
                 lr=current_lr,
+                mcts_delta_vs_greedy_mean=mcts_delta_vs_greedy_mean,
+                mcts_win_rate_vs_greedy=mcts_win_rate_vs_greedy,
+                greedy_cost_mean=greedy_cost_mean,
+                mcts_cost_mean=mcts_cost_mean,
             )
             self._save_checkpoint(tag=f'{self.iter_idx}')
 

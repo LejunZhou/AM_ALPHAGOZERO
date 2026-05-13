@@ -105,7 +105,10 @@ def parse_opts(argv=None):
     parser.add_argument('--dirichlet_alpha_factor', type=float, default=10.0,
                         help='Dirichlet concentration scale: α = factor / N (AGZ default 10/N).')
     parser.add_argument('--lambda_v', type=float, default=1.0,
-                        help='Value-loss weight in the joint MSE+CE objective (AGZ default 1.0).')
+                        help='Value-loss weight in the joint MSE+CE objective '
+                             '(AGZ default 1.0). Set 0 for policy-only rollout-teacher '
+                             'distillation; value_loss is still logged but contributes '
+                             'no gradients.')
     parser.add_argument('--weight_decay', type=float, default=1e-4,
                         help='L2 weight decay applied via the optimizer (AGZ canonical 1e-4).')
     parser.add_argument('--lr_model', type=float, default=1e-4,
@@ -198,6 +201,9 @@ def parse_opts(argv=None):
 
 def _finalize_opts(opts):
     """Fill in derived fields that downstream code expects (mirroring Config)."""
+    if float(opts.lambda_v) < 0.0:
+        raise ValueError(f"--lambda_v must be non-negative, got {opts.lambda_v}")
+
     # Device.
     opts.use_cuda = torch.cuda.is_available() and not opts.no_cuda
     opts.device = torch.device('cuda:0' if opts.use_cuda else 'cpu')

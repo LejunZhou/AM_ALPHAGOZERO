@@ -31,10 +31,12 @@ or:
 from __future__ import annotations
 
 import copy
+import contextlib
 import math
 import os
+import shutil
 import sys
-import tempfile
+import uuid
 
 import numpy as np
 import torch
@@ -57,6 +59,24 @@ from am_baseline.training.coach import (
     generate_self_play_batch,
 )
 from am_baseline.training.trainer import train_step_alphazero
+
+
+@contextlib.contextmanager
+def _workspace_tempdir():
+    """Temporary directory under the repo scratch area.
+
+    Windows sandbox runs can create ACL-restricted dirs via `tempfile` that
+    PyTorch's C++ zip writer cannot open. A normal workspace dir avoids that
+    without changing the smoke semantics.
+    """
+    root = os.path.abspath(os.path.join(os.getcwd(), ".tmp", "smoke_alphazero"))
+    os.makedirs(root, exist_ok=True)
+    path = os.path.join(root, uuid.uuid4().hex)
+    os.makedirs(path, exist_ok=False)
+    try:
+        yield path
+    finally:
+        shutil.rmtree(path, ignore_errors=True)
 
 
 # ---------------------------------------------------------------------------
@@ -183,7 +203,7 @@ def test_save_load_roundtrip(N: int = 6) -> None:
     buf = _build_buffer(N, n_instances=5, seed=7)
     snap_sets = [set(int(x) for x in arr) for arr in buf._step_index]
 
-    with tempfile.TemporaryDirectory() as tmp:
+    with _workspace_tempdir() as tmp:
         path = os.path.join(tmp, "buf.pt")
         buf.save(path)
         buf2 = MCTSReplayBuffer(
@@ -282,6 +302,60 @@ def test_train_step_alphazero(N: int = 8) -> None:
     assert metrics["value_loss"] > 0, "value_loss should be strictly positive (MSE)"
     assert metrics["total_loss"] >= metrics["policy_loss"] - 1e-6
     print("  [A1] OK")
+
+
+def test_train_step_alphazero_lambda_zero(N: int = 8) -> None:
+    """Smoke A1c - lambda_v=0 is a true policy-only update.
+
+    The value head still reports a finite MSE metric, but value gradients must
+    be exactly absent from the combined update. This is the rollout-teacher
+    ablation contract.
+    """
+    print(f"  [A1c] train_step_alphazero lambda_v=0 on N={N} ...")
+    torch.manual_seed(0)
+
+    buf = _build_buffer(N, n_instances=5, seed=17)
+    cfg = Config(
+        graph_size=N,
+        embedding_dim=32,
+        n_encode_layers=2,
+        n_heads=4,
+        value_enabled=True,
+        value_hidden_dim=32,
+    )
+    model = AttentionModel(cfg).cpu()
+    optimizer = torch.optim.Adam(model.parameters(), lr=1e-3, weight_decay=1e-4)
+    pre = {name: p.detach().clone() for name, p in model.named_parameters()}
+    batch = buf.sample_step(step=2, batch_size=5)
+
+    class _Opts:
+        device = torch.device("cpu")
+        lambda_v = 0.0
+        max_grad_norm = 1.0
+
+    metrics = train_step_alphazero(model, optimizer, batch, _Opts())
+
+    for k, v in metrics.items():
+        assert math.isfinite(v), f"metrics[{k}] is not finite: {v}"
+    assert abs(metrics["total_loss"] - metrics["policy_loss"]) < 1e-6, (
+        f"lambda_v=0 should make total_loss == policy_loss, got {metrics}"
+    )
+    assert metrics["value_grad_norm"] == 0.0, metrics
+    assert metrics["value_grad_norm_vh"] == 0.0, metrics
+    assert metrics["value_grad_norm_shared"] == 0.0, metrics
+    assert "mean_entropy_policy" in metrics, "policy entropy metric missing"
+
+    moved = {"shared": False, "value_head": False}
+    for name, p in model.named_parameters():
+        delta = (p.detach() - pre[name]).abs().max().item()
+        if name.startswith("value_head"):
+            moved["value_head"] = moved["value_head"] or delta > 0
+        else:
+            moved["shared"] = moved["shared"] or delta > 0
+    assert moved["shared"], "policy-only update did not move shared policy parameters"
+    assert not moved["value_head"], "lambda_v=0 unexpectedly moved value_head parameters"
+
+    print("  [A1c] OK")
 
 
 def test_state_reconstruction_roundtrip(N: int = 6) -> None:
@@ -601,7 +675,7 @@ def test_coach_gate_noop(N: int = 8) -> None:
     n_iterations = 3
     gate_every = 10  # > n_iterations -> never fires
 
-    with tempfile.TemporaryDirectory() as tmp:
+    with _workspace_tempdir() as tmp:
         opts = _make_tiny_coach_opts(
             N=N, M=M, K=K, train_steps=train_steps,
             gate_every=gate_every, save_dir=tmp,
@@ -679,7 +753,7 @@ def test_coach_three_iters(N: int = 8) -> None:
     n_iterations = 3
     gate_every = 2  # gates at iter_idx in {1} -> (1+1)%2 == 0 -> fires once
 
-    with tempfile.TemporaryDirectory() as tmp:
+    with _workspace_tempdir() as tmp:
         opts = _make_tiny_coach_opts(
             N=N, M=M, K=K, train_steps=train_steps,
             gate_every=gate_every, save_dir=tmp,
@@ -790,6 +864,7 @@ def main() -> int:
         test_save_load_roundtrip(N=6)
         test_state_reconstruction_roundtrip(N=6)
         test_train_step_alphazero(N=8)
+        test_train_step_alphazero_lambda_zero(N=8)
         test_self_play_generator(N=20, M=10, K=20)
         test_target_entropy_under_schedule(N=20, M=10, K=20)
         test_coach_gate_noop(N=8)

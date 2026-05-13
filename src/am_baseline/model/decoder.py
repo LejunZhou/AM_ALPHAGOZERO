@@ -126,19 +126,42 @@ class Decoder(nn.Module):
         return log_p, mask
 
     def _get_step_context(self, embeddings, state):
-        """Get context for current decoding step (TSP: first + current node embeddings)."""
+        """Get context for current decoding step (TSP: first + current node embeddings).
+
+        Track A (2026-05-11): supports a per-row `state.i` of shape (B,) so that
+        rollouts at heterogeneous tour-steps can be batched together. The
+        scalar fast-path (used by training-time multi-step decode and by the
+        MCTS selection path, both of which pass scalar `state.i`) is preserved
+        bit-for-bit by branching on `state.i.numel() == 1`.
+        """
         current_node = state.get_current_node()
         batch_size, num_steps = current_node.size()
 
         if num_steps == 1:
-            if state.i.item() == 0:
-                return self.W_placeholder[None, None, :].expand(batch_size, 1, self.W_placeholder.size(-1))
-            else:
+            # Fast-path: scalar i, all rows at the same step (selection-path
+            # eval_many, smoke tests).
+            if state.i.numel() == 1:
+                if state.i.item() == 0:
+                    return self.W_placeholder[None, None, :].expand(batch_size, 1, self.W_placeholder.size(-1))
                 return embeddings.gather(
                     1,
                     torch.cat((state.first_a, current_node), 1)[:, :, None].expand(batch_size, 2, embeddings.size(-1))
                 ).view(batch_size, 1, -1)
-        # Multi-step (parallel) context
+
+            # Per-row path: state.i is (B,) — rows are at heterogeneous steps.
+            # Build BOTH the placeholder-form and the gathered-form context,
+            # then select per row via torch.where. Cost of the unused gather
+            # work at step==0 rows is small relative to the saved NN-launch
+            # overhead from merging step groups.
+            gathered = embeddings.gather(
+                1,
+                torch.cat((state.first_a, current_node), 1)[:, :, None].expand(batch_size, 2, embeddings.size(-1))
+            ).view(batch_size, 1, -1)  # (B, 1, 2*embed_dim)
+            placeholder = self.W_placeholder[None, None, :].expand(batch_size, 1, self.W_placeholder.size(-1))
+            step_zero = (state.i.view(-1, 1, 1) == 0)
+            return torch.where(step_zero, placeholder, gathered)
+
+        # Multi-step (parallel) context — training-time, unchanged.
         embeddings_per_step = embeddings.gather(
             1,
             current_node[:, 1:, None].expand(batch_size, num_steps - 1, embeddings.size(-1))
