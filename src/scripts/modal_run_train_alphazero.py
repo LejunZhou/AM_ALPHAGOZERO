@@ -1566,6 +1566,114 @@ def run_tsp50_lv0_K50_50iter(timestamp: str = "") -> None:
 
 
 @app.local_entrypoint()
+def run_tsp100_lv0_K50_50iter(timestamp: str = "") -> None:
+    """TSP-100 lv0 from-scratch probe — 50 iters at K=50 (proposal Stage 5 scaling).
+
+    First TSP-100 run with the lv0 winner recipe (leaf_eval=rollout, lambda_v=0)
+    that landed at TSP-20 (lv0 iter-197 best val 3.8486 greedy, beats Stage 1
+    canonical 3.83943 at ~6.4x sample efficiency) and is in flight at TSP-50
+    (`0d48yqys` finished iter 99 at val 6.0294 last-accept / 6.0259 raw best;
+    follow-up `tsp50_lv0_K50_resume100_lr1e4_to199_trackA` at lr=1e-4 launched
+    2026-05-13).
+
+    Reference points (TSP-100):
+      LKH3 (near-optimal, val_seed=1234):              7.749   (outputs/baselines/tsp100_lkh_seed1234.csv)
+      AM-paper released greedy:                        ~8.13
+      AM-paper released sampling-1280:                 7.928   (Stage 3 D.3 anchor)
+      Stage 1 reduced-compute (bs=1024, ep=640k):      8.21043 (g7jxkixo @ epoch 99; reduced-compute caveat)
+      Released AM ckpt + MCTS rollout K=50 (val seed=1234, val_size=1000): 7.9217 (Stage 3 D.4)
+
+    NB: Stage 4 uses val_seed=42, val_size=10000 — DIFFERENT from the seed=1234
+    val sets the Stage 1/3 numbers above were measured on. Apples-to-apples
+    against Stage 1 TSP-100 (8.21 at seed=1234) would require re-running the
+    reduced-compute ckpt on val_seed=42. For headline-purposes the LKH 7.749
+    reference is robust across seeds (TSP is rotation/scale-invariant; LKH
+    converges to optimum on essentially all uniform-2D instances).
+
+    Recipe: lv0 winner verbatim from `_f61_args` plus graph_size=100:
+      leaf_eval=rollout, lambda_v=0.0, K=50, step10, eps=0.25,
+      value_target_norm=none, lr=5e-4 const, wd=0, buffer=5000, batch=512,
+      train_steps=200, M=1000, val_seed=42, gate=ttest gate_every=1,
+      mcts_batch_size=1000.
+
+    **From-scratch (no --load_path).** Matches the TSP-20 lv0 and TSP-50 lv0
+    chains. Open question: would warm-starting from the existing Stage 1
+    TSP-100 ckpt (`stage1_tsp100_bs1024_ep640k_with_value_20260428T233519/
+    epoch-99.pt`, val 8.21) accelerate convergence vs from-scratch? The TSP-50
+    lv0 chain only ran from-scratch; we don't have evidence either way. From-
+    scratch keeps the sample-efficiency story clean (instances counted from 0)
+    but may take longer to reach competitive val at TSP-100. Worth a follow-up
+    warm-start variant if from-scratch struggles.
+
+    Wall estimate (extrapolated from TSP-50 K=50 M=1000 = 5.85 min/iter
+    post-Track A; TSP-100 scales roughly 2-3x per iter — N=100 vs N=50 doubles
+    per-rollout decoder calls AND doubles per-NN-call work, plus K=50 sims at
+    100 tour-steps = 2x simulations per instance):
+      Per-iter wall:  ~12-18 min on A10
+      50 iters:       ~10-15 h
+      Cost:           ~$30-50 Modal credits
+
+    Goals (50-iter probe):
+      - **Verify lv0 recipe transfers to TSP-100** (no OOM at M=1000, no Triton/
+        decoder issues at N=100, val_avg_cost descending iteration-by-iteration).
+      - Beat existing Stage 1 reduced-compute baseline 8.21 within 50 iters
+        (should be easy; lv0 at TSP-50 was beating Stage 4 prior best by iter ~30).
+      - Reach the LKH-gap zone (target val ~7.95-8.05) — would put us in the
+        same ballpark as released-AM sampling-1280 (7.928) at <50K instances
+        vs the AM paper's 1.28M.
+      - If trajectory still descending at iter 49, escalate to lr=1e-4 resume
+        +100 iters (mirroring TSP-20/TSP-50 lv0 chains).
+
+    Open knobs to consider before launch (defaults below; flag for review):
+      - **K=50 vs K=100**: K=50 matches TSP-50 production and halves wall;
+        K=100 doubles search budget per step but doubles wall. The TSP-20
+        A.3 finding was "K dominates over batch and M", which suggests K=100
+        could help; but at TSP-100 we already get ~2x simulations per
+        instance vs TSP-50 K=50 just from the longer tour. Default K=50.
+      - **From-scratch vs warm-start** from Stage 1 ckpt: default from-scratch.
+      - **50 iters vs 100 iters**: 100 iters would hit Modal's 24h timeout
+        envelope at 12-18 min/iter (50 iters = 10-15h is safe). Default 50;
+        chain at lr=1e-4 for +100 if the 50-iter slope is still healthy.
+      - **A10 vs A100**: default A10 (current image GPU). A100 would cut wall
+        by ~2.5x but $/hr is ~2.7x, so cost is similar; A100 wins on real-time.
+    """
+    from datetime import datetime, timezone
+    if not timestamp:
+        timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")
+
+    run_name = f"tsp100_lv0_K50_50iter_{timestamp}"
+    args = _f61_args(
+        run_name=run_name,
+        k=50,
+        buffer_capacity=5000,
+        lr_model="5e-4",
+        lr_decay="1.0",
+        temperature_schedule="step10",
+        dirichlet_epsilon="0.25",
+        leaf_eval="rollout",
+        lambda_v="0.0",
+    )
+    # Patch graph_size 20 -> 100.
+    idx_g = args.index("--graph_size")
+    args[idx_g + 1] = "100"
+    # Override n_iterations 100 -> 50 (probe scope; chain at lr=1e-4 for +100 later).
+    idx_n = args.index("--n_iterations")
+    args[idx_n + 1] = "50"
+    # Production-scale cross-instance parallelism.
+    args.extend(["--mcts_batch_size", "1000"])
+
+    print(f"[modal] launching TSP-100 lv0 from-scratch (K=50, 50 iter, leaf=rollout, lambda_v=0)")
+    print(f"  {run_name}")
+    print(f"  graph_size=100  K=50  lr=5e-4  mcts_batch_size=1000  M=1000")
+    print(f"  wall estimate: ~12-18 min/iter -> 10-15h total on A10")
+    h = train_alphazero_remote.spawn(*args)
+    print(f"\n[modal] awaiting {run_name} (function_call_id={h.object_id}) ...", flush=True)
+    h.get()
+    print(f"[modal] {run_name} done.", flush=True)
+    print("[modal] download results with: modal volume get am-alphagozero-volume outputs/")
+
+
+@app.local_entrypoint()
 def run_tsp50_lv0_resume_from_iter15_trackA(timestamp: str = "") -> None:
     """Resume TSP-50 lv0 from `oxjyj70e` iter-15.pt for +34 iters (target iter 49).
 
@@ -1677,6 +1785,94 @@ def run_tsp50_lv0_resume50_to_iter99_trackA(timestamp: str = "") -> None:
     print(f"  {run_name}")
     print(f"  resume_from={resume_from}")
     print(f"  graph_size=50  K=50  lr=5e-4 const  mcts_batch_size=1000")
+    h = train_alphazero_remote.spawn(*args)
+    print(f"\n[modal] awaiting {run_name} (function_call_id={h.object_id}) ...", flush=True)
+    h.get()
+    print(f"[modal] {run_name} done.", flush=True)
+    print("[modal] download results with: modal volume get am-alphagozero-volume outputs/")
+
+
+@app.local_entrypoint()
+def run_tsp50_lv0_resume100_lr1e4_to_iter199(timestamp: str = "") -> None:
+    """Continue TSP-50 lv0 chain from `0d48yqys` iter-99.pt for +100 iters at lr=1e-4 (target iter 199).
+
+    TSP-50 analog of `run_rollout_lv0_resume100_lr1e4_to_iter199` (the TSP-20
+    D.4 chain that broke the 3.85 greedy ceiling).
+
+    Continuation of `0d48yqys` (`tsp50_lv0_K50_resume50_to99_trackA_20260513T064031`)
+    which finished at iter 99 with:
+      - best val 6.0259 (iter 97, raw greedy)
+      - last gate-accepted best_model 6.0294 (iter 90)
+      - segment slope iter 75-99 = ~-0.002/iter (lr=5e-4 well filling but not
+        saturated; mirrors TSP-20 D.3 endpoint at iter 99)
+
+    Reference points (TSP-50, val_seed=42):
+      Gurobi:                              5.6987
+      Stage 1 canonical (AM+value greedy): 5.7999
+      Stage 4 prior best (muckiyvi vh+lv1, 100 iters): 6.060
+      lv0 chain iter 99 (this resume's input):         6.0294
+
+    Hypothesis (from the TSP-20 D.3 -> D.4 pattern): at constant lr=5e-4 the
+    lv0 chain saturates around iter 90-100 with slope -0.001 to -0.002/iter.
+    Resuming at lr=1e-4 should fire immediately and unlock another ~0.01-0.02
+    in the first 3-5 iters, asymptoting around iter 150-180 at val ~5.95-6.00.
+    Still 0.15-0.20 above Stage 1 5.7999 — would need either F.6.1.6 step-decay
+    or §E.4 step-decay 400-iter to fully close.
+
+    Same recipe verbatim (lv0: leaf_eval=rollout, lambda_v=0.0, K=50, step10,
+    eps=0.25, value_target_norm=none, wd=0, buffer=5000, batch=512,
+    train_steps=200, val_seed=42, gate=ttest gate_every=1, M=1000,
+    mcts_batch_size=1000). Only knob change: **lr_model 5e-4 -> 1e-4**.
+
+    `train_alphazero.py`'s lr-override-on-resume (added 2026-05-07) applies
+    `--lr_model` AFTER `coach.load_checkpoint` so the optimizer's loaded lr +
+    LambdaLR base_lrs are overwritten to 1e-4. Verified at TSP-20 (D.4 chain
+    fired the -0.006/3-iter drop expected from the F.6.1.4.b pattern).
+
+    Wall estimate: Track A holds ~5.85 min/iter at TSP-50 K=50 M=1000. 100
+    iters = ~9.7h on A10. Cost: ~$25-30 Modal credits.
+
+    Open question: does the lr unlock pattern that worked at TSP-20 transfer
+    cleanly to TSP-50 where the absolute gap to optimum is ~6x larger? If yes
+    -> commits the lv0 recipe as the TSP-N scaling story; opens §E.4 400-iter
+    step-decay as the next-tier consolidation. If no (lr=1e-4 doesn't unlock
+    or unlocks tiny <0.01) -> suggests TSP-50 needs more structural changes
+    (decoupled value head, separate encoder, etc.).
+    """
+    from datetime import datetime, timezone
+    if not timestamp:
+        timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")
+
+    resume_from = (
+        "outputs/tsp_50/"
+        "tsp50_lv0_K50_resume50_to99_trackA_20260513T064031_20260513T064039/"
+        "iter-99.pt"
+    )
+    run_name = f"tsp50_lv0_K50_resume100_lr1e4_to199_trackA_{timestamp}"
+    args = _f61_args(
+        run_name=run_name,
+        k=50,
+        buffer_capacity=5000,
+        lr_model="1e-4",                  # KEY: dropped from 5e-4
+        lr_decay="1.0",
+        temperature_schedule="step10",
+        dirichlet_epsilon="0.25",
+        leaf_eval="rollout",
+        lambda_v="0.0",
+    )
+    idx_g = args.index("--graph_size")
+    args[idx_g + 1] = "50"
+    # +100 iters to reach iter 199 (0d48yqys finished at iter 99).
+    idx_n = args.index("--n_iterations")
+    args[idx_n + 1] = "100"
+    args.extend(["--mcts_batch_size", "1000"])
+    args.extend(["--resume_from", resume_from])
+
+    print(f"[modal] launching TSP-50 lv0 +100 iter resume at lr=1e-4 (target iter 199) from 0d48yqys iter-99.pt")
+    print(f"  {run_name}")
+    print(f"  resume_from={resume_from}")
+    print(f"  graph_size=50  K=50  mcts_batch_size=1000")
+    print(f"  lr override: 5e-4 -> 1e-4 (applied AFTER coach.load_checkpoint)")
     h = train_alphazero_remote.spawn(*args)
     print(f"\n[modal] awaiting {run_name} (function_call_id={h.object_id}) ...", flush=True)
     h.get()
@@ -2006,6 +2202,252 @@ def run_tsp50_k_compare_20iter(timestamp: str = "") -> None:
 
 
 @app.local_entrypoint()
+def run_tsp100_k_compare_20iter(timestamp: str = "") -> None:
+    """TSP-100 K-comparison ablation: K=50 vs K=100, 20 iters each, parallel (lv0 recipe).
+
+    Mirrors `run_tsp50_k_compare_20iter` at TSP-100 scale with the **lv0
+    recipe** (leaf_eval=rollout, lambda_v=0) — the current production winner.
+    Decision-driver before committing to a 50-iter or 100-iter TSP-100 main
+    run.
+
+    Hypothesis: at N=100 the action space is 2x TSP-50's. K=50 gives ~0.5
+    visit/action at root (under-explored); K=100 gives ~1 visit/action. The
+    TSP-20 A.3 finding ("K dominates over batch and M, ~10x the batch effect")
+    suggests K=100 may help materially at TSP-100 — but at 2x per-iter wall
+    cost. This probe answers: is the quality gain at iter 19 worth the wall?
+
+    Decision rule after 20 iters:
+      - If K=100 val(19) <= K=50 val(19) - 0.05 (cost units): K=100 wins
+        clearly; commit K=100 for the 50-iter main run.
+      - If K=50 val(19) is within ~0.05 of K=100 (or better): K=50 wins on
+        cost-efficiency; commit K=50.
+
+    Settings (both variants, lv0 production recipe):
+      graph_size=100, M=1000, mcts_batch_size=1000, train_steps=200,
+      batch=512, buffer=5000, lr=5e-4 const, wd=0, value_target_norm=none,
+      lambda_v=0.0, leaf_eval=rollout, step10, dirichlet_epsilon=0.25,
+      dirichlet_alpha_factor=10.0, gate=ttest gate_every=1, val_seed=42.
+
+    Per-iter wall predicted (extrapolating from TSP-50 K=50 ~5.85 min/iter
+    post-Track A; TSP-100 scales ~2-3x per iter from TSP-50 due to 2x rollout
+    length + 2x per-NN-call work; K=100 doubles simulations):
+      K=50  variant:  ~12-18 min/iter  -> 20 iter = ~4-6 h
+      K=100 variant:  ~24-36 min/iter  -> 20 iter = ~8-12 h
+      Parallel total: ~8-12 h wall (max of the two), ~$45-75 credits.
+
+    Both fit well within Modal's 24h timeout.
+    """
+    from datetime import datetime, timezone
+    if not timestamp:
+        timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")
+
+    variants = [50, 100]
+    grid = []
+    for k in variants:
+        run_name = f"tsp100_k{k}_lv0_compare_20iter_{timestamp}"
+        args = _f61_args(
+            run_name=run_name,
+            k=k,
+            buffer_capacity=5000,
+            lr_model="5e-4",
+            lr_decay="1.0",
+            temperature_schedule="step10",
+            dirichlet_epsilon="0.25",
+            leaf_eval="rollout",
+            lambda_v="0.0",
+        )
+        # Override graph_size 20 -> 100 and n_iterations 100 -> 20.
+        idx_g = args.index("--graph_size")
+        args[idx_g + 1] = "100"
+        idx_n = args.index("--n_iterations")
+        args[idx_n + 1] = "20"
+        # Production-scale cross-instance parallelism.
+        args.extend(["--mcts_batch_size", "1000"])
+        grid.append((run_name, args))
+
+    print(f"[modal] launching TSP-100 K-comparison ablation (K=50 vs K=100, 20 iter each, lv0 recipe)")
+    for label, _ in grid:
+        print(f"  {label}")
+
+    handles = {label: train_alphazero_remote.spawn(*args) for label, args in grid}
+    print(f"\n[modal] all {len(handles)} jobs spawned. Awaiting completion...")
+    for label, h in handles.items():
+        print(f"[modal] awaiting {label} (function_call_id={h.object_id}) ...", flush=True)
+        h.get()
+        print(f"[modal] {label} done.", flush=True)
+    print(f"\n[modal] all {len(handles)} TSP-100 K-comparison jobs complete.")
+    print("[modal] download results with: modal volume get am-alphagozero-volume outputs/")
+
+
+@app.local_entrypoint()
+def run_tsp100_k50_lv0_resume30_to49(timestamp: str = "") -> None:
+    """TSP-100 K=50 lv0 +30 iter resume from iter-19.pt of the K-comparison run.
+
+    Continues the K=50 arm of `run_tsp100_k_compare_20iter` (wandb `dbv1cr8o`,
+    finished 2026-05-13 at iter 19, val_avg_cost=9.1009; best raw 8.9671 at
+    iter 17 = last accept). Same recipe verbatim, lr=5e-4 const — no lr-drop
+    yet because at iter 19 the trajectory is still improving (8.99 at iter 13
+    -> 8.97 at iter 17; the F.6.1.4-style lr-drop is reserved for after the
+    5e-4 well empties, mirroring the TSP-50 0->49 -> 50->99 chain shape).
+
+    Resumes from `iter-19.pt` (model + best_model + optimizer + lr_scheduler
+    + RNG + buffer.pt) for +30 iters -> target iter 49.
+
+    Wall estimate: K=50 at TSP-100 averaged ~1660 s/iter (~27.7 min) in the
+    20-iter compare run. 30 iters ~= 14h on A10. Cost: ~$30-40 Modal credits.
+
+    Decision-driver for the next chain link: if val at iter 49 beats ~8.8
+    -> commit lv0 recipe for TSP-100 main run; if plateau at 8.9 -> trigger
+    lr-drop to 1e-4 mirroring §B.2 / §E.2.b.
+    """
+    from datetime import datetime, timezone
+    if not timestamp:
+        timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")
+
+    resume_from = (
+        "outputs/tsp_100/"
+        "tsp100_k50_lv0_compare_20iter_20260513T120814_20260513T120821/"
+        "iter-19.pt"
+    )
+    run_name = f"tsp100_k50_lv0_resume20_to49_trackA_{timestamp}"
+    args = _f61_args(
+        run_name=run_name,
+        k=50,
+        buffer_capacity=5000,
+        lr_model="5e-4",
+        lr_decay="1.0",
+        temperature_schedule="step10",
+        dirichlet_epsilon="0.25",
+        leaf_eval="rollout",
+        lambda_v="0.0",
+    )
+    idx_g = args.index("--graph_size")
+    args[idx_g + 1] = "100"
+    # +30 iters to reach iter 49 (compare run finished at iter 19).
+    idx_n = args.index("--n_iterations")
+    args[idx_n + 1] = "30"
+    args.extend(["--mcts_batch_size", "1000"])
+    args.extend(["--resume_from", resume_from])
+
+    print(f"[modal] launching TSP-100 K=50 lv0 +30 iter resume (target iter 49) from dbv1cr8o iter-19.pt")
+    print(f"  {run_name}")
+    print(f"  resume_from={resume_from}")
+    print(f"  graph_size=100  K=50  mcts_batch_size=1000  lr=5e-4 const")
+    h = train_alphazero_remote.spawn(*args)
+    print(f"\n[modal] awaiting {run_name} (function_call_id={h.object_id}) ...", flush=True)
+    h.get()
+    print(f"[modal] {run_name} done.", flush=True)
+    print("[modal] download results with: modal volume get am-alphagozero-volume outputs/")
+
+
+@app.local_entrypoint()
+def run_tsp20_k10_lv0_step50(timestamp: str = "") -> None:
+    """TSP-20 K=10 lv0 100-iter with built-in lr step at iter 50.
+
+    Schedule (one --lr_decay 0.2 --lr_decay_step_size 50 cycle):
+        iter  0..49: lr = 5e-4
+        iter 50..99: lr = 1e-4   (decay factor 0.2)
+
+    Recipe: lv0 winner verbatim (leaf_eval=rollout, lambda_v=0, step10,
+    eps=0.25, value_target_norm=none, wd=0, buffer=5000, batch=512,
+    train_steps=200, M=1000, val_seed=42, gate=ttest gate_every=1,
+    mcts_batch_size=1000) — only K and lr-schedule are non-default.
+
+    Open question: K=10 is well below the A.3 sub-budget probe's K=20
+    lower-bound (which already cost +0.200 vs K=40 at TSP-20). Can the
+    early lr-drop compensate for the search-budget starvation, or is K=10
+    structurally below the threshold where AGZ policy improvement works
+    regardless of optimizer tuning?
+
+    Wall estimate: TSP-20 K=10 ~1 min/iter (Track A scales with K). 100
+    iters ~= 1.5-2h on A10. Cost: ~$3-5 Modal credits.
+    """
+    from datetime import datetime, timezone
+    if not timestamp:
+        timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")
+
+    run_name = f"tsp20_k10_lv0_step50_100iter_{timestamp}"
+    args = _f61_args(
+        run_name=run_name,
+        k=10,
+        buffer_capacity=5000,
+        lr_model="5e-4",
+        lr_decay="0.2",                  # 5e-4 -> 1e-4 at the step
+        lr_decay_step_size=50,           # step at iter 50
+        temperature_schedule="step10",
+        dirichlet_epsilon="0.25",
+        leaf_eval="rollout",
+        lambda_v="0.0",
+    )
+    args.extend(["--mcts_batch_size", "1000"])
+
+    print(f"[modal] launching TSP-20 K=10 lv0 100-iter with lr step at iter 50 (5e-4 -> 1e-4)")
+    print(f"  {run_name}")
+    print(f"  graph_size=20  K=10  mcts_batch_size=1000")
+    print(f"  lr schedule: 5e-4 for iter 0..49, 1e-4 for iter 50..99")
+    h = train_alphazero_remote.spawn(*args)
+    print(f"\n[modal] awaiting {run_name} (function_call_id={h.object_id}) ...", flush=True)
+    h.get()
+    print(f"[modal] {run_name} done.", flush=True)
+    print("[modal] download results with: modal volume get am-alphagozero-volume outputs/")
+
+
+@app.local_entrypoint()
+def run_tsp50_k25_lv0_step50(timestamp: str = "") -> None:
+    """TSP-50 K=25 lv0 100-iter with built-in lr step at iter 50.
+
+    Schedule (one --lr_decay 0.2 --lr_decay_step_size 50 cycle):
+        iter  0..49: lr = 5e-4
+        iter 50..99: lr = 1e-4   (decay factor 0.2)
+
+    Recipe: lv0 winner verbatim (leaf_eval=rollout, lambda_v=0, step10,
+    eps=0.25, value_target_norm=none, wd=0, buffer=5000, batch=512,
+    train_steps=200, M=1000, val_seed=42, gate=ttest gate_every=1,
+    mcts_batch_size=1000). Graph size 50 and K=25 are the non-default knobs.
+
+    Open question: K=25 sits halfway between the K=50 lv0 chain (which reached
+    val 5.93 over 200 iters with manual lr-staircase) and the K=10 TSP-20
+    sibling. Does an under-search K=25 budget paired with an early lr-drop
+    learn meaningfully on TSP-50, or does the smaller K starve the
+    policy-improvement signal? Cross-graph comparison with the K=10 TSP-20
+    step50 experiment isolates the search-budget effect across N.
+
+    Wall estimate: TSP-50 K=50 averaged ~4.5 min/iter (Track A); K=25 should
+    be ~2-3 min/iter -> 100 iters ~= 4-5h on A10. Cost: ~$10-15 Modal credits.
+    """
+    from datetime import datetime, timezone
+    if not timestamp:
+        timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")
+
+    run_name = f"tsp50_k25_lv0_step50_100iter_{timestamp}"
+    args = _f61_args(
+        run_name=run_name,
+        k=25,
+        buffer_capacity=5000,
+        lr_model="5e-4",
+        lr_decay="0.2",                  # 5e-4 -> 1e-4 at the step
+        lr_decay_step_size=50,           # step at iter 50
+        temperature_schedule="step10",
+        dirichlet_epsilon="0.25",
+        leaf_eval="rollout",
+        lambda_v="0.0",
+    )
+    idx_g = args.index("--graph_size")
+    args[idx_g + 1] = "50"
+    args.extend(["--mcts_batch_size", "1000"])
+
+    print(f"[modal] launching TSP-50 K=25 lv0 100-iter with lr step at iter 50 (5e-4 -> 1e-4)")
+    print(f"  {run_name}")
+    print(f"  graph_size=50  K=25  mcts_batch_size=1000")
+    print(f"  lr schedule: 5e-4 for iter 0..49, 1e-4 for iter 50..99")
+    h = train_alphazero_remote.spawn(*args)
+    print(f"\n[modal] awaiting {run_name} (function_call_id={h.object_id}) ...", flush=True)
+    h.get()
+    print(f"[modal] {run_name} done.", flush=True)
+    print("[modal] download results with: modal volume get am-alphagozero-volume outputs/")
+
+
+@app.local_entrypoint()
 def run_f616_400iter_step_decay(timestamp: str = "") -> None:
     """Phase F.6.1.6 — from-scratch 400-iter run with stepped lr decay.
 
@@ -2226,6 +2668,149 @@ def run_f63_kbracket_step10_eps25(timestamp: str = "") -> None:
     h.get()
     print(f"[modal] {run_name} done.", flush=True)
     print("[modal] download results with: modal volume get am-alphagozero-volume outputs/")
+
+
+@app.function(
+    volumes={VOLUME_PATH: volume},
+    timeout=60 * 60 * 2,
+    env=run_env,
+    image=image,
+    gpu=DEFAULT_GPU,
+)
+def probe_mcts_decomp_remote(*probe_args: str) -> str:
+    """Run scripts.probe_mcts_decomp on Modal A10 with a checkpoint from the volume.
+
+    Returns the captured stdout so the local entrypoint can echo it back.
+    Used by `run_probe_mcts_decomp` below.
+    """
+    import io
+    import contextlib
+    os.chdir(PROJECT_DIR)
+    sys.path.insert(0, os.path.join(PROJECT_DIR, "src"))
+
+    outputs_vol = Path(VOLUME_PATH) / "outputs"
+    outputs_vol.mkdir(parents=True, exist_ok=True)
+    outputs_link = Path(PROJECT_DIR) / "outputs"
+    if outputs_link.is_dir() and not outputs_link.is_symlink():
+        import shutil
+        shutil.rmtree(outputs_link)
+    elif outputs_link.exists() or outputs_link.is_symlink():
+        outputs_link.unlink()
+    outputs_link.symlink_to(outputs_vol)
+
+    sys.argv = ["probe_mcts_decomp.py"] + list(probe_args)
+    from scripts.probe_mcts_decomp import main as probe_main
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        probe_main()
+    out = buf.getvalue()
+    # Also dump to stderr so it appears in Modal logs live.
+    print(out, file=sys.stderr, flush=True)
+    return out
+
+
+@app.function(
+    volumes={VOLUME_PATH: volume},
+    timeout=60 * 5,
+    env=run_env,
+    image=image,
+    gpu=DEFAULT_GPU,
+)
+def probe_triton_diag_remote() -> str:
+    """Diagnostic: report PyTorch + Triton install status on the Modal A10 image."""
+    import io, contextlib, sys
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        import torch
+        print(f"torch.__version__ = {torch.__version__}")
+        print(f"torch.cuda.is_available() = {torch.cuda.is_available()}")
+        print(f"torch.version.cuda = {torch.version.cuda}")
+        if torch.cuda.is_available():
+            print(f"torch.cuda.get_device_name(0) = {torch.cuda.get_device_name(0)}")
+            print(f"torch.cuda.get_device_capability(0) = {torch.cuda.get_device_capability(0)}")
+        try:
+            import triton
+            print(f"triton.__version__ = {triton.__version__}")
+            print(f"triton.__file__ = {triton.__file__}")
+        except Exception as exc:
+            print(f"triton import failed: {exc!r}")
+        try:
+            import torch._inductor.utils as _iu
+            print(f"torch._inductor.utils.has_triton() = {_iu.has_triton()}")
+        except Exception as exc:
+            print(f"has_triton probe failed: {exc!r}")
+        # Try compiling a trivial function to see if the full pipeline works.
+        try:
+            @torch.compile(dynamic=True)
+            def f(x):
+                return x.sin().cos()
+            y = f(torch.randn(8, device="cuda"))
+            print(f"trivial compile OK: y.sum()={y.sum().item():.4f}")
+        except Exception as exc:
+            print(f"trivial compile failed: {type(exc).__name__}: {exc}")
+    return buf.getvalue()
+
+
+@app.local_entrypoint()
+def run_probe_triton_diag() -> None:
+    h = probe_triton_diag_remote.spawn()
+    print(f"[modal] awaiting triton diag (id={h.object_id})", flush=True)
+    out = h.get()
+    print("\n========== triton diagnostic ==========")
+    print(out)
+
+
+@app.local_entrypoint()
+def run_probe_mcts_decomp(
+    load_path: str = (
+        "outputs/tsp_50/"
+        "tsp50_lv0_K50_resume50_to99_trackA_20260513T064031_20260513T064039/"
+        "iter-68_accepted.pt"
+    ),
+    m_instances: str = "1000",
+    n_simulations: str = "50",
+    mcts_batch_size: str = "1000",
+    leaf_eval: str = "rollout",
+    ckpt_key: str = "best_model",
+    cprofile_top: str = "40",
+    compile_decoder: str = "false",
+    compile_mode: str = "default",
+) -> None:
+    """Run the MCTS wall decomposition probe on Modal A10 with a trained ckpt.
+
+    Default loads `iter-68_accepted.pt` from the current in-flight TSP-50 run
+    `0d48yqys` (val 6.0584 — current best Stage 4 TSP-50 lv0 checkpoint as of
+    2026-05-13). Uses production scale M=1000 K=50 leaf_eval=rollout to match
+    the live training MCTS wall.
+
+    Compare against the local random-init probe at M=200 to factor out the
+    random-init Python-share inflation (F.3 caveat in stage5_progress).
+    """
+    probe_args = [
+        "--graph_size", "50",
+        "--n_simulations", str(n_simulations),
+        "--M", str(m_instances),
+        "--mcts_batch_size", str(mcts_batch_size),
+        "--leaf_eval", leaf_eval,
+        "--dirichlet_epsilon", "0.25",
+        "--c_puct", "0.05",
+        "--temperature_schedule", "step10",
+        "--device", "cuda",
+        "--load_path", load_path,
+        "--ckpt_key", ckpt_key,
+        "--cprofile_top", str(cprofile_top),
+    ]
+    if str(compile_decoder).lower() in ("true", "1", "yes"):
+        probe_args.extend(["--compile_decoder", "--compile_mode", compile_mode])
+    print(f"[modal] launching probe_mcts_decomp on A10")
+    print(f"  load_path={load_path}")
+    print(f"  M={m_instances}  K={n_simulations}  mcts_batch_size={mcts_batch_size}  leaf_eval={leaf_eval}")
+    print(f"  compile_decoder={compile_decoder}  compile_mode={compile_mode}")
+    h = probe_mcts_decomp_remote.spawn(*probe_args)
+    print(f"\n[modal] awaiting probe (function_call_id={h.object_id}) ...", flush=True)
+    result = h.get()
+    print("\n========== probe output (from Modal A10) ==========")
+    print(result)
 
 
 @app.local_entrypoint()

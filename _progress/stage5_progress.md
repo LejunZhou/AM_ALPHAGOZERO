@@ -129,6 +129,39 @@ Single from-scratch run consolidating the F.6.1.3 → 4 → 4.b → 4.c manual c
 
 **Underperformed the F.6.1.4.c chain by ~0.014 at matched iters** (3.8578 vs 3.8498) despite identical recipe + 175 more iters + 2 extra lr-decay steps. Two candidate explanations not pursued: random-seed variance at ε=0.25 (~0.01-0.015 noise floor), or premature lr drop at iter 100 (chain ran 149 iters at lr=5e-4 before dropping). The 3.85 line is the recipe ceiling on TSP-20 under value_head leaf eval — drove the bottleneck-probe chain below.
 
+### B.4 K=10 lv0 step50 100-iter compute-efficiency probe — **COMPLETE 2026-05-13**
+
+`tsp20_k10_lv0_step50_100iter_20260513T230051_20260513T230102` — single from-scratch run testing whether the F.6.1.4.b lr-drop mechanism still fires under a deeply compressed search budget (K=10 vs lv0-chain K=40), and how far that compression can be pushed before policy-improvement stalls. Recipe: lv0 winner verbatim (leaf_eval=rollout, λᵥ=0, step10, ε=0.25, value_target_norm=none, wd=0, buffer=5000, batch=512, train_steps=200, M=1000, val_seed=42, gate=ttest gate_every=1, mcts_batch_size=1000); only K=10 and the built-in step schedule (`--lr_decay 0.2 --lr_decay_step_size 50` → 5e-4 for iter 0-49, 1e-4 for iter 50-99) are non-canonical.
+
+Modal `ap-4fKoITAJhNb98FiRpEwaql`. Wall: **33 min on A10** (~20 s/iter; mcts_s ~14 s, train_s ~3.5 s).
+
+**Per-segment ROI table:**
+
+| iter range | lr | first val | last val | min val (iter) | net Δ | accepts |
+|---|---|---:|---:|---:|---:|---:|
+| 0-49 | 5e-4 | 5.0159 | 3.8843 | 3.8843 (49) | **−1.132** | 22 / 50 |
+| 50-99 | 1e-4 | 3.8735 | 3.8576 | **3.8576 (99)** | −0.027 | 13 / 50 |
+| **49 → 50 step jump** | 5e-4→1e-4 | 3.8843 | 3.8735 | — | **−0.011 in one iter** | acc |
+
+**Best val: 3.8576 raw (iter 99) / 3.8583 last-accept (iter 97).** Last accept at iter 97 → 2 final rejects.
+
+**The lr-step unlock mechanism transfers cleanly to K=10.** The 49→50 single-iter Δ=−0.011 mirrors F.6.1.4.b's "lr=1e-4 unlocks the next tier in ONE iter" pattern (§B.2) — at 1/4 the search budget. ε=0.25 + step10 evidently produces enough target-information per root even at K=10 for the lr-step refinement to bite.
+
+**Compute-efficiency comparison (TSP-20 val_seed=42):**
+
+| recipe | K | iters | wall | best val | Δ vs Stage 1 (3.83943) |
+|---|---:|---:|---:|---:|---:|
+| Stage 1 REINFORCE canonical | — | ~250K grad steps | days | 3.83943 | — |
+| D.4 lv0 K=40 200-iter chain (F.6.1.4.b lr=1e-4) | 40 | 199 | ~3-4 h | **3.8486** | +0.009 |
+| B.3 F.6.1.6 step-decay (vh+λᵥ=1) | 40 | 400 | 2.79 h | 3.8578 (plateau 365) | +0.018 |
+| **B.4 K=10 lv0 step50** | **10** | **100** | **33 min** | **3.8576** | **+0.018** |
+
+**Implications:**
+- **Matches F.6.1.6's plateau (3.8578) at ~1/5 wall and 1/4 iters** — confirms the §C value-head bottleneck story: B.3's 3.85 ceiling was a vh-leaf-eval artifact, not a recipe ceiling. lv0 rollout breaks past it even with K=10.
+- **Trails D.4's K=40 200-iter best by 0.009** — K does still matter, but the marginal value of K∈[10,40] is much smaller than A.3's TSP-20 K=20→40 probe (which cost +0.200) suggested *once an early lr-drop is added*. The lr step substantially compensates for under-search by switching the optimizer to the refinement regime sooner.
+- **F.6.1.6 step-decay 400-iter is likely redundant** for the TSP-20 ceiling characterization — a 100-iter K=10 step50 buys the same answer in 1/30 the wall. The remaining 0.009 gap to D.4 is the most plausible target for any further TSP-20 compute spending; K=40 step50 100-iter is the natural follow-up to disentangle K vs schedule contributions.
+- **Strongly motivates the §E TSP-50 K=25 step50 sibling** (currently in flight, ETA ~21:00 PDT 2026-05-13) — if the K-vs-N scaling of step50 holds at TSP-50, the trackA recipe in §E.2.b (two-link chain to iter 199) may be superseded by a single 100-iter step50 at lower K, with significant credit-cost savings.
+
 ---
 
 ## §C — Value-head bottleneck diagnosis — **COMPLETE 2026-05-08/09**
@@ -380,9 +413,37 @@ Mid-run snapshot (1wpkngg9 trajectory iter 16-30 via wandb scan, polled 2026-05-
 
 Best accepted val in resume: 6.1709 at iter 23. avg mcts_w (iter 16-30): 309.9s = 5.16 min/iter; iters remaining (to 49): 19, projected ETA ~1.67h.
 
-### E.2 TSP-50 lv0 K=50 +50 iter resume to iter 99 (Track A relaunch) — **IN FLIGHT 2026-05-13**
+### E.2 TSP-50 lv0 K=50 +50 iter resume to iter 99 (Track A relaunch) — **COMPLETE 2026-05-13**
 
-`tsp50_lv0_K50_resume50_to99_trackA_20260513T064031` — +50 iters from `1wpkngg9 iter-49.pt` at lr=5e-4 const, target iter 99. Track A throughout. (Not actively tracked at partition time.)
+`tsp50_lv0_K50_resume50_to99_trackA_20260513T064031` (wandb `0d48yqys`) — +50 iters from `1wpkngg9 iter-49.pt` at lr=5e-4 const, target iter 99. Track A throughout. Finished iter 99 at **val 6.0294 last-accept / 6.0259 raw best** — but the lr=5e-4 trajectory had plateaued (iter 23 already at 6.171; iter 30 at 6.186), so the natural follow-up was an lr-drop, see §E.2.b.
+
+### E.2.b lr=1e-4 unlock chain to iter 199 (Track A) — **COMPLETE 2026-05-13**
+
+`tsp50_lv0_K50_resume100_lr1e4_to199_trackA_20260513T115549_20260513T115558` (wandb `jzafz93s`, Modal `ap-oY6QnRUcjF0cutpMsYZPr0`). +100 iters from E.2 `iter-99.pt`, **lr dropped 5e-4 → 1e-4** via `--lr_model 1e-4` (lr-override-on-resume infra from §B.2), all other knobs unchanged. Wall: 04:55 → 12:45 PDT = **7h 50m for 100 iters ≈ 270 s/iter** (mcts_s ~263-280s, train_s ~7s — Track A holding the −75% wall savings at TSP-50 K=50 M=1000).
+
+Tail telemetry (last 4 iters):
+
+| iter | val_avg_cost | policy_loss | value_loss | entropy | accepted |
+|---:|---:|---:|---:|---:|:---:|
+| 196 | 5.9445 | 0.4529 | 13.06 | 0.293 | 0 |
+| 197 | 5.9448 | 0.4496 | 11.94 | 0.287 | 0 |
+| **198** | **5.9316** (best in tail) | 0.4452 | 12.88 | 0.283 | 0 |
+| 199 | 5.9443 | 0.4466 | 12.78 | 0.287 | 0 |
+
+**Accepts in lr=1e-4 chain: iters 155, 179, 191, 194** (baseline val 5.93231 still active at iter 199); iters 195-199 all gated but rejected — the lr=1e-4 well is emptying, mirroring the F.6.1.4 → F.6.1.4.b → F.6.1.4.c pattern at TSP-20 (§B.2).
+
+**Headline: lr=1e-4 buys ~−0.094 over 100 iters at TSP-50** (6.0259 raw best at iter 99 → 5.9316 at iter 198). The TSP-20 lr-drop mechanism (§B.2) transfers cleanly. Status vs targets:
+
+| reference | val | Δ vs E.2.b best (5.9316) |
+|---|---:|---:|
+| Gurobi optimum (TSP-50) | 5.6987 | +0.233 |
+| Stage 1 greedy (TSP-50) | 5.7999 | +0.132 |
+| Stage 4 prior best vh+λᵥ=1 (`muckiyvi`) | 6.060 | **−0.128** |
+| lv0 chain pre-lr-drop (iter 99) | 6.026 | **−0.094** |
+
+TSP-50 parity (≤ 5.7999) still **not yet reached** (`_plans/stage5_plan.md` success criterion 3 remains open). Natural next steps: (a) further lr-drop to 2e-5 mirroring F.6.1.4.c, or (b) launch the §E.4 step-decay 400-iter from-scratch entrypoint to test whether the schedule helps from t=0 vs only at plateau-unlock.
+
+Local checkpoints pulled 2026-05-13: `iter-194.pt`, `iter-194_accepted.pt` (baseline), `iter-198.pt` (raw-best in tail), `iter-199.pt` under `outputs/tsp_50/tsp50_lv0_K50_resume100_lr1e4_to199_trackA_20260513T115549_20260513T115558/`.
 
 ### E.3 K-comparison ablation (K=50 vs K=100) — see commits `d60e4d3`, `8e1f47b`
 
@@ -515,6 +576,61 @@ Far beat the plan's 580-620s estimate. Track A saves both NN time AND total cach
 | **Track A (`1wpkngg9`)** | **310-320s = 5.2-5.3 min/iter** | **−75%** |
 
 Wall went from 20.9 min/iter → 5.3 min/iter (**−75%**) across six surgical optimizations with **zero behavior change** (max_abs_cost_diff = 0.0 at every step). A 50-iter Stage 5 TSP-50 lv0 run now fits in ~4h, down from ~17h.
+
+### F.6 Post-Track A decomposition probe + T2.1 torch.compile (negative result) — **COMPLETE 2026-05-13**
+
+After Track A landed, the open question was whether further wall optimization was worth pursuing (motivated by §E.4: TSP-50 lv0 step-decay 400-iter ≈ ~35h on A10 at 5.3 min/iter). Built a decomposition probe ([src/scripts/probe_mcts_decomp.py](../src/scripts/probe_mcts_decomp.py)) with Modal entrypoint ([modal_run_train_alphazero.py::run_probe_mcts_decomp](../src/scripts/modal_run_train_alphazero.py)) and re-measured at production scale.
+
+**Production decomposition** (TSP-50 K=50 M=1000, `iter-68_accepted.pt` from `0d48yqys`, leaf_eval=rollout, A10G):
+
+| phase | wall (s) | share |
+|---|---:|---:|
+| Decoder NN forward (cuda-synced) | 74.69 | **19.5%** |
+| C++ `collect_requests` (PUCT walk) | 39.67 | **10.3%** |
+| C++ `apply_results` (backup) | 8.87 | 2.3% |
+| Python remainder (cache loop + tensor bridge + numpy state) | 260.67 | **67.9%** |
+| **TOTAL** | **383.92** | 100% |
+
+Probe stats: `batch_eval_calls = 98,731` (avg 57 miss-rows/call), cache hit rate 81.9% (vs random-init 88%). Wall matches `0d48yqys`'s live `mcts_w` ≈ 350 s/iter — same recipe, same checkpoint family.
+
+**Function-level top contributors** (cProfile tottime):
+
+| function | tottime (s) | share |
+|---|---:|---:|
+| `eval_many_arrays` body (per-row cache loop) | 103.2 | 27% |
+| C++ `collect_requests` | 39.7 | 10% |
+| `dict.get` cache lookups | 26.2 | 7% |
+| `rollout_many` body (Python state machine) | 17.4 | 5% |
+| `_one_to_many_logits` + `matmul` + `linear` (NN) | ~36 | 9% |
+| `torch.tensor` (CPU→GPU build) | 9.9 | 3% |
+| `AttentionModelFixed.__getitem__` + `index_select` | 13.3 | 3% |
+
+**Key correction to the F.3-era random-init probe assumption.** At trained-ckpt + production scale:
+1. NN forward is only ~20% of wall (not ~50% as a naive scaling of F.3 would suggest). The decoder amortizes well with 57-row average miss batches per call.
+2. The per-row Python cache loop in `eval_many_arrays` is the single biggest cost at 27%.
+3. C++ `collect_requests` jumped from ~2% (random init) to ~10% (trained ckpt) — sharper priors → deeper PUCT walks → ~5× more work per simulation.
+4. Per-NN-call host overhead is the structural bottleneck: 98,731 calls × ~2.6ms host overhead ≈ 260s = essentially the entire Python remainder.
+
+**T2.1 — `torch.compile` decoder probe.** Wrapped `model.decoder.decode_step = torch.compile(..., mode='default', dynamic=True)` behind a `--compile_decoder` flag in the probe. Required adding `setuptools` to `pyproject.toml` deps for Triton 3.2.0 to import on Modal's uv venv (Triton 3.2.0 imports `pkg_resources` at runtime; uv venv defaults to isolated, so the system-pip setuptools isn't visible).
+
+A/B at TSP-50 K=50 M=1000 with `iter-68_accepted.pt` (paired-seed):
+
+| metric | baseline | `--compile_decoder` | Δ |
+|---|---:|---:|---:|
+| Total wall | 383.92 s | **364.23 s** | **−19.69 s = −5.1%** |
+| mean cost | 5.7605 | 5.7605 | **0.0000 ✓ deterministic** |
+| decode_step wall (instrumented) | 74.69 s | 169.24 s | +94.6 s |
+| Python remainder | 260.67 s | 155.38 s | −105.3 s |
+| decode_step call count | 98,781 | 124,119 | +25k (dynamo splits the graph) |
+| Warmup (M=8 first call) | — | 74.3 s | one-shot compile cost |
+
+The decode_step phase went UP because `torch.compile` interposes Dynamo's `eval_frame` machinery around every call; cProfile shows ~25-30s of new Python time in `_dynamo.eval_frame._fn`, `_inductor.runtime.triton_heuristics.run`, `_dynamo.utils.call_size`, etc. The compiled Triton kernels DO fuse some matmul-side work (`torch.bmm` 8.2s + `torch.mm` 4.7s replacing `torch.matmul` 14.0s + `linear` 7.3s, ~8s net), but per-call dispatch overhead is large relative to a ~1ms graph. Net 5.1% wall, right at the ship/park threshold.
+
+**Decision: park T2.1 default-off behind `--compile_decoder` flag.** Probe code stays in repo. Marginal gain doesn't justify the dynamo maintenance surface. The cprofile data points squarely at the per-row Python cache loop in `eval_many_arrays` + the rollout state machine in `rollout_many` (Python orchestration combined ~150s = 40% of wall) as the highest-leverage open target.
+
+### F.7 Identified follow-up: T2.2 — rollout state machine + cache loop in C++ — **OPEN**
+
+The next structural mirror of Track A: move the `while active.any()` loop in `rollout_many` and the per-row cache loop in `eval_many_arrays` from Python into C++, keeping the NN forward in PyTorch via a Python callback (same architectural pattern as the existing C++ MCTS tree walk). Estimated payoff from the F.6 cprofile: ~40% wall (`eval_many_arrays` body 103s + `rollout_many` body 17s + dict.get 26s + key construction ≈ 150-160s out of 384s). Engineering cost: ~2-3 days. Brings TSP-50 K=50 M=1000 from 5.3 min/iter → ~3.0-3.2 min/iter, making §E.4 step-decay 400-iter feasible in ~22h instead of ~35h on A10. Not yet scoped or scheduled — gated on whether §E.4 is on the docket.
 
 ---
 
