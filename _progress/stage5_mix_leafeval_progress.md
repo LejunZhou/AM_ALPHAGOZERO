@@ -16,7 +16,7 @@ sub-section header carries `**OPEN** / **IN FLIGHT** / **COMPLETE <date>**`.
 |---|---|---|---|
 | H.1 Implementation (Python + C++ + plumbing) | **COMPLETE 2026-05-21** | 2026-05-21 | mix mode wired across mcts.py, mcts.cpp, BatchSearch, Coach, train_alphazero CLI, val_stage4_mcts, probe_mcts_decomp, Modal entrypoint |
 | H.2 Smoke tests (λ=0 parity, λ=1 parity, C++↔Py at λ=0.5) | **COMPLETE 2026-05-21** | 2026-05-21 | `smoke_mix.py` M1/M2/M3 all pass with \|Δ\|=0.000e+00 |
-| H.3 Phase A — Colab T4 inference λ-sweep on F.6.1.6 | OPEN | — | — |
+| H.3 Phase A — Colab T4 inference λ-sweep on F.6.1.6 | **READY** (notebook in place) | 2026-05-21 | awaiting Colab T4 run |
 | H.4 Phase B — Modal A10 training at λ\* (K=10 step50 100-iter) | OPEN | — | — |
 | H.5 Phase C — 1000-instance canonical eval | OPEN | — | — |
 | H.6 Verdict + open follow-ups | OPEN | — | — |
@@ -126,7 +126,7 @@ PYTHONPATH=src python -m scripts.smoke_mix
 
 ---
 
-## §H.3 Phase A — Colab T4 inference probe — **OPEN**
+## §H.3 Phase A — Colab T4 inference probe — **READY (awaiting Colab T4 run)**
 
 Target checkpoint: F.6.1.6 winner —
 `outputs/tsp_20/f616_400iter_step_decay_20260507T101222_20260507T101229/iter-361_accepted.pt`.
@@ -137,6 +137,29 @@ Grid: λ ∈ {0.00, 0.25, 0.50, 0.75, 1.00}, K=40, ε=0, τ=0,
 Reference anchors (must match within per-instance SE):
 - λ=0 ≈ 3.834 (§C.3 K=40 rollout)
 - λ=1 ≈ 3.868 (§C.3 K=40 vh)
+
+**Setup status (2026-05-21):**
+
+- Local CPU pre-flight on F.6.1.6 (val_size=50, λ∈{0,1}) passed cleanly:
+  λ=0 → mean=3.82104 (SE=0.04149), wall=2.9s;
+  λ=1 → mean=3.82318 (SE=0.04164), wall=3.3s. Indistinguishable at N=50
+  but the driver, ckpt loader, and both endpoints run end-to-end.
+- Colab notebook
+  [`notebooks/colab_phaseA_mix_sweep.ipynb`](../notebooks/colab_phaseA_mix_sweep.ipynb)
+  in place. Section 1 mounts Drive + clones + installs + runs `smoke_mix.py`
+  to confirm mix mode is wired; Section 2 expects F.6.1.6 at
+  `MyDrive/AM_AlphaGoZero/checkpoints/f616_400iter_step_decay/iter-361_accepted.pt`,
+  runs the sweep, then prints a results table with endpoint-anchor checks.
+
+**Action items to complete §H.3:**
+
+1. Upload `outputs/tsp_20/f616_400iter_step_decay_20260507T101222_20260507T101229/iter-361_accepted.pt`
+   to Drive at the path above.
+2. Open the notebook in Colab T4 and run all cells.
+3. Download CSV + NPZ from
+   `MyDrive/AM_AlphaGoZero/outputs/eval_logs/tsp20_f616_mix_lambda_sweep_K40.csv`
+   back into `_progress/eval_logs/` and paste the table into the §H.3
+   results block below.
 
 ### Results table (to fill in)
 
