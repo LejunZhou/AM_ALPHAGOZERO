@@ -67,8 +67,13 @@ class MCTSConfig:
     # Default `rollout` per Stage 2 leaf-eval ablation (uniformly +12-22pp
     # gap reduction over `value_head` at every matched K on TSP-20/TSP-50);
     # `value_head` remains available for diagnostics and is required by
-    # Stage 4 training-loop semantics.
-    leaf_eval: str = 'rollout'                # 'value_head' | 'rollout'
+    # Stage 4 training-loop semantics. `mix` is the Stage 5 §H AlphaGo-Fan/Lee
+    # convex blend `v_leaf = λ·v_value_head + (1−λ)·v_rollout` (λ = mix_lambda);
+    # both branches return positive normalized cost-to-go in identical units,
+    # so the blend is unitless-clean and the existing backup sign convention
+    # (Q = -total_norm) applies unchanged.
+    leaf_eval: str = 'rollout'                # 'value_head' | 'rollout' | 'mix'
+    mix_lambda: float = 0.5                   # weight on v_value_head when leaf_eval='mix'
     value_norm: str = 'bl'                    # 'bl' (per-instance greedy) | 'sqrt_n'
 
     # Describes how the value head was TRAINED. Used at value_head leaf-eval
@@ -122,7 +127,7 @@ class MCTSSolver:
       - Leaf eval: value head by default; greedy rollout as optional fallback.
     """
 
-    VALID_LEAF_EVAL = {'value_head', 'rollout'}
+    VALID_LEAF_EVAL = {'value_head', 'rollout', 'mix'}
     VALID_VALUE_NORM = {'bl', 'sqrt_n'}
     VALID_VALUE_TARGET_NORM = {'bl', 'sqrt_n', 'none'}
     VALID_FPU_MODE = {'fallback', 'running_q', 'node_value'}
@@ -209,21 +214,29 @@ class MCTSSolver:
                     raise ValueError(
                         f"cfg.n_simulations_per_step[{t}]={k} must be >= 1"
                     )
-        if cfg.leaf_eval == 'value_head' and model.value_head is None:
+        if cfg.leaf_eval in ('value_head', 'mix') and model.value_head is None:
             raise ValueError(
-                "cfg.leaf_eval='value_head' but model has no value_head. "
+                f"cfg.leaf_eval={cfg.leaf_eval!r} but model has no value_head. "
                 "Either pass a checkpoint trained with value_enabled=True, "
                 "or use cfg.leaf_eval='rollout'."
             )
+        if cfg.leaf_eval == 'mix':
+            lam = getattr(cfg, 'mix_lambda', 0.5)
+            if not (0.0 <= float(lam) <= 1.0):
+                raise ValueError(
+                    f"cfg.mix_lambda={lam!r} must lie in [0, 1] when "
+                    "leaf_eval='mix'."
+                )
         # Scale-compatibility check: the value head was trained against
         # `bl_val_training`-normalized targets (≈ realized cost / greedy cost
         # ≈ 1.0). Combining its raw output with `bl_val = sqrt(N)` path
         # normalization mixes incompatible scales inside `total_norm` in
         # `_simulate`. Rollout returns `remaining_real / bl_val` and stays
-        # internally consistent under any value_norm.
-        if cfg.value_norm == 'sqrt_n' and cfg.leaf_eval == 'value_head':
+        # internally consistent under any value_norm. `mix` includes the
+        # value-head branch and inherits the same incompatibility.
+        if cfg.value_norm == 'sqrt_n' and cfg.leaf_eval in ('value_head', 'mix'):
             raise ValueError(
-                "value_norm='sqrt_n' is incompatible with leaf_eval='value_head': "
+                f"value_norm='sqrt_n' is incompatible with leaf_eval={cfg.leaf_eval!r}: "
                 "the value head was trained in bl-normalized units, so its raw output "
                 "would be combined with sqrt(N)-scaled path costs, mixing units in PUCT. "
                 "Use leaf_eval='rollout' with value_norm='sqrt_n'."
@@ -457,6 +470,14 @@ class MCTSSolver:
         elif self.cfg.leaf_eval == 'rollout':
             remaining_real = self._rollout_remaining_real(node.state, fixed)
             node.v_estimate = remaining_real / bl_val
+        elif self.cfg.leaf_eval == 'mix':
+            v_raw = float(self.model.value_head(glimpse).view(-1)[0].item())
+            v_head = self._convert_value_head_output(v_raw, node, bl_val)
+            self.fwd_count_value += 1
+            remaining_real = self._rollout_remaining_real(node.state, fixed)
+            v_rollout = remaining_real / bl_val
+            lam = float(self.cfg.mix_lambda)
+            node.v_estimate = lam * v_head + (1.0 - lam) * v_rollout
         else:
             raise ValueError(f"Unknown leaf_eval: {self.cfg.leaf_eval}")
 
@@ -481,6 +502,14 @@ class MCTSSolver:
         if self.cfg.leaf_eval == 'rollout':
             remaining_real = self._rollout_remaining_real(node.state, fixed)
             return remaining_real / bl_val
+        if self.cfg.leaf_eval == 'mix':
+            v_raw = float(self.model.value_head(glimpse).view(-1)[0].item())
+            v_head = self._convert_value_head_output(v_raw, node, bl_val)
+            self.fwd_count_value += 1
+            remaining_real = self._rollout_remaining_real(node.state, fixed)
+            v_rollout = remaining_real / bl_val
+            lam = float(self.cfg.mix_lambda)
+            return lam * v_head + (1.0 - lam) * v_rollout
         raise ValueError(f"Unknown leaf_eval: {self.cfg.leaf_eval}")
 
     def _fill_priors_from_logp(self, node: MCTSNode, log_p, mask) -> None:

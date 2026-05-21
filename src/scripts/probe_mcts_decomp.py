@@ -52,7 +52,9 @@ def main():
     p.add_argument("--M", type=int, default=200, help="batch instances")
     p.add_argument("--mcts_batch_size", type=int, default=200,
                    help="cross-instance chunk size; equals M for one chunk")
-    p.add_argument("--leaf_eval", choices=["rollout", "value_head"], default="rollout")
+    p.add_argument("--leaf_eval", choices=["rollout", "value_head", "mix"], default="rollout")
+    p.add_argument("--mix_lambda", type=float, default=0.5,
+                   help="Convex blend coefficient when --leaf_eval=mix.")
     p.add_argument("--dirichlet_epsilon", type=float, default=0.25)
     p.add_argument("--c_puct", type=float, default=0.05)
     p.add_argument("--temperature_schedule", default="step10")
@@ -129,6 +131,7 @@ def main():
         dirichlet_alpha=0.3,
         dirichlet_epsilon=args.dirichlet_epsilon,
         leaf_eval=args.leaf_eval,
+        mix_lambda=args.mix_lambda,
         value_norm="bl",
         seed=args.seed,
     )

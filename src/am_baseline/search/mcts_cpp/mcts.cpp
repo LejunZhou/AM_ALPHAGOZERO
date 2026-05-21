@@ -97,6 +97,11 @@ Config Config::from_python(py::dict cfg) {
   out.dirichlet_alpha = get_or<double>(cfg, "dirichlet_alpha", out.dirichlet_alpha);
   out.dirichlet_epsilon = get_or<double>(cfg, "dirichlet_epsilon", out.dirichlet_epsilon);
   out.leaf_eval = get_or<std::string>(cfg, "leaf_eval", out.leaf_eval);
+  out.mix_lambda = get_or<double>(cfg, "mix_lambda", out.mix_lambda);
+  if (out.leaf_eval == "mix" && (out.mix_lambda < 0.0 || out.mix_lambda > 1.0)) {
+    throw std::runtime_error(
+        "mix_lambda must lie in [0, 1] when leaf_eval == 'mix'");
+  }
   out.value_norm = get_or<std::string>(cfg, "value_norm", out.value_norm);
   out.value_target_norm = get_or<std::string>(cfg, "value_target_norm", out.value_target_norm);
   out.fpu_mode = get_or<std::string>(cfg, "fpu_mode", out.fpu_mode);
@@ -479,7 +484,7 @@ void Solver::populate_priors(Node& node, double bl_val) {
   if (node.is_terminal()) {
     throw std::runtime_error("populate_priors called on a terminal node");
   }
-  const bool need_value = cfg_.leaf_eval == "value_head";
+  const bool need_value = cfg_.leaf_eval == "value_head" || cfg_.leaf_eval == "mix";
   EvalResult eval = evaluate(node.state, need_value);
   fill_priors(node, eval);
 
@@ -488,6 +493,11 @@ void Solver::populate_priors(Node& node, double bl_val) {
         eval.value, static_cast<int>(node.state.n), bl_val);
   } else if (cfg_.leaf_eval == "rollout") {
     node.v_estimate = rollout_remaining_real(node.state) / bl_val;
+  } else if (cfg_.leaf_eval == "mix") {
+    const double v_head = convert_value_head_output(
+        eval.value, static_cast<int>(node.state.n), bl_val);
+    const double v_rollout = rollout_remaining_real(node.state) / bl_val;
+    node.v_estimate = cfg_.mix_lambda * v_head + (1.0 - cfg_.mix_lambda) * v_rollout;
   } else {
     throw std::runtime_error("unknown leaf_eval: " + cfg_.leaf_eval);
   }
@@ -497,7 +507,7 @@ double Solver::expand(Node& node, double bl_val) {
   if (node.is_terminal()) {
     throw std::runtime_error("expand called on a terminal node");
   }
-  const bool need_value = cfg_.leaf_eval == "value_head";
+  const bool need_value = cfg_.leaf_eval == "value_head" || cfg_.leaf_eval == "mix";
   EvalResult eval = evaluate(node.state, need_value);
   fill_priors(node, eval);
 
@@ -507,6 +517,12 @@ double Solver::expand(Node& node, double bl_val) {
   }
   if (cfg_.leaf_eval == "rollout") {
     return rollout_remaining_real(node.state) / bl_val;
+  }
+  if (cfg_.leaf_eval == "mix") {
+    const double v_head = convert_value_head_output(
+        eval.value, static_cast<int>(node.state.n), bl_val);
+    const double v_rollout = rollout_remaining_real(node.state) / bl_val;
+    return cfg_.mix_lambda * v_head + (1.0 - cfg_.mix_lambda) * v_rollout;
   }
   throw std::runtime_error("unknown leaf_eval: " + cfg_.leaf_eval);
 }
@@ -705,10 +721,10 @@ void Solver::evaluate_pending(std::vector<PendingSimulation>& pending, double bl
   }
 
   if (!eval_states.empty()) {
-    const bool need_value = cfg_.leaf_eval == "value_head";
+    const bool need_value = cfg_.leaf_eval == "value_head" || cfg_.leaf_eval == "mix";
     std::vector<EvalResult> evals = evaluate_many(eval_states, need_value);
     std::vector<double> rollout_values;
-    if (cfg_.leaf_eval == "rollout") {
+    if (cfg_.leaf_eval == "rollout" || cfg_.leaf_eval == "mix") {
       rollout_values = rollout_many_remaining_real(eval_states);
       if (rollout_values.size() != eval_states.size()) {
         throw std::runtime_error("batched rollout returned a mismatched number of values");
@@ -726,6 +742,11 @@ void Solver::evaluate_pending(std::vector<PendingSimulation>& pending, double bl
             evals[row].value, static_cast<int>(leaf.state.n), bl_val);
       } else if (cfg_.leaf_eval == "rollout") {
         v_remaining_norm = rollout_values[row] / bl_val;
+      } else if (cfg_.leaf_eval == "mix") {
+        const double v_head = convert_value_head_output(
+            evals[row].value, static_cast<int>(leaf.state.n), bl_val);
+        const double v_rollout = rollout_values[row] / bl_val;
+        v_remaining_norm = cfg_.mix_lambda * v_head + (1.0 - cfg_.mix_lambda) * v_rollout;
       } else {
         throw std::runtime_error("unknown leaf_eval: " + cfg_.leaf_eval);
       }
@@ -1275,7 +1296,9 @@ struct BatchInstance {
         pending_leaf = root.get();
         pending_path.clear();
         return batch_make_request(
-            slot, pending_leaf->state, cfg.leaf_eval == "value_head", cfg.leaf_eval == "rollout");
+            slot, pending_leaf->state,
+            cfg.leaf_eval == "value_head" || cfg.leaf_eval == "mix",
+            cfg.leaf_eval == "rollout" || cfg.leaf_eval == "mix");
       }
 
       if (!dirichlet_applied) {
@@ -1318,7 +1341,9 @@ struct BatchInstance {
         pending_leaf = node;
         pending_path = std::move(path);
         return batch_make_request(
-            slot, pending_leaf->state, cfg.leaf_eval == "value_head", cfg.leaf_eval == "rollout");
+            slot, pending_leaf->state,
+            cfg.leaf_eval == "value_head" || cfg.leaf_eval == "mix",
+            cfg.leaf_eval == "rollout" || cfg.leaf_eval == "mix");
       }
 
       const int action = batch_pick_root_action(*root, cfg, tau_per_step, rng);
@@ -1368,29 +1393,47 @@ struct BatchInstance {
           static_cast<long long>(pending_leaf->state.n - pending_leaf->state.step);
       counters.decode += rollout_steps;
       counters.rollout += rollout_steps;
+    } else if (cfg.leaf_eval == "mix") {
+      // Mix path runs BOTH branches at each leaf: count the value-head call
+      // AND the rollout's decode/rollout steps.
+      counters.value += 1;
+      const long long rollout_steps =
+          static_cast<long long>(pending_leaf->state.n - pending_leaf->state.step);
+      counters.decode += rollout_steps;
+      counters.rollout += rollout_steps;
     } else {
       throw std::runtime_error("unknown leaf_eval: " + cfg.leaf_eval);
     }
 
     batch_fill_priors(*pending_leaf, eval);
 
-    double v_remaining_norm = 0.0;
-    if (cfg.leaf_eval == "value_head") {
-      // Convert head output by training-time normalization. Mirrors
-      // Solver::convert_value_head_output / Python _convert_value_head_output.
+    // Helper: convert raw value-head output to v_remaining_norm per the
+    // training-time normalizer. Mirrors Solver::convert_value_head_output.
+    auto convert_v_head = [&](double v_raw) -> double {
       const double safe_bl = bl_val > 1e-6 ? bl_val : 1e-6;
       if (cfg.value_target_norm == "bl") {
-        v_remaining_norm = eval.value;
-      } else if (cfg.value_target_norm == "none") {
-        v_remaining_norm = eval.value / safe_bl;
-      } else if (cfg.value_target_norm == "sqrt_n") {
-        v_remaining_norm = eval.value
-            * std::sqrt(static_cast<double>(pending_leaf->state.n)) / safe_bl;
-      } else {
-        throw std::runtime_error("unknown value_target_norm: " + cfg.value_target_norm);
+        return v_raw;
       }
-    } else {
+      if (cfg.value_target_norm == "none") {
+        return v_raw / safe_bl;
+      }
+      if (cfg.value_target_norm == "sqrt_n") {
+        return v_raw * std::sqrt(static_cast<double>(pending_leaf->state.n)) / safe_bl;
+      }
+      throw std::runtime_error("unknown value_target_norm: " + cfg.value_target_norm);
+    };
+
+    double v_remaining_norm = 0.0;
+    if (cfg.leaf_eval == "value_head") {
+      v_remaining_norm = convert_v_head(eval.value);
+    } else if (cfg.leaf_eval == "rollout") {
       v_remaining_norm = rollout_remaining / bl_val;
+    } else if (cfg.leaf_eval == "mix") {
+      const double v_head = convert_v_head(eval.value);
+      const double v_rollout = rollout_remaining / bl_val;
+      v_remaining_norm = cfg.mix_lambda * v_head + (1.0 - cfg.mix_lambda) * v_rollout;
+    } else {
+      throw std::runtime_error("unknown leaf_eval: " + cfg.leaf_eval);
     }
     pending_leaf->v_estimate = v_remaining_norm;
 

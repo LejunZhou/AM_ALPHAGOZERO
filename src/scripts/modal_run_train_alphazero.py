@@ -2393,6 +2393,66 @@ def run_tsp20_k10_lv0_step50(timestamp: str = "") -> None:
 
 
 @app.local_entrypoint()
+def run_tsp20_k10_mix_step50(
+    mix_lambda: str = "0.5",
+    timestamp: str = "",
+) -> None:
+    """Stage 5 §H — TSP-20 K=10 mix(λ) 100-iter with lr step at iter 50.
+
+    Recipe: B.4 K=10 lv0 step50 verbatim except:
+      - leaf_eval: rollout -> mix
+      - lambda_v:  0.0 -> 1.0   (value head trained again; lv0 -> lv1)
+      - --mix_lambda: caller-supplied λ ∈ [0,1] (default 0.5)
+
+    All other knobs locked to the B.4 winner: K=10, step10, ε=0.25,
+    value_target_norm=none, wd=0, buffer=5000, batch=512, train_steps=200,
+    M=1000, val_seed=42, gate=ttest gate_every=1, mcts_batch_size=1000.
+    lr: 5e-4 for iter 0..49, 1e-4 for iter 50..99 (one step at iter 50).
+
+    Phase B of [`_plans/stage5_mix_leafeval_plan.md`](../_plans/stage5_mix_leafeval_plan.md).
+    Apples-to-apples baseline: B.4 reached 3.8576 at iter 100 / 33 min on A10.
+
+    Wall estimate: same K=10 lv0 footprint plus one value-head MLP call per
+    leaf (~free since glimpse is already computed for priors). Predict
+    ~1.5-2 h on A10. Cost: ~$5-10 Modal credits per λ.
+
+    Usage:
+      modal run src/scripts/modal_run_train_alphazero.py::run_tsp20_k10_mix_step50 \\
+          --mix-lambda 0.5
+    """
+    from datetime import datetime, timezone
+    if not timestamp:
+        timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")
+
+    lam_tag = mix_lambda.replace(".", "p")
+    run_name = f"tsp20_k10_mix{lam_tag}_step50_100iter_{timestamp}"
+    args = _f61_args(
+        run_name=run_name,
+        k=10,
+        buffer_capacity=5000,
+        lr_model="5e-4",
+        lr_decay="0.2",                  # 5e-4 -> 1e-4 at the step
+        lr_decay_step_size=50,           # step at iter 50
+        temperature_schedule="step10",
+        dirichlet_epsilon="0.25",
+        leaf_eval="mix",
+        lambda_v="1.0",                  # value head trained (lv1), unlike B.4's lv0
+    )
+    args.extend(["--mix_lambda", mix_lambda, "--mcts_batch_size", "1000"])
+
+    print(f"[modal] launching TSP-20 K=10 mix(λ={mix_lambda}) 100-iter with lr step at iter 50")
+    print(f"  {run_name}")
+    print(f"  graph_size=20  K=10  mix_lambda={mix_lambda}  mcts_batch_size=1000")
+    print(f"  lr schedule: 5e-4 for iter 0..49, 1e-4 for iter 50..99")
+    print(f"  baseline: B.4 lv0 step50 reached 3.8576 at iter 100 / 33 min")
+    h = train_alphazero_remote.spawn(*args)
+    print(f"\n[modal] awaiting {run_name} (function_call_id={h.object_id}) ...", flush=True)
+    h.get()
+    print(f"[modal] {run_name} done.", flush=True)
+    print("[modal] download results with: modal volume get am-alphagozero-volume outputs/")
+
+
+@app.local_entrypoint()
 def run_tsp50_k25_lv0_step50(timestamp: str = "") -> None:
     """TSP-50 K=25 lv0 100-iter with built-in lr step at iter 50.
 

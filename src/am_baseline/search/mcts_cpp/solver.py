@@ -166,7 +166,7 @@ class CppMCTSSolver:
             evaluator,
             self._cfg_dict(),
             float(bl_val),
-            rollout_evaluator if self.cfg.leaf_eval == "rollout" else None,
+            rollout_evaluator if self.cfg.leaf_eval in ("rollout", "mix") else None,
         )
 
         self.fwd_count_decode = int(result["decode_steps"])

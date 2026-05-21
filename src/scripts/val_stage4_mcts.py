@@ -76,9 +76,12 @@ def parse():
     # constant τ) for clean eval. Use --match_train to override from args.json.
     p.add_argument('--K', type=int, default=50,
                    help='MCTS simulations per root.')
-    p.add_argument('--leaf_eval', choices=['value_head', 'rollout'], default='rollout',
+    p.add_argument('--leaf_eval', choices=['value_head', 'rollout', 'mix'], default='rollout',
                    help='MCTS leaf evaluator. Eval default = rollout (more reliable '
-                        'on warm-started policies, see probe_mcts_quality.py).')
+                        'on warm-started policies, see probe_mcts_quality.py). '
+                        "Stage 5 §H adds 'mix' (AlphaGo-Fan/Lee blend λ·v_head + (1−λ)·v_rollout).")
+    p.add_argument('--mix_lambda', type=float, default=0.5,
+                   help='Mix coefficient λ when --leaf_eval=mix. Honored by --match_train via args.json.')
     p.add_argument('--eps', type=float, default=0.0,
                    help='Dirichlet ε root noise. Default 0 (deterministic eval).')
     p.add_argument('--alpha_factor', type=float, default=10.0,
@@ -320,6 +323,7 @@ def _build_mcts_config(opts, graph_size, train_args):
     """Build an MCTSConfig honoring --match_train overrides."""
     K = opts.K
     leaf_eval = opts.leaf_eval
+    mix_lambda = float(getattr(opts, 'mix_lambda', 0.5))
     eps = opts.eps
     alpha_factor = opts.alpha_factor
     tsched = opts.temperature_schedule
@@ -331,6 +335,7 @@ def _build_mcts_config(opts, graph_size, train_args):
             )
         K = int(train_args.get('n_simulations_train', K))
         leaf_eval = str(train_args.get('leaf_eval', leaf_eval))
+        mix_lambda = float(train_args.get('mix_lambda', mix_lambda))
         eps = float(train_args.get('dirichlet_epsilon', eps))
         alpha_factor = float(train_args.get('dirichlet_alpha_factor', alpha_factor))
         tsched = str(train_args.get('temperature_schedule', tsched))
@@ -347,6 +352,7 @@ def _build_mcts_config(opts, graph_size, train_args):
     cfg = MCTSConfig(
         n_simulations=K,
         leaf_eval=leaf_eval,
+        mix_lambda=mix_lambda,
         value_norm='bl',
         c_puct=opts.c_puct,
         temperature=temperature,
@@ -360,7 +366,7 @@ def _build_mcts_config(opts, graph_size, train_args):
         return_root_visits=False,
         seed=opts.seed,
     )
-    return cfg, dict(K=K, leaf_eval=leaf_eval, eps=eps,
+    return cfg, dict(K=K, leaf_eval=leaf_eval, mix_lambda=mix_lambda, eps=eps,
                      alpha_factor=alpha_factor, tsched=tsched)
 
 

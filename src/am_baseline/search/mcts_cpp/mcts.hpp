@@ -35,6 +35,13 @@ struct Config {
   double dirichlet_alpha = 0.3;
   double dirichlet_epsilon = 0.0;
   std::string leaf_eval = "rollout";
+  // Stage 5 §H AlphaGo-Fan/Lee mixed leaf eval. Only consulted when
+  // leaf_eval == "mix"; the leaf value is
+  //   v_leaf = mix_lambda * v_value_head + (1 - mix_lambda) * v_rollout
+  // in the same positive-normalized cost-to-go units returned by either
+  // pure branch, so the backup sign convention (Q = -total_norm) is
+  // unchanged.
+  double mix_lambda = 0.5;
   std::string value_norm = "bl";
   // Mirrors `MCTSConfig.value_target_norm` in the Python backend; describes
   // the value head's training-time normalizer ("bl" = cost_to_go/bl_val_train,

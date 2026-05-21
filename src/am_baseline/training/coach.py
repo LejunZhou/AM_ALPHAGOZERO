@@ -527,6 +527,7 @@ def make_self_play_config(
     graph_size: int,
     n_simulations: int,
     leaf_eval: str = 'value_head',
+    mix_lambda: float = 0.5,
     dirichlet_epsilon: float = 0.25,
     dirichlet_alpha_factor: float = 10.0,
     temperature_schedule: str = 'step30',
@@ -565,6 +566,7 @@ def make_self_play_config(
             if n_simulations_per_step else None
         ),
         leaf_eval=leaf_eval,
+        mix_lambda=mix_lambda,
         value_norm='bl',
         value_target_norm=value_target_norm,
         c_puct=0.05,
@@ -1087,6 +1089,7 @@ class MCTSCoach:
                 int(opts.graph_size),
                 int(getattr(opts, 'n_simulations_train', 50)),
                 leaf_eval=str(getattr(opts, 'leaf_eval', 'value_head')),
+                mix_lambda=float(getattr(opts, 'mix_lambda', 0.5)),
                 dirichlet_epsilon=float(getattr(opts, 'dirichlet_epsilon', 0.25)),
                 dirichlet_alpha_factor=float(getattr(opts, 'dirichlet_alpha_factor', 10.0)),
                 temperature_schedule=str(getattr(opts, 'temperature_schedule', 'step30')),

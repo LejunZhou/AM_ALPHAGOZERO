@@ -126,8 +126,13 @@ def parse_opts(argv=None):
                              '(lr unchanged within a 100-iter window if step_size=100). '
                              'Useful for AGZ-canonical step-anneal schedules.')
     parser.add_argument('--leaf_eval', type=str, default='value_head',
-                        choices=['value_head', 'rollout'],
-                        help='MCTS leaf evaluator: AGZ value head (default) or AlphaGo-Lee-style rollout.')
+                        choices=['value_head', 'rollout', 'mix'],
+                        help='MCTS leaf evaluator: AGZ value head (default), AlphaGo-Lee-style rollout, '
+                             "or AlphaGo-Fan/Lee 'mix' (convex blend λ·v_head + (1−λ)·v_rollout).")
+    parser.add_argument('--mix_lambda', type=float, default=0.5,
+                        help="Mix coefficient λ ∈ [0,1] when --leaf_eval=mix. "
+                             "λ=0 collapses to pure rollout; λ=1 to pure value_head. "
+                             "Stage 5 §H starts the from-scratch sweep around λ=0.5.")
     parser.add_argument('--resume_from', type=str, default=None,
                         help='Optional path to a Stage 4 iter-{i}.pt checkpoint. Resumes coach state.')
 
