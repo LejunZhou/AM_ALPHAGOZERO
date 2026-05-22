@@ -16,7 +16,7 @@ sub-section header carries `**OPEN** / **IN FLIGHT** / **COMPLETE <date>**`.
 |---|---|---|---|
 | H.1 Implementation (Python + C++ + plumbing) | **COMPLETE 2026-05-21** | 2026-05-21 | mix mode wired across mcts.py, mcts.cpp, BatchSearch, Coach, train_alphazero CLI, val_stage4_mcts, probe_mcts_decomp, Modal entrypoint |
 | H.2 Smoke tests (λ=0 parity, λ=1 parity, C++↔Py at λ=0.5) | **COMPLETE 2026-05-21** | 2026-05-21 | `smoke_mix.py` M1/M2/M3 all pass with \|Δ\|=0.000e+00 |
-| H.3 Phase A — Colab T4 inference λ-sweep on F.6.1.6 | **READY** (notebook in place) | 2026-05-21 | awaiting Colab T4 run |
+| H.3 Phase A — Colab T4 inference λ-sweep on F.6.1.6 | **COMPLETE 2026-05-21** | 2026-05-21 | monotone curve, λ=0 wins; total spread 0.004 (much smaller than §C.3 anchor of 0.034); proceed to Phase B per plan |
 | H.4 Phase B — Modal A10 training at λ\* (K=10 step50 100-iter) | OPEN | — | — |
 | H.5 Phase C — 1000-instance canonical eval | OPEN | — | — |
 | H.6 Verdict + open follow-ups | OPEN | — | — |
@@ -126,58 +126,75 @@ PYTHONPATH=src python -m scripts.smoke_mix
 
 ---
 
-## §H.3 Phase A — Colab T4 inference probe — **READY (awaiting Colab T4 run)**
+## §H.3 Phase A — Colab T4 inference probe — **COMPLETE 2026-05-21**
 
 Target checkpoint: F.6.1.6 winner —
 `outputs/tsp_20/f616_400iter_step_decay_20260507T101222_20260507T101229/iter-361_accepted.pt`.
 
 Grid: λ ∈ {0.00, 0.25, 0.50, 0.75, 1.00}, K=40, ε=0, τ=0,
-`val_size=10000, val_seed=42`.
+`val_size=10000, val_seed=42, c_puct=0.05, mcts_batch_size=1000`.
 
-Reference anchors (must match within per-instance SE):
-- λ=0 ≈ 3.834 (§C.3 K=40 rollout)
-- λ=1 ≈ 3.868 (§C.3 K=40 vh)
+### Results — Colab T4 (2026-05-21)
 
-**Setup status (2026-05-21):**
+| λ    | val_avg_cost | SE      | wall (s) | fwd_decode | fwd_value | fwd_rollout |
+|------|--------------|---------|----------|------------|-----------|-------------|
+| 0.00 | 3.82798      | 0.00305 | 211.8    | 11,543,491 | 1,061,940 | 10,481,551  |
+| 0.25 | 3.82814      | 0.00305 | 213.4    | 11,435,512 | 1,062,954 | 10,372,558  |
+| 0.50 | 3.82893      | 0.00306 | 225.6    | 11,570,770 | 1,086,749 | 10,484,021  |
+| 0.75 | 3.82992      | 0.00305 | 234.6    | 11,918,868 | 1,132,041 | 10,786,827  |
+| 1.00 | 3.83222      | 0.00306 | 253.8    | 12,535,756 | 1,207,007 | 11,328,749  |
 
-- Local CPU pre-flight on F.6.1.6 (val_size=50, λ∈{0,1}) passed cleanly:
-  λ=0 → mean=3.82104 (SE=0.04149), wall=2.9s;
-  λ=1 → mean=3.82318 (SE=0.04164), wall=3.3s. Indistinguishable at N=50
-  but the driver, ckpt loader, and both endpoints run end-to-end.
-- Colab notebook
-  [`notebooks/colab_phaseA_mix_sweep.ipynb`](../notebooks/colab_phaseA_mix_sweep.ipynb)
-  in place. Section 1 mounts Drive + clones + installs + runs `smoke_mix.py`
-  to confirm mix mode is wired; Section 2 expects F.6.1.6 at
-  `MyDrive/AM_AlphaGoZero/checkpoints/f616_400iter_step_decay/iter-361_accepted.pt`,
-  runs the sweep, then prints a results table with endpoint-anchor checks.
+Artifacts:
+- CSV: `_progress/eval_logs/tsp20_f616_mix_lambda_sweep_K40.csv`
+- NPZ (per-instance costs, for paired-t): `_progress/eval_logs/tsp20_f616_mix_lambda_sweep_K40.npz`
 
-**Action items to complete §H.3:**
+### Interpretation
 
-1. Upload `outputs/tsp_20/f616_400iter_step_decay_20260507T101222_20260507T101229/iter-361_accepted.pt`
-   to Drive at the path above.
-2. Open the notebook in Colab T4 and run all cells.
-3. Download CSV + NPZ from
-   `MyDrive/AM_AlphaGoZero/outputs/eval_logs/tsp20_f616_mix_lambda_sweep_K40.csv`
-   back into `_progress/eval_logs/` and paste the table into the §H.3
-   results block below.
+**Curve is monotone increasing in λ → λ=0 wins.** Matches the plan's
+"monotone curve" branch of the decision rule: mix offers no inference
+benefit on F.6.1.6's biased value head. Proceed to Phase B *per the plan*
+because mix at training time may yield a less-biased head.
 
-### Results table (to fill in)
+**The bias of F.6.1.6's value head at K=40 is much milder than §C.3
+suggested.** Total inference spread λ=0→λ=1 is only **0.00424** here;
+§C.3's same-checkpoint spread (3.868 − 3.834) was **0.034** — 8× larger.
+Possible reasons:
 
-| λ | val_avg_cost | std | wall (min) | fwd_decode | fwd_value | fwd_rollout |
-|---|---|---|---|---|---|---|
-| 0.00 | — | — | — | — | — | — |
-| 0.25 | — | — | — | — | — | — |
-| 0.50 | — | — | — | — | — | — |
-| 0.75 | — | — | — | — | — | — |
-| 1.00 | — | — | — | — | — | — |
+- **Instance-set effect.** §C.3 used `val_size=2000, val_seed=42`,
+  this used `val_size=10000, val_seed=42`. If the dataset generator's
+  RNG consumption depends on `val_size`, the two subsets are different
+  populations, and the value head may behave very differently on the
+  2000-instance subset.
+- **`mcts_batch_size` effect.** §C.3 used the script default
+  `mcts_batch_size=64`; here we used `1000`. Larger batches may
+  reduce per-leaf eval ordering effects that interact with the
+  value-head's bias surface.
+- **§C.3 was a noisy roll.** 2000-instance SE on F.6.1.6 is ~0.007;
+  the 3.868 reading is ~5σ above this measurement's λ=1 value
+  (3.832), which would be improbable as pure noise but possible
+  given the population differences above.
 
-Decision rule:
-- Monotone curve (λ=0 strictly wins) → mix offers no inference benefit on
-  F.6.1.6's biased head; proceed to Phase B *anyway* because mix at
-  training time may yield a less-biased head.
-- Interior λ\* wins → pick top 1–2 λ into Phase B.
+This **weakens** the Phase B hypothesis: with so little vh-bias to
+"undo," a mix-trained head needs to add even less noise reduction to win.
+Phase B is still worth running — the plan called for it and self-play
+dynamics under mix may differ qualitatively from inference — but expected
+gains are smaller. **Single λ=0.5 run is the right scope (not a sweep).**
 
-W&B / Colab notebook link: (to fill in)
+### Wall / compute cost
+
+- Wall scales ~linearly with λ (211.8 s @ λ=0 → 253.8 s @ λ=1, +20%),
+  consistent with one extra MLP call per leaf at λ>0. At λ=0.5 the
+  overhead is ~7%.
+- Total Phase A wall: ~19.5 min for all 5 λ values on Colab T4.
+  Plan budgeted 60–90 min; came in 3-5× faster than expected.
+  (The K=10 Phase B will be much shorter per leaf.)
+
+### Decision
+
+- **Phase B**: single Modal A10 run at **λ=0.5** (the canonical
+  AGFan/Lee value, what `run_tsp20_k10_mix_step50` defaults to,
+  and what the C++ smoke test validated bit-for-bit). Skip
+  λ∈{0.25, 0.75} — flat inference curve doesn't justify the extra ~$10.
 
 ---
 
