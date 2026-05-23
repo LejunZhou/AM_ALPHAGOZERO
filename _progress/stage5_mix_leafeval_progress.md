@@ -17,7 +17,7 @@ sub-section header carries `**OPEN** / **IN FLIGHT** / **COMPLETE <date>**`.
 | H.1 Implementation (Python + C++ + plumbing) | **COMPLETE 2026-05-21** | 2026-05-21 | mix mode wired across mcts.py, mcts.cpp, BatchSearch, Coach, train_alphazero CLI, val_stage4_mcts, probe_mcts_decomp, Modal entrypoint |
 | H.2 Smoke tests (λ=0 parity, λ=1 parity, C++↔Py at λ=0.5) | **COMPLETE 2026-05-21** | 2026-05-21 | `smoke_mix.py` M1/M2/M3 all pass with \|Δ\|=0.000e+00 |
 | H.3 Phase A — Colab T4 inference λ-sweep on F.6.1.6 | **COMPLETE 2026-05-21** | 2026-05-21 | monotone curve, λ=0 wins; total spread 0.004 (much smaller than §C.3 anchor of 0.034); proceed to Phase B per plan |
-| H.4 Phase B — Modal A10 training at λ\* (K=10 step50 100-iter) | OPEN | — | — |
+| H.4 Phase B — Colab T4 training at λ=0.5 (K=10 step50 100-iter) | **COMPLETE 2026-05-22** | 2026-05-22 | **NEGATIVE: 3.87083 vs §B.4 3.8576 (+0.0132, +4.4σ worse)** |
 | H.5 Phase C — 1000-instance canonical eval | OPEN | — | — |
 | H.6 Verdict + open follow-ups | OPEN | — | — |
 
@@ -198,37 +198,76 @@ gains are smaller. **Single λ=0.5 run is the right scope (not a sweep).**
 
 ---
 
-## §H.4 Phase B — Modal A10 training — **OPEN**
+## §H.4 Phase B — Colab T4 training at λ=0.5 — **COMPLETE 2026-05-22**
 
-Recipe (`run_tsp20_k10_mix_step50` at λ = λ\* from §H.3):
+Per §H.3 decision, ran a single λ=0.5 from-scratch training on Colab T4
+(not Modal A10 as originally planned — Phase A was so fast on T4 that
+the T4 path looked attractive for Phase B too, and verified ~1.5× of A10
+wall, well inside the 12 h Colab Pro session envelope).
+
+Recipe (matches `modal_run_train_alphazero.run_tsp20_k10_mix_step50` at λ=0.5):
 ```
 graph_size=20, n_iterations=100, M_instances=1000,
 n_simulations_train=10, train_steps_per_iter=200,
 buffer_capacity=5000, batch_size=512, gate_every=1, gate_mode=ttest,
 temperature_schedule=step10, val_size=10000, val_seed=42,
-leaf_eval=mix, mix_lambda=<λ*>, lambda_v=1.0,
+leaf_eval=mix, mix_lambda=0.5, lambda_v=1.0,
 max_grad_norm=1.0, value_target_norm=none,
 lr_model=5e-4, lr_decay=0.2, lr_decay_step_size=50,
 weight_decay=0.0, dirichlet_epsilon=0.25, dirichlet_alpha_factor=10.0,
 mcts_batch_size=1000
 ```
 
-Wall budget: ~1.5–2 h per λ on A10. Modal cost: ~$5–10 per run.
+Notebook: [`notebooks/colab_phaseB_mix_train.ipynb`](../notebooks/colab_phaseB_mix_train.ipynb).
+Output dir on Drive: `MyDrive/AM_AlphaGoZero/outputs/tsp_20/tsp20_k10_mix0p5_step50_100iter_20260522T055640_20260522T055644/`.
 
-### Results table (to fill in)
+### Result
 
-| λ\* | run_name | wandb | iter best | val best | gate accept rate | wall |
+| λ | run_name | wandb | iter best | val best | gate accept rate | wall |
 |---|---|---|---|---|---|---|
-| — | — | — | — | — | — | — |
+| 0.5 | tsp20_k10_mix0p5_step50_100iter_20260522T055640 | [h2ojy9qp](https://wandb.ai/lejun/am-alphagozero/runs/h2ojy9qp) | 99 | **3.87083** | 44/100 = 44 % | 50.3 min T4 (34.5 min MCTS + 15.8 min train) |
 
-Per-iter signals to log: `mcts_s`, `fwd_count_{decode,value,rollout}`,
-`val_avg_cost`, `value_loss_mean`, `policy_loss_mean`,
-`mean_entropy_policy`, `mcts_delta_vs_greedy_mean`.
+### Verdict — NEGATIVE (mix loses)
+
+| Recipe | Best val @ iter 100 | Δ vs §B.4 | σ-dist (SE=0.003) |
+|---|---|---|---|
+| §B.4 lv0 K=10 step50 (rollout-only) | **3.8576** | — | — |
+| **Phase B mix(λ=0.5)** | **3.87083** | **+0.01323** | **+4.4σ worse** |
+| §B.3 F.6.1.6 ceiling (lv1 K=40 step-decay) | 3.8578 | +0.013 | — |
+
+The trajectory plateaued at ~3.87 over the last 10 iters (iter 90→99 range:
+3.876 → 3.871), with no signs of breaking through 3.86 even after the
+lr step at iter 50 (5e-4 → 1e-4). Best val = final val at iter 99.
+
+### What the result attributes — and what it doesn't
+
+Phase B differs from §B.4 by **two simultaneous knob changes**:
+1. `lambda_v`: 0.0 → 1.0 (value head goes from untrained-and-unused to
+   trained-with-MSE-on-z each iter).
+2. `leaf_eval`: rollout → mix (MCTS Q-backup uses
+   `λ · v_head + (1−λ) · v_rollout` instead of just `v_rollout`).
+
+So the clean apples-to-apples conclusion is: **"recipe ablation
+{lv0+rollout} → {lv1+mix(0.5)} costs 0.013 on TSP-20 at this budget."**
+We cannot yet attribute the loss to either knob in isolation. Two
+plausible mechanisms:
+- **vh-bias-poisoned visits** (mix path is the culprit): even a half-dose
+  of a biased value head at each leaf shifts the visit distribution
+  enough that the policy training target is degraded. §C.3 documented
+  this bias on F.6.1.6; the question is whether it persists when the
+  head is co-trained.
+- **value-loss interference** (lambda_v path is the culprit): the value
+  head's MSE-on-z loss may pull encoder gradients in a direction that
+  hurts the policy head, especially in a small-K (K=10) regime where
+  the policy loss already has high variance. F.6.1 sibling runs
+  (lv1+value_head) sat at ~3.86 — close to Phase B's 3.87, suggesting
+  lambda_v=1 alone may explain most of the deficit.
 
 ### Sample-efficiency check
-- [ ] Best val at iter 100 vs §B.4 (3.8576).
-- [ ] Per-iter wall vs §B.4 (33 min total ≈ 20 s/iter). Mix adds 1 vh MLP
-      call per leaf; should be ≤ 5 % wall overhead.
+- [x] Best val at iter 100 (3.87083) vs §B.4 (3.8576) — Phase B loses by 4.4σ.
+- [x] Wall: 50.3 min T4 vs 33 min A10 (§B.4) — T4 is ~1.5× slower as expected;
+      mix overhead of ~7% predicted in Phase A holds (mcts wall 34.5 min on T4
+      vs estimated §B.4 ~22 min on T4 if scaled = ~57% of total wall, similar).
 
 ---
 
