@@ -128,6 +128,11 @@ def parse():
                    help='Skip the greedy θ★ baseline evaluation (saves a forward pass).')
     p.add_argument('--batch_size', type=int, default=2048,
                    help='Greedy-eval batch size (MCTS uses --mcts_batch_size).')
+    p.add_argument('--save_costs', type=str, default=None,
+                   help='Optional .npz path: save per-instance cost arrays '
+                        '(greedy_<key>, mcts_<key>, am_*) for cross-arm paired '
+                        'tests across separate invocations on the same val set '
+                        '(Stage 5 §V1 matched-wall comparison).')
     return p.parse_args()
 
 
@@ -529,6 +534,21 @@ def main():
                     continue
                 d = costs - ref
                 print(f'    {tag:40s}  Δ={d.mean():+.5f}  SE={d.std() / np.sqrt(len(d)):.5f}')
+
+    # ---- Per-instance cost export (cross-invocation paired tests) -----------
+    if opts.save_costs:
+        out = {}
+        for label, costs in am_results.items():
+            out[f'am_{label}'] = costs
+        for (key, kind), costs in head_results.items():
+            out[f'{kind}_{key}'] = costs
+        out['cfg_json'] = np.array(json.dumps({
+            **cfg_summary, 'c_puct': opts.c_puct, 'num_test': opts.num_test,
+            'seed': opts.seed, 'ckpt': os.path.abspath(opts.ckpt),
+        }))
+        os.makedirs(os.path.dirname(os.path.abspath(opts.save_costs)), exist_ok=True)
+        np.savez(opts.save_costs, **out)
+        print(f'\n[save_costs] wrote {opts.save_costs}')
 
 
 if __name__ == '__main__':

@@ -50,14 +50,33 @@ Decision rule: **G1∧G2 PASS → V1. G1 pass only → training-data lever (add
 hop-augmented children to the dataset), re-gate. Both fail after the data
 lever → the amortization claim fails on TSP-20; record and stop.**
 
-## 3. §V1 — matched-wall inference validation (TSP-20, val-only, ~1 h T4)
+## 3. §V1 — matched-wall inference validation (TSP-20, val-only, ~15 min T4)
 
-Only on V0 PASS. Same frozen policy, `leaf_eval='value_head'` with the
-distilled head, K chosen for equal wall vs `rollout` K=40 (≈K=400+ given the
-~11× per-leaf multiplier; calibrate from measured wall). Success: vh-only
-matches or beats the rollout K=40 line (3.834-line on val_size 10000 seed 42).
-This stays within the §12 standing decision — a *gate*, not a TSP-20 training
-experiment.
+**V0 PASSED 2026-07-04** (depth-1 rollout parity: regret 0.0554 vs anchor
+0.0563; see progress). V1 cashes the dividend end-to-end via
+`notebooks/colab_V1_matched_wall_vh.ipynb` — four paired arms on
+val_size 10000 seed 42 (`val_stage4_mcts.py --save_costs` for cross-arm
+paired t-tests; ε=0, τ=const, c_puct=0.05, mcts_batch_size=1000):
+
+| arm | ckpt | leaf_eval | K |
+|---|---|---|---|
+| R (wall budget) | distilled | rollout | 40 |
+| V40 | distilled | value_head | 40 |
+| **VM (primary)** | distilled | value_head | K_matched = 40·W_R/W_V40, rounded to 20, clamp [60, 800] |
+| O40 (contrast) | ORIGINAL | value_head | 40 |
+
+Pre-registered criteria:
+- **S1 (mechanism):** V40 < greedy, paired one-sided p < 0.01. The original
+  head fails this at every K (§C.3); the distilled head must pass.
+- **S2 (primary, non-inferiority):** paired Δ(VM − R) ≤ +0.002. Strictly
+  better ⇒ headline; parity ⇒ mechanism validated and the prize moves to
+  N≥50 (multiplier ~26× vs ~11× here).
+
+Known residual risk: V0 trained on depth-1 children only; deeper MCTS trees
+query farther off-distribution (depth-2 regret 0.161 vs rollout's 0.082).
+If S1 passes but S2 fails, the first lever is hop-augmented training data
+(labeler on hopped states), not architecture. This stays within the §12
+standing decision — a *gate*, not a TSP-20 training experiment.
 
 ## 4. §V2 — deploy at TSP-50 (the actual prize)
 

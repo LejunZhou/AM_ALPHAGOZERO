@@ -7,8 +7,8 @@ Mirror of [`_plans/stage5_offpolicy_value_plan.md`](../_plans/stage5_offpolicy_v
 | Phase | Status | Date | Headline |
 |---|---|---|---|
 | V0 scaffold (labeler + trainer + probes + Colab notebook + smokes) | **COMPLETE 2026-07-04** | 2026-07-04 | batched labeler fp32-parity 2.4e-7 with sequential probe; tiny 219-pair distill already moves held-out Spearman(v,g) 0.081→0.489 |
-| V0 Colab T4 run (~200k pairs, gates G1/G2) | **OPEN — ready to run** | — | `notebooks/colab_V0_offpolicy_value_distill.ipynb` |
-| V1 matched-wall vh-only val (TSP-20) | BLOCKED on V0 PASS | — | — |
+| V0 Colab T4 run (~200k pairs, gates G1/G2) | **COMPLETE 2026-07-04 — PASS (both gates)** | 2026-07-04 | **distilled head reaches ROLLOUT PARITY at depth-1 (regret 0.0554 vs anchor 0.0563); Spearman(v,g) 0.081→0.788; depth-2 0.161 ≤ 2× anchor 0.082** |
+| V1 matched-wall vh-only val (TSP-20) | **OPEN — scaffold ready** | 2026-07-04 | `notebooks/colab_V1_matched_wall_vh.ipynb` (4 arms, paired, ~15 min T4) |
 | V2 TSP-50 deployment | BLOCKED on V1 PASS | — | — |
 
 Reference anchors (held-out instance split, 50 nodes, sampled-E[z|s'] gt —
@@ -57,17 +57,57 @@ The starting held-out child RMSE of the warm-started head (≈1.06 raw)
 independently reproduces the §H.7.2 off-policy error magnitude (−1.03 vs
 sampled gt) on a fresh state sample — the diagnosis holds out of sample.
 
-## §V0 Colab T4 run — **OPEN**
+## §V0 Colab T4 run — **COMPLETE 2026-07-04 — PASS (G1 ∧ G2)**
 
-Run `notebooks/colab_V0_offpolicy_value_distill.ipynb` top to bottom
-(~30–40 min). Paste the Section 6 verdict table back. Artifacts persist to
-Drive in the §H.4 run dir: `iter-99_vh_offpolicy.pt`, both datasets, probe
-CSVs, hop-1 gt caches.
+Run: `notebooks/colab_V0_offpolicy_value_distill.ipynb` on T4, ~200k
+rollout-labeled child pairs (train split `inst%5!=0`), 20-epoch distill into
+the 16.6k-param glimpse head. Verdict table (held-out instances, Section 6):
 
-Gates (pre-registered in plan §2): G1 regret ≤ 0.08 ∧ Spearman(v,g) ≥ 0.5;
-G2 (hop-1) regret ≤ 2× rollout anchor ∧ Spearman(v,g) ≥ 0.4.
-PASS → V1 (matched-wall vh-only val). G1-only → hop-augmented training data,
-re-gate. Both fail after data lever → record negative, stop per plan §12.
+| probe | regret | sp(v,g) | sp(act) | top1 |
+|---|---|---|---|---|
+| rollout anchor depth-1 | 0.0563 | — | 0.879 | 0.74 |
+| head ORIG depth-1 | 0.1994 | 0.081 | 0.669 | 0.60 |
+| **head DISTILLED depth-1** | **0.0554** | **0.788** | **0.867** | **0.76** |
+| rollout anchor depth-2 (hop1) | 0.0819 | — | — | — |
+| head ORIG depth-2 | 0.3435 | 0.120 | 0.334 | 0.30 |
+| **head DISTILLED depth-2** | **0.1610** | **0.765** | **0.710** | **0.52** |
+
+- **G1 PASS** (regret ≤ 0.08 ∧ sp_ctg ≥ 0.5): 0.0554 / 0.788.
+- **G2 PASS** (regret ≤ 2×0.0819 ∧ sp_ctg ≥ 0.4): 0.1610 / 0.765.
+
+### Interpretation
+
+1. **The off-policy diagnosis is confirmed BY INTERVENTION.** Same
+   architecture, same 16.6k params, same frozen policy — only the training
+   distribution changed — and held-out sibling ranking went from ≈0 signal
+   to **statistical parity with the greedy rollout itself** (0.0554 vs
+   0.0563 on identical slots). §H.7's "not representation, distribution"
+   verdict is now causal, not correlational.
+2. **Depth-2 generalizes but degrades gracefully.** The rollout anchor
+   itself degrades off-trajectory (0.056 → 0.082 — harder nodes); the
+   distilled head holds 0.161 with sp(v,g) 0.765 (vs ORIG's useless
+   0.344/0.120 at depth-2). Training data was depth-1 children only, so
+   deeper MCTS trees see states farther from the training distribution —
+   the residual risk V1 measures end-to-end.
+3. The amortized-rollout framing holds: the head now IS a ~free
+   approximation of the function `leaf_eval='rollout'` computes.
+
+Artifacts on Drive (§H.4 run dir): `iter-99_vh_offpolicy.pt`, both datasets,
+4 probe CSVs, 2 hop-1 gt caches.
+
+## §V1 matched-wall vh-only val (TSP-20) — **OPEN — scaffold ready 2026-07-04**
+
+`notebooks/colab_V1_matched_wall_vh.ipynb` (~15 min T4). Four paired arms on
+val_size 10000 seed 42 (per-instance costs via the new
+`val_stage4_mcts.py --save_costs`, smoke-verified paired across invocations):
+R (rollout K=40, the wall budget), V40 (vh-distilled K=40), VM (vh-distilled
+at K_matched = 40·W_R/W_V40, computed in-notebook, clamp [60,800]), O40
+(vh-ORIGINAL K=40 contrast).
+
+Pre-registered: **S1** V40 < greedy (paired p<0.01; ORIG head fails this per
+§C.3); **S2 (primary)** Δ(VM − R) ≤ +0.002 non-inferiority at matched wall.
+PASS → V2 (TSP-50, where the multiplier is ~26× and the +0.132 parity gap is
+the target).
 
 ## Cross-references
 
