@@ -5,6 +5,7 @@ from torch.utils.checkpoint import checkpoint
 from am_baseline.model.encoder import GraphAttentionEncoder
 from am_baseline.model.decoder import Decoder
 from am_baseline.model.value_head import ValueHead
+from am_baseline.model.value_trunk import ValueTrunk
 from am_baseline.problem.tsp import TSP
 from am_baseline.utils.tensor_ops import sample_many
 
@@ -43,15 +44,42 @@ class AttentionModel(nn.Module):
             tanh_clipping=config.tanh_clipping,
         )
 
-        # Value head (Stage 1: auxiliary, does not enter the policy gradient)
+        # Value head (Stage 1: auxiliary, does not enter the policy gradient).
+        # value_head_type: 'glimpse_mlp' (default, MLP on the policy glimpse) or
+        # 'separate_trunk' (Stage 5 §H.7 — own attention over unvisited nodes).
         self.value_enabled = getattr(config, 'value_enabled', True)
+        self.value_head_type = getattr(config, 'value_head_type', 'glimpse_mlp')
+        # When True (and separate_trunk), the value path gets its OWN encoder
+        # over coords, so value training never touches the policy encoder and
+        # the policy (hence the E[z|s] reference) is unchanged (Stage 5 §H.7 0b).
+        self.value_own_encoder = getattr(config, 'value_own_encoder', False)
+        self.value_init_embed = None
+        self.value_embedder = None
         if self.value_enabled:
             self.value_head = ValueHead(
                 embedding_dim=config.embedding_dim,
                 hidden_dim=getattr(config, 'value_hidden_dim', config.embedding_dim),
             )
+            if self.value_head_type == 'separate_trunk':
+                self.value_trunk = ValueTrunk(
+                    embedding_dim=config.embedding_dim,
+                    n_heads=config.n_heads,
+                    hidden_dim=getattr(config, 'value_hidden_dim', config.embedding_dim),
+                )
+                if self.value_own_encoder:
+                    self.value_init_embed = nn.Linear(2, config.embedding_dim)
+                    self.value_embedder = GraphAttentionEncoder(
+                        n_heads=config.n_heads,
+                        embed_dim=config.embedding_dim,
+                        n_layers=config.n_encode_layers,
+                        normalization=config.normalization,
+                        feed_forward_hidden=getattr(config, 'feed_forward_hidden', 512),
+                    )
+            else:
+                self.value_trunk = None
         else:
             self.value_head = None
+            self.value_trunk = None
 
         self.problem = TSP
 
@@ -104,6 +132,32 @@ class AttentionModel(nn.Module):
     def decode_step(self, fixed, state, return_glimpse=False):
         """Single decoding step. For MCTS."""
         return self.decoder.decode_step(fixed, state, return_glimpse=return_glimpse)
+
+    def value_from_state(self, fixed, state, detach_encoder=True):
+        """Separate-value-trunk leaf value from a (fixed, state) pair.
+
+        Used when value_head_type='separate_trunk'. Returns a raw cost-to-go
+        estimate (B,). `detach_encoder=True` stops the value loss from
+        perturbing the shared policy encoder (the lv0-compatible decoupling).
+        """
+        assert self.value_trunk is not None, \
+            "value_from_state requires value_head_type='separate_trunk'"
+        if self.value_embedder is not None:
+            # Fully separate value encoder: encode coords independently of the
+            # policy. `fixed` is ignored; the policy path is untouched.
+            h = self.value_embedder(self.value_init_embed(state.loc))[0]
+        else:
+            h = fixed.node_embeddings
+            if detach_encoder:
+                h = h.detach()
+        bsz, n_nodes, _ = h.shape
+        mask = state.get_mask().reshape(bsz, n_nodes)        # (B, N) True = visited
+        current = state.get_current_node().reshape(bsz)      # (B,)
+        first = state.first_a.reshape(bsz)                   # (B,)
+        step_zero = (state.i.reshape(-1) == 0)
+        if step_zero.numel() == 1:
+            step_zero = step_zero.expand(bsz)
+        return self.value_trunk(h, mask, current, first, step_zero)
 
     def sample_many(self, input, batch_rep=1, iter_rep=1):
         return sample_many(

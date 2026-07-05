@@ -56,6 +56,12 @@ def parse_args():
     p.add_argument("--dirichlet_epsilon", type=float, default=None)
     p.add_argument("--dirichlet_alpha_factor", type=float, default=None)
     p.add_argument("--value_target_norm", choices=["bl", "sqrt_n", "none"], default=None)
+    p.add_argument("--value_head_type", choices=["glimpse_mlp", "separate_trunk"], default="glimpse_mlp")
+    p.add_argument("--value_own_encoder", action="store_true",
+                   help="Value trunk uses its own encoder (fully separate value net).")
+    p.add_argument("--holdout_k", type=int, default=0, help="Instance-split modulus (0 = off).")
+    p.add_argument("--inst_split", choices=["all", "train", "eval"], default="all",
+                   help="Restrict probe states to an instance split (train: inst%%k!=0, eval: inst%%k==0).")
     p.add_argument("--out_csv", default=None)
     p.add_argument("--seed", type=int, default=1234)
     p.add_argument("--graph_size", type=int, default=None)
@@ -89,7 +95,8 @@ def _read_buffer_meta(path: str) -> dict:
     }
 
 
-def _build_model_cfg(train_args: Optional[dict], graph_size: int, value_target_norm: str):
+def _build_model_cfg(train_args: Optional[dict], graph_size: int, value_target_norm: str,
+                     value_head_type: str = "glimpse_mlp", value_own_encoder: bool = False):
     class Cfg:
         embedding_dim = 128
         hidden_dim = 128
@@ -101,6 +108,8 @@ def _build_model_cfg(train_args: Optional[dict], graph_size: int, value_target_n
         value_enabled = True
         value_hidden_dim = 128
         value_target_norm = "bl"
+        value_head_type = "glimpse_mlp"
+        value_own_encoder = False
         graph_size = 20
 
     if train_args is not None:
@@ -121,6 +130,8 @@ def _build_model_cfg(train_args: Optional[dict], graph_size: int, value_target_n
                 setattr(Cfg, k, train_args[k])
     # CLI-resolved value_target_norm is authoritative for interpreting the head.
     Cfg.value_target_norm = value_target_norm
+    Cfg.value_head_type = value_head_type
+    Cfg.value_own_encoder = value_own_encoder
     Cfg.graph_size = graph_size
     return Cfg()
 
@@ -132,12 +143,14 @@ def _load_stage4_model(
     graph_size: int,
     value_target_norm: str,
     device: torch.device,
+    value_head_type: str = "glimpse_mlp",
+    value_own_encoder: bool = False,
 ):
     ckpt = torch_load_cpu(ckpt_path)
     key = "best_model" if which == "best" else "model"
     if key not in ckpt:
         raise KeyError(f"checkpoint has no {key!r}; available keys: {list(ckpt.keys())}")
-    cfg = _build_model_cfg(train_args, graph_size, value_target_norm)
+    cfg = _build_model_cfg(train_args, graph_size, value_target_norm, value_head_type, value_own_encoder)
     model = AttentionModel(cfg)
     model.load_state_dict(ckpt[key])
     model.to(device)
@@ -203,11 +216,21 @@ def _sample_slots(
     num_states: int,
     rng: np.random.Generator,
     steps_filter: Optional[List[int]] = None,
+    holdout_k: int = 0,
+    inst_split: str = "all",
 ) -> List[int]:
+    def step_slots(t):
+        slots = np.asarray(buf._step_index[t])
+        if holdout_k and holdout_k > 0 and inst_split != "all" and slots.shape[0] > 0:
+            inst = buf.inst_idx[torch.as_tensor(slots, dtype=torch.long)].cpu().numpy()
+            keep = (inst % holdout_k != 0) if inst_split == "train" else (inst % holdout_k == 0)
+            slots = slots[keep]
+        return slots
+
     steps = [
         int(t)
-        for t, arr in enumerate(buf._step_index)
-        if arr.shape[0] > 0 and (steps_filter is None or t in steps_filter)
+        for t in range(len(buf._step_index))
+        if step_slots(t).shape[0] > 0 and (steps_filter is None or t in steps_filter)
     ]
     if not steps:
         raise RuntimeError("no non-empty step buckets available for sampling")
@@ -215,7 +238,7 @@ def _sample_slots(
     slots: List[int] = []
     for i in range(num_states):
         step = steps[i % len(steps)]
-        candidates = buf._step_index[step]
+        candidates = step_slots(step)
         slots.append(int(candidates[int(rng.integers(0, candidates.shape[0]))]))
     rng.shuffle(slots)
     return slots
@@ -266,9 +289,12 @@ def _prepare_state_eval(
     fixed = model.precompute_decoder(encoded)
     state = reconstruct_state(batch, device=device)
     _log_p, _mask, glimpse = model.decode_step(fixed, state, return_glimpse=True)
-    if model.value_head is None:
+    if getattr(model, "value_trunk", None) is not None:
+        v_pred = float(model.value_from_state(fixed, state).view(-1)[0].item())
+    elif model.value_head is not None:
+        v_pred = float(model.value_head(glimpse).view(-1)[0].item())
+    else:
         raise RuntimeError("value head is disabled; cannot run value residual probe")
-    v_pred = float(model.value_head(glimpse).view(-1)[0].item())
     bl_val = float(batch["bl_val"].view(-1)[0].item())
     cost_to_go = float(batch["cost_to_go"].view(-1)[0].item())
     buffer_z = _buffer_target(cost_to_go, bl_val, graph_size, value_target_norm)
@@ -476,14 +502,16 @@ def main():
         print(f"  {k:22s}: {cfg_dict[k]}")
 
     model = _load_stage4_model(
-        args.ckpt, args.which, train_args, graph_size, value_target_norm, device
+        args.ckpt, args.which, train_args, graph_size, value_target_norm, device,
+        value_head_type=args.value_head_type, value_own_encoder=args.value_own_encoder,
     )
     buf = _load_buffer(args.buffer, graph_size, capacity)
 
     steps_filter = None
     if args.steps:
         steps_filter = [int(x.strip()) for x in args.steps.split(",") if x.strip()]
-    slots = _sample_slots(buf, args.num_states, np_rng, steps_filter=steps_filter)
+    slots = _sample_slots(buf, args.num_states, np_rng, steps_filter=steps_filter,
+                          holdout_k=args.holdout_k, inst_split=args.inst_split)
     solver = _make_solver(model, cfg_dict, device, seed=args.seed + 17)
 
     rows: List[Dict] = []

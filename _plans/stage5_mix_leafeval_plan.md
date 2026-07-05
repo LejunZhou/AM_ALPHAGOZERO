@@ -3,6 +3,21 @@
 Sibling of [stage5_plan.md](stage5_plan.md) §A–§G. Mirror progress file:
 [`_progress/stage5_mix_leafeval_progress.md`](../_progress/stage5_mix_leafeval_progress.md).
 
+> **STATUS: CLOSED 2026-07-02 — NEGATIVE, question answered.**
+> §H.4 mix(λ=0.5) self-play lost to §B.4 rollout+lv0 (+0.0132; λᵥ-interference
+> the best-supported dominant channel, mix-inference channel priced at
+> +0.001 by Phase A; magnitude ~1σ of the ~0.01–0.015 seed-noise floor).
+> §H.7 (separate ValueTrunk, Phase 0/0b) was also negative and produced the
+> real answer: the value head fails **off-policy** — calibrated on trajectory
+> states (|err| 0.08 raw) but ~0.6 raw optimistic on untaken siblings, so its
+> sibling-ranking signal is ≈ 0 wherever MCTS reads it; richer representations
+> make this *worse*, not better. Phase C (§7) was not run — evaluating a leaf
+> eval that cannot rank actions adds nothing. The premise itself was flawed:
+> the leaf rollout is deterministic argmax (zero sampling variance), so there
+> was never rollout variance to reduce — see **§12** for the reframed,
+> compute-based value proposition and the preconditions for reopening.
+> Full evidence: progress §H.4 attribution review + §H.7.
+
 ## 1. Context
 
 Two earlier Stage 5 findings drive this:
@@ -242,3 +257,131 @@ optimal-gap %, n_optimal/1000, paired-t vs lv0 iter-199, verdict.
   §D (lv0 ablation).
 - Mirror progress: [`_progress/stage5_mix_leafeval_progress.md`](../_progress/stage5_mix_leafeval_progress.md).
 - Internal Claude plan: `~/.claude/plans/i-want-to-test-polymorphic-cookie.md` (this plan was approved there first, then transcribed here for the project record).
+
+---
+
+## 11. §H.7 — Separate value-trunk experiment (richer value input)
+
+**Motivation.** The §H.4 mix value head and F.6.1.6 are equally biased
+(~0.082 vs 0.080 raw RMS against E[z|s]; calibration probe 2026-06-28). The
+bias is **state-dependent geometry error** (|signed| 0.016 ≪ RMS 0.082), and
+the head's only input is the policy **glimpse** — a softmax-pooled, next-step
+query readout that discards the remaining-sub-tour geometry that determines
+cost-to-go. Hypothesis: a value head with its **own representation** (attention
+over the *unvisited* nodes) reduces the bias. If so, mix may finally beat the
+lv0/rollout frontier; if not, the bias is capacity/target-fundamental and the
+AGZ value head is a scaling-only bet on TSP.
+
+**Design — `ValueTrunk`.** Own MHA: query = proj([h_current ; h_first])
+(placeholder at step 0); K/V = node embeddings with **visited nodes masked
+out** → attends over the remaining sub-tour; → 2-layer MLP → scalar **raw**
+cost-to-go (`value_target_norm='none'`, unchanged). Encoder shared but read
+**detached** (stop-grad) so the value loss never perturbs the policy encoder —
+net recipe = "lv0 policy + side value-trunk used only at mix leaf-eval", which
+closes the §D λᵥ-interference channel by construction.
+
+**Key backend fact (verified).** The C++ MCTS never computes the value head —
+`mcts_cpp/solver.py:31-32` calls a Python evaluator (`solver.py:305-309`:
+`decode_step → value_head(glimpse)`) that already holds `fixed`
+(node_embeddings) + `state` (mask). So the trunk needs **zero C++ changes / no
+`.pyd` rebuild**; only Python eval sites change.
+
+### Phase 0 — decisive cheap test (supervised; no self-play, no MCTS, no C++)
+Load §H.4 `iter-99` (encoder+policy frozen) + its `buffer.pt` (100k tuples,
+local). Supervised-train **only** the trunk: `MSE(v_trunk(s), cost_to_go)` (raw,
+= `z·bl_val`). Re-run `probe_value_aleatoric` (rollout-K=10 reference, raw
+units — matched to the §H.4 Job-B 0.082 anchor).
+**Gate:** RMS bias **< ~0.04** → representation bottleneck → Phase 1; **≈ 0.08**
+→ fundamental → stop & report. Fallback 0b: unfreeze encoder for the trunk grad.
+Files: new `model/value_trunk.py`, `model/attention_model.py`
+(`value_head_type` flag + `value_from_state`), new
+`scripts/train_value_trunk_supervised.py`, `scripts/probe_value_aleatoric.py`
+(trunk branch).
+
+### Phase 1 — self-play (only if Phase 0 passes)
+Swap value forward → `value_from_state` at the 3 Python sites (`trainer.py`,
+`mcts.py` mix/value branches, `solver.py` `eval_many` + BatchSearch evaluator).
+Train from scratch on TSP-20, recipe = §H.4 (K=10 step10 ε=0.25 mix λ=0.5
+vtn=none 100-iter) + stop-grad trunk. Compare best val vs §B.4 (3.8576) /
+§H.4 (3.871); re-probe. Entrypoint `run_tsp20_k10_mix_vtrunk_step50`.
+
+### Phase 2 — verdict
+1000-instance canonical eval, paired-t vs lv0 iter-199, log in §H.5/§H.6.
+
+### Verification
+Phase-0 bias gate; smoke (trunk shapes, CPU, `mix(λ=0)==rollout` exact,
+Py↔C++ value parity); stop-grad telemetry `value_grad_norm_shared==0`.
+
+### Design defaults
+stop-grad ON · query=[current,first] · 1 MHA layer + 2-layer MLP ·
+Phase-0 encoder = §H.4 `iter-99`.
+
+### §11 closure — **CLOSED 2026-07-02 (NEGATIVE for the representation hypothesis)**
+
+Phase 0 + 0b ran (shared-trunk, own-encoder, own-encoder+holdout variants;
+checkpoints next to §H.4 `iter-99.pt`). Outcome, in full in progress §H.7:
+
+- The **Phase-0 gate as specified above was the wrong metric.** On-policy
+  RMS bias is *not* what limits the head — the §H.4 glimpse head is already
+  near-perfectly calibrated on-policy (signed −0.01, |err| 0.08 raw vs
+  greedy-completion gt). The decision-relevant metric is **within-node
+  sibling ranking** (`probe_action_ranking.py`), where every head variant
+  scores Spearman ≈ 0 (−0.19…+0.19) vs the rollout's 0.89.
+- Cause: **off-policy calibration failure**, not representation. The buffer
+  contains only trajectory states; on untaken siblings the head is ~0.6 raw
+  optimistic (own-encoder trunk: −0.84 — *lower* on-policy error buys *more*
+  off-policy overconfidence, so the dissociation is causal).
+- **Phases 1–2 cancelled.** Self-play with any current head as (part of)
+  the leaf eval cannot beat rollout; a better trunk does not change that.
+- Any future gate: `probe_action_ranking` decision regret vs the greedy
+  rollout's 0.047 benchmark — not RMS.
+
+---
+
+## 12. Reframed value proposition — compute, not variance — **ADOPTED 2026-07-02**
+
+**Premise correction.** §1 motivated the value head as a variance reducer
+for "noisy" rollout leaf evals. That premise is false for this system: the
+leaf rollout is a *deterministic* argmax completion
+([`mcts.py:550-561`](../src/am_baseline/search/mcts.py)) — zero sampling
+variance at a fixed leaf — and §C.2 measured var(z|s) ≈ 0 for steps ≥ 2
+under step10+argmax. The AGFan/Lee mix averaged a *stochastic* fast-rollout
+policy; there is no analogous noise dividend here. Mixing could only ever
+trade nonexistent noise for value-head bias, which is what §H.3/§H.4 observed.
+
+**What the value head is actually worth: forward passes.** A rollout from a
+leaf at step t costs (N − t) extra decode forwards; the value head costs ~0
+extra (an MLP on the glimpse the leaf already computed for priors).
+Empirically (Phase A, λ=0 row): rollouts are **10.48M of 11.54M decode
+forwards = 91%** of search compute at TSP-20 K=40. A head-only search
+therefore buys **~11× more simulations at matched wall on TSP-20**, scaling
+as ≈ 1 + N/2: **~26× at TSP-50, ~51× at TSP-100**. That dividend is real —
+but currently unredeemable: §C.3 showed vh at K=200 (5× sims) still loses to
+rollout at K=40, because a leaf eval that cannot rank siblings does not
+convert extra sims into better visits.
+
+**Consequences (standing decisions):**
+1. **TSP-20 is closed for value-head experiments.** K=10 rollout self-play
+   costs 33 min end-to-end; there is no compute problem to solve at N=20.
+   The frontier recipe stays `leaf_eval=rollout, λᵥ=0` (§D verdict).
+2. **The value head re-enters only as a compute play at TSP-100+**, where
+   O(N) decodes/leaf is the binding cost, and only after its ranking is
+   fixed. Preconditions for reopening (in order):
+   a. **Off-policy value targets** — label counterfactual children /
+      within-tree leaf states with their greedy-rollout cost-to-go (already
+      computed for free during `leaf_eval=rollout` self-play) and train the
+      head on that distribution. Cheap Phase-0-style test: supervised-train
+      the *existing glimpse head* on augmented data from the §H.4 buffer +
+      rollout labels, then re-run `probe_action_ranking`.
+      → **Instantiated as Stage 5 §V0** —
+      [`stage5_offpolicy_value_plan.md`](stage5_offpolicy_value_plan.md)
+      (scaffold complete 2026-07-04; Colab T4 gate run pending).
+   b. **Gate on ranking, not RMS**: decision regret approaching the
+      rollout's 0.047 (TSP-20 anchor) before any self-play spend.
+   c. Only then a self-play trial — at a graph size where the ~1+N/2×
+      sim multiplier pays for the head's residual ranking deficit.
+3. Optional attribution refinement (not required for closure): §B.4
+   verbatim + λᵥ=1 + `leaf_eval=rollout` (~$5 / ~40 min A10) splits the
+   H.4 deficit between the λᵥ and mix channels and starts bounding the
+   seed-noise floor; run it only if the λᵥ-interference magnitude at K=10
+   becomes decision-relevant elsewhere.
