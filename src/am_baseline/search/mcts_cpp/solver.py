@@ -75,6 +75,10 @@ class CppMCTSSolver:
         # per tour-step (length N after a full solve); each dict maps
         # action -> visit count for actions touched in backup at that step.
         self.root_visit_dists: list = []
+        # Stage 5 §I Step 2 — per-tour-step root Q dicts and root estimates
+        # (Q units). Populated only when `cfg.return_root_q=True`.
+        self.root_q_dists: list = []
+        self.root_values: list = []
 
     @torch.no_grad()
     def solve_batch(self, inputs: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -193,6 +197,20 @@ class CppMCTSSolver:
             ]
         else:
             self.root_visit_dists = []
+        # Stage 5 §I Step 2 — root Q dicts and root estimates (Q units).
+        if self.cfg.return_root_q:
+            if "root_q_dists" not in result:
+                raise RuntimeError(
+                    "return_root_q=True but the C++ extension did not return root Q "
+                    "values; rebuild it from this source tree (pip install -e .)."
+                )
+            self.root_q_dists = [
+                {int(a): float(q) for a, q in step} for step in result["root_q_dists"]
+            ]
+            self.root_values = [float(v) for v in result["root_values"]]
+        else:
+            self.root_q_dists = []
+            self.root_values = []
 
         cost = torch.tensor(float(result["cost"]), device=self.device, dtype=input_1.dtype)
         tour = torch.tensor(list(result["tour"]), device=self.device, dtype=torch.long)
@@ -640,6 +658,9 @@ class CppBatchMCTSSolver(CppMCTSSolver):
         # Populated by `solve_batch` / `solve_instance` only when
         # `cfg.return_root_visits=True`.
         self.root_visit_dists_per_instance: list = []
+        # Stage 5 §I Step 2 — per-instance per-step root Q dicts / root values.
+        self.root_q_dists_per_instance: list = []
+        self.root_values_per_instance: list = []
 
     @torch.no_grad()
     def solve_instance(
@@ -661,6 +682,12 @@ class CppBatchMCTSSolver(CppMCTSSolver):
             self.root_visit_dists = self.root_visit_dists_per_instance[0]
         else:
             self.root_visit_dists = []
+        if self.cfg.return_root_q and self.root_q_dists_per_instance:
+            self.root_q_dists = self.root_q_dists_per_instance[0]
+            self.root_values = self.root_values_per_instance[0]
+        else:
+            self.root_q_dists = []
+            self.root_values = []
         return costs[0], tours[0]
 
     @torch.no_grad()
@@ -687,6 +714,8 @@ class CppBatchMCTSSolver(CppMCTSSolver):
         self.batch_eval_calls = 0
         self.batch_eval_rows = 0
         self.root_visit_dists_per_instance = []
+        self.root_q_dists_per_instance = []
+        self.root_values_per_instance = []
 
         for start in range(0, bsz, self.mcts_batch_size):
             end = min(start + self.mcts_batch_size, bsz)
@@ -705,6 +734,9 @@ class CppBatchMCTSSolver(CppMCTSSolver):
             self.batch_eval_rows += chunk_stats["batch_eval_rows"]
             if "root_visit_dists" in chunk_stats:
                 self.root_visit_dists_per_instance.extend(chunk_stats["root_visit_dists"])
+            if "root_q_dists" in chunk_stats:
+                self.root_q_dists_per_instance.extend(chunk_stats["root_q_dists"])
+                self.root_values_per_instance.extend(chunk_stats["root_values"])
 
         self.fwd_count_decode = int(sum(self.fwd_count_decode_per_instance))
         self.fwd_count_rollout = int(sum(self.fwd_count_rollout_per_instance))
@@ -1276,5 +1308,18 @@ class CppBatchMCTSSolver(CppMCTSSolver):
             stats["root_visit_dists"] = [
                 [{int(a): int(c) for a, c in step} for step in inst]
                 for inst in raw["root_visit_dists_per_instance"]
+            ]
+        if self.cfg.return_root_q:
+            if "root_q_dists_per_instance" not in raw:
+                raise RuntimeError(
+                    "return_root_q=True but the C++ extension did not return root Q "
+                    "values; rebuild it from this source tree (pip install -e .)."
+                )
+            stats["root_q_dists"] = [
+                [{int(a): float(q) for a, q in step} for step in inst]
+                for inst in raw["root_q_dists_per_instance"]
+            ]
+            stats["root_values"] = [
+                [float(v) for v in inst] for inst in raw["root_values_per_instance"]
             ]
         return costs, tours, stats

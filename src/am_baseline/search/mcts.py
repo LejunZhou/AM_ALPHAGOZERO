@@ -115,6 +115,14 @@ class MCTSConfig:
     # Stage 2/3 callers see no behavioral or memory change.
     return_root_visits: bool = False
 
+    # --- Stage 5 §I Step 2: root value exposure ---
+    # When True, solvers also record, per tour-step at the same snapshot point,
+    # the root Q of every visited child ({action: W/N}, higher = better, units
+    # -total_cost/bl_val) in `root_q_dists`, and the root's own leaf estimate in
+    # the same units, -(length/bl_val + v_estimate), in `root_values`. Used to
+    # build completed-Q (Gumbel) policy targets. Default False: no change.
+    return_root_q: bool = False
+
     seed: Optional[int] = None
 
 
@@ -170,6 +178,9 @@ class MCTSSolver:
         # taken AFTER `_pick_root_action` and BEFORE the tree-reuse advance so
         # the dict contains the visit counts for the action chosen at this step.
         self.root_visit_dists: list[dict[int, int]] = []
+        # Stage 5 §I Step 2 — populated only when `cfg.return_root_q=True`.
+        self.root_q_dists: list[dict[int, float]] = []
+        self.root_values: list[float] = []
 
     @classmethod
     def _validate_config(cls, cfg: MCTSConfig, model: AttentionModel) -> None:
@@ -288,6 +299,9 @@ class MCTSSolver:
         # Stage 4 Phase A — reset visit-dist log for this instance.
         if self.cfg.return_root_visits:
             self.root_visit_dists = []
+        if self.cfg.return_root_q:
+            self.root_q_dists = []
+            self.root_values = []
 
         embeddings = self.model.encode(input_1)
         fixed = self.model.precompute_decoder(embeddings)
@@ -341,6 +355,12 @@ class MCTSSolver:
             # child) cannot corrupt earlier snapshots.
             if self.cfg.return_root_visits:
                 self.root_visit_dists.append(dict(root.N))
+            if self.cfg.return_root_q:
+                self.root_q_dists.append(dict(root.Q))
+                self.root_values.append(
+                    -(float(root.state.lengths.view(-1)[0].item()) / max(bl_val, 1e-6)
+                      + root.v_estimate)
+                    if math.isfinite(root.v_estimate) else math.nan)
 
             state = state.update(torch.tensor([a], dtype=torch.long, device=self.device))
 

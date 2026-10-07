@@ -1,0 +1,42 @@
+{
+  "date": "2026-09-29",
+  "notebook": "notebooks/colab_value_evaluator_repair.ipynb",
+  "notebook_source_sha256": "afdce0988a124496d8bd62dbbccc997e77541ecdf12222ea6972af1d5868d0c7",
+  "unit_tests": 7,
+  "clean_kernel_execution": {
+    "tsp20_f616": {
+      "status": "ok",
+      "seconds": 3.8,
+      "code_cells": 12,
+      "errors": 0
+    },
+    "tsp50_stage1": {
+      "status": "ok",
+      "seconds": 3.7,
+      "code_cells": 12,
+      "errors": 0
+    }
+  },
+  "mode": "PROFILE=cpu_smoke for both EXPERIMENT values; real F.6.1.6 and Stage 1 TSP-50 checkpoints; CPU; graph_size=6",
+  "real_checkpoint_pilots": {
+    "tsp20_f616": {
+      "train_instances": 96,
+      "probe_instances": 16,
+      "search_instances": 8,
+      "epochs": 12,
+      "seeds": 1,
+      "K": 20,
+      "status": "all complete"
+    },
+    "tsp50_stage1": {
+      "train_instances": 4,
+      "probe_instances": 2,
+      "search_instances": 2,
+      "epochs": 1,
+      "seeds": 1,
+      "K": 4,
+      "status": "all complete"
+    }
+  },
+  "smoke_is_not_performance_evidence": true
+}

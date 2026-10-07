@@ -9,6 +9,32 @@ around those proposals to find lower-cost tours than greedy decoding. The same
 search is then recycled into training data: the model learns from its own
 search statistics, the way AlphaGo Zero learned from MCTS-guided self-play.
 
+Current experimental status (2026-09-25): from-scratch search-supervised greedy
+policies still trail the REINFORCE baselines on the matched TSP-20/50 checks.
+The latest [research audit](_progress/research_diagnosis_20260925_progress.md)
+identifies an evaluation-normalization omission and a value-input limitation.
+Correctly scaled value-guided search improves on greedy in the audit, although
+rollouts remain stronger. Consult that report before using older value-failure
+or sample-efficiency claims. The proposed fixes and training ablations are pending.
+
+The [frozen-policy value repair experiment](notebooks/colab_value_evaluator_repair.ipynb)
+ran on Colab (2026-09-30). Missing inputs, not capacity, limited the value head:
+explicit endpoint and geometry features cut its TSP-50 decision regret 30-fold and
+recovered most of the rollout's search gain at lower cost. The gain is concentrated
+in the last ten cities, so rollouts remain the stronger teacher; see the
+[results record](_progress/value_evaluator_repair_colab_progress.md).
+
+The [student isolation experiment](notebooks/colab_student_isolation.ipynb) ran on
+Colab (2026-10-04). It asked whether a REINFORCE-trained TSP-50 model can absorb the
+improvements a rollout-MCTS teacher finds.
+- One round of distillation from the search beat continued REINFORCE at the same wall
+  time for all three training targets. The best target cost 0.0131 less than Stage 1
+  greedy; REINFORCE improved by 0.0034.
+- The student kept only about a fifth of the teacher's 0.0635 gain, below the 25%
+  floor set before the run.
+- The outcome is therefore STOP for the TSP claim. See the
+  [results record](_progress/student_isolation_colab_progress.md).
+
 ## How MCTS works
 
 TSP construction is treated as a sequence of small decisions: each state is a
@@ -166,7 +192,59 @@ conda activate AM_AlphaGoZero
 pip install -e .
 ```
 
-**Stage 1 — supervised + value-head training** (produces the warm-start
+**Student isolation — Colab (Stage 5 §I Step 2):**
+
+1. Upload [`notebooks/colab_student_isolation.ipynb`](notebooks/colab_student_isolation.ipynb)
+   to Colab and select a GPU runtime (L4 recommended).
+2. Place the Stage 1 TSP-50 checkpoint and its `args.json` at
+   `MyDrive/AM_AlphaGoZero/checkpoints/stage1_tsp50_with_value/`.
+3. Run all cells with `PROFILE = "main"` (the screen). If the report says
+   `CONTINUE`, rerun with `PROFILE = "confirm"`; it reuses the same Drive folder.
+
+The notebook embeds a hash-checked source snapshot and compiles the C++ search in
+the runtime; no repository push is needed. A frozen Stage 1 policy plus batched
+rollout MCTS labels 32,768 training graphs once. Students start from Stage 1 and
+learn from visit counts, a completed-Q improved policy, or the best tour found;
+validation picks checkpoints and learning rates. Continued REINFORCE with the
+checkpoint's optimizer and rollout baseline gets the same wall time. Runs resume
+from Drive under `outputs/student_isolation/<run_name>/`. CLI:
+`PYTHONPATH=src python src/scripts/run_student_isolation.py --profile cpu_smoke
+--checkpoint <epoch-99.pt> --output_dir <dir>`. Regenerate the notebook with
+`python src/scripts/build_student_isolation_notebook.py`.
+
+**Frozen-policy value evaluator repair — Colab diagnostic:**
+
+1. Upload [`notebooks/colab_value_evaluator_repair.ipynb`](notebooks/colab_value_evaluator_repair.ipynb)
+   to Colab and select a GPU runtime (CPU is supported).
+2. Place the F.6.1.6 checkpoint at
+   `MyDrive/AM_AlphaGoZero/checkpoints/f616_400iter_step_decay/iter-361_accepted.pt`.
+   The notebook explicitly uses its raw-output convention, `original_value_norm='none'`.
+3. Run the cells in order. The default `main` preset uses 1,024 training graphs,
+   128 validation graphs, 100 sibling-test graphs, and 100 separate search-test
+   graphs; each of three architectures is fitted with seeds 0, 1, and 2 for 30
+   epochs. `pilot` and `cpu_smoke` presets provide smaller runs.
+
+The notebook embeds a hash-checked source snapshot, so no repository push,
+clone, C++ build, or W&B login is required. Its `EXPERIMENT` switch also runs the
+Stage 1 TSP-50 checkpoint (the decision run). It freezes all policy parameters and
+normalization buffers, caches raw greedy-completion targets for all children of
+selected greedy/sampled prefix states, and compares the original head, a wider
+original head, and a head with explicit endpoint/remaining-set features.
+Held-out decisions use exact DP at up to 20 remaining nodes. Search comparisons
+include prior-only, geometric, and rollout evaluators, both equal-K and with K
+calibrated on separate timing instances. Actual held-out times are reported;
+calibration is not a strict wall-clock deadline.
+
+Runs resume from Drive under `outputs/value_repair/<run_name>/`. Change the run
+name when changing settings. The final cell exports raw results and plots to a
+compact ZIP; feature caches and resumable heads stay on Drive. The source runner
+is [`src/am_baseline/experiments/value_repair.py`](src/am_baseline/experiments/value_repair.py).
+For CLI use, pass the notebook's saved `config.json` to
+`PYTHONPATH=src python -m scripts.run_value_repair --config <path> --phase all`.
+After editing the experiment sources, regenerate the embedded notebook with
+`python src/scripts/build_value_repair_notebook.py`.
+
+**Stage 1 — REINFORCE + auxiliary value-head training** (produces the warm-start
 checkpoint that everything else builds on):
 
 ```bash
@@ -211,14 +289,14 @@ PYTHONPATH=src python src/scripts/train_alphazero.py \
   --dirichlet_epsilon 0.25
 ```
 
-`--load_path` is required: Stage 4 warm-starts from a Stage 1 checkpoint so
-the value head and policy already have a sensible scale before self-play
-begins.
+This example warm-starts from Stage 1. Omitting `--load_path` starts from random
+initialization; the main Stage 5 experiments use that setting. Warm-start and
+from-scratch results answer different training-efficiency questions.
 
 ## Further reading
 
 - `proposal.md` — research questions, methods, and expected outcomes.
-- `_plans/stage{0,1,2,3,4}_plan.md` — design documents per stage.
-- `_progress/stage{0,1,2,3,4}_progress.md` — running results, decisions, and
+- `_plans/stage{0,1,2,3,4,5}_plan.md` — design documents per stage.
+- `_progress/stage{0,1,2,3,4,5}_progress.md` — running results, decisions, and
   open questions.
 - `ref/` — reference codebases the project draws on.

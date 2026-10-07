@@ -57,6 +57,11 @@ struct Config {
   // per-tour-step root visit counts (raw root.n_visits) into the result dict.
   // Defaults false to preserve Stage 2/3 wire format.
   bool return_root_visits = false;
+  // Stage 5 §I Step 2: when true, also dump per-tour-step root Q values of
+  // visited children (W/N, higher = better, units -total_cost/bl_val) and the
+  // root's own leaf estimate in the same units, -(length/bl_val + v_estimate).
+  // Taken at the same point as the visit snapshot. Defaults false.
+  bool return_root_q = false;
   std::uint64_t seed = 0;
 
   static Config from_python(py::dict cfg);

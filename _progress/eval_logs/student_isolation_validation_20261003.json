@@ -1,0 +1,130 @@
+{
+ "date": "2026-10-03",
+ "machine": "Mac (Apple silicon), CPU only, .venv torch 2.10",
+ "notebook": "notebooks/colab_student_isolation.ipynb",
+ "snapshot_sha256_prefix": "26188b0f9bfc",
+ "checkpoint_sha256": "04150b55e566dd1281216af1301a57cfb6031b292587f2cd154d7d1054601907",
+ "cpp_python_parity": {
+  "graphs": "3 x 12 cities, Stage 1 TSP-50 weights, K=16",
+  "tours_identical": true,
+  "visits_identical": true,
+  "max_abs_q_diff": 1.7e-07
+ },
+ "existing_smokes": {
+  "smoke_mix": "pass",
+  "smoke_alphazero": "pass"
+ },
+ "unit_tests": "11/11 pass (scripts.test_student_isolation)",
+ "notebook_cpu_smoke": "9/9 code cells, clean kernel, C++ compiled from snapshot, 30 s",
+ "cpu_preview": {
+  "note": "1/8-scale preview on CPU; NOT the experiment. Control is meaningless on CPU (101 REINFORCE steps).",
+  "config": {
+   "checkpoint": "/Users/lejunzhou/Desktop/AM_ALPHAGOZERO/outputs/tsp_50/stage1_tsp50_with_value_20260424T032357/epoch-99.pt",
+   "output_dir": "/private/tmp/claude-501/-Users-lejunzhou-Desktop-AM-ALPHAGOZERO/df149fa3-2728-4284-a027-d4ea51e9b416/scratchpad/si_mini",
+   "train_instances": 4096,
+   "val_instances": 512,
+   "test_instances": 512,
+   "canonical_val_instances": 0,
+   "teacher_batch": 512,
+   "epochs": 4,
+   "batch_instances": 64,
+   "eval_every": 16,
+   "learning_rates": [
+    1e-05,
+    3e-05,
+    0.0001
+   ],
+   "control_epoch_size": 128000,
+   "control_eval_every": 50,
+   "device": "cpu"
+  },
+  "teacher_train_seconds_per_graph": 0.021,
+  "policies": [
+   {
+    "policy": "stage1",
+    "test_mean": "5.797998497262597",
+    "val_cost": "5.803697113879025",
+    "lr": "",
+    "fix_rate": "0.0",
+    "keep_rate": "1.0"
+   },
+   {
+    "policy": "teacher",
+    "test_mean": "5.736794202588499",
+    "val_cost": "",
+    "lr": "",
+    "fix_rate": "",
+    "keep_rate": ""
+   },
+   {
+    "policy": "visits_s0",
+    "test_mean": "5.789554956369102",
+    "val_cost": "5.792695446871221",
+    "lr": "3e-05",
+    "fix_rate": "0.23628048598766327",
+    "keep_rate": "0.9946790933609009"
+   },
+   {
+    "policy": "gumbel_q_s0",
+    "test_mean": "5.789054756984115",
+    "val_cost": "5.788141998462379",
+    "lr": "3e-05",
+    "fix_rate": "0.29573169350624084",
+    "keep_rate": "0.9899312257766724"
+   },
+   {
+    "policy": "best_tour_s0",
+    "test_mean": "5.789388079196215",
+    "val_cost": "5.790773242712021",
+    "lr": "3e-05",
+    "fix_rate": "0.25304877758026123",
+    "keep_rate": "0.9927963614463806"
+   },
+   {
+    "policy": "control_s0",
+    "test_mean": "5.799706025980413",
+    "val_cost": "5.799225368537009",
+    "lr": "",
+    "fix_rate": "0.4070121943950653",
+    "keep_rate": "0.964268147945404"
+   }
+  ],
+  "decision": {
+   "teacher_minus_stage1": 0.06120429467409849,
+   "screen_outcome": "STOP",
+   "continue_with": null
+  },
+  "students": [
+   {
+    "target": "visits",
+    "lr": 3e-05,
+    "student_minus_stage1": -0.008443540893495083,
+    "student_minus_control": -0.010151069611310959,
+    "student_minus_control_hi": -0.0034121330887083917,
+    "retention": 0.1379566734402442,
+    "retention_lo": 0.08105343765255019,
+    "retention_hi": 0.19238569061358712
+   },
+   {
+    "target": "gumbel_q",
+    "lr": 3e-05,
+    "student_minus_stage1": -0.008943740278482437,
+    "student_minus_control": -0.010651268996298313,
+    "student_minus_control_hi": -0.0037126060695060357,
+    "retention": 0.14612929249664902,
+    "retention_lo": 0.0758835889500259,
+    "retention_hi": 0.21130836456177163
+   },
+   {
+    "target": "best_tour",
+    "lr": 3e-05,
+    "student_minus_stage1": -0.008610418066382408,
+    "student_minus_control": -0.010317946784198284,
+    "student_minus_control_hi": -0.0037213870826688436,
+    "retention": 0.1406832332964751,
+    "retention_lo": 0.07573919337113223,
+    "retention_hi": 0.2013151602835855
+   }
+  ]
+ }
+}

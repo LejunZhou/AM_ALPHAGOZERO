@@ -175,3 +175,86 @@ These criteria were originally in Stage 4 plan but require Stage 5-style ablatio
 - Stage 0 Gurobi reference for TSP-50: 5.6987.
 - Stage 1 reference val_avg_cost: TSP-20 canonical bs=512 = 3.83943; TSP-50 = 5.7999.
 - Stage 3 reference test-time MCTS K=400 rollout (TSP-20): 3.8312 (gap 0.087% vs Gurobi).
+
+---
+
+## §I — Sibling-ranking diagnostic: is the value head usable as a leaf evaluator at all? (added 2026-09-25)
+
+**Motivation.** Every Stage 5 value-head result (§C.2 bias decomposition, §C.3 leaf-eval
+bypass, §D lv0 ablation, §H mixed leaf eval) measured the head *indirectly* through
+MCTS tour cost, or through R²/MSE on cost-to-go, which is dominated by "how much tour is
+left" rather than by the quantity search consumes. What PUCT actually needs from a leaf
+evaluator is the *ranking of sibling children* under the same parent, where the
+decisive differences are ~0.01–0.1 in tour-length units. Before choosing whether to
+keep patching the head, move to a different CO problem, or drop the value head, measure
+that ranking quality directly against ground truth.
+
+**Design** ([`src/scripts/probe_sibling_ranking.py`](../src/scripts/probe_sibling_ranking.py)).
+For each probed partial-tour state s (steps t = 1 … N−2 of the model's own greedy
+trajectory, or of a trajectory whose first ⌈0.3N⌉ actions are sampled at temperature τ),
+enumerate every legal child s' = s + a and score it in total-tour units:
+
+| scorer | definition | role |
+|---|---|---|
+| `pol` | parent's policy prior, argmax = greedy action | what MCTS starts from |
+| `vh`  | lengths(s') + value_head(s') (de-normalized per `value_target_norm`) | AGZ-canonical leaf eval |
+| `ro`  | lengths(s') + greedy rollout from s' | `leaf_eval='rollout'` |
+| `opt` | lengths(s') + exact optimal completion (path-TSP: Held-Karp bitmask DP in numba for m ≤ 20 children, LKH dummy-node otherwise, clamped to ≤ rollout) | ground truth |
+
+Per state: which child each scorer picks; optimal-completion regret of that pick;
+whether the pick is optimal (tolerance 1e-6, handles the two-direction tie at t=1);
+"fix rate" = P(scorer picks an optimal child | greedy action is not optimal);
+P(vh pick worse / better than the policy pick); pick agreement; Spearman(scorer, opt);
+calibration slope of scorer on opt across siblings; the same restricted to the top-3
+children by prior (the set PUCT actually visits at c_puct=0.05); median decision margin
+(best vs second-best opt child) vs median scorer error spread across siblings.
+
+**Decision rule.** The head is a usable leaf evaluator only if P(opt)_vh and fix_vh are
+at least comparable to the policy prior's own P(opt) — an evaluator that ranks siblings
+worse than the prior can only degrade a PUCT search seeded by that prior. If
+P(opt)_vh < P(opt)_pol on the head's own on-policy states, no amount of K, mixing, or
+lr tuning can rescue value-head MCTS on this problem; the remaining options are
+rollout-only search or a different problem class.
+
+**Runs.** TSP-20: Stage 1 canonical head (`bl` target, R²=0.9965) and F.6.1.6
+iter-361 best_model (Stage 4-trained, raw target), each on greedy states and on τ=3
+sampled states, 100 instances × 18 steps = 1,800 states / 18,900 children, exact DP
+throughout. TSP-50: Stage 1 head, 20 instances, every 3rd step, LKH for m > 20.
+Outputs: `_progress/eval_logs/sibling_ranking/*.csv`; summary in
+[`stage5_progress.md` §I](../_progress/stage5_progress.md).
+
+## Frozen-policy evaluator repair follow-up (2026-09-26)
+
+The §I claim that inferior standalone ranking makes useful PUCT impossible is
+superseded by the matched evaluation audit (§J in the progress log). The next
+bounded experiment tests the known value-input limitation directly, with a
+frozen policy, matched head refits, a parameter-count control, held-out sibling
+decisions, and actual search quality/time measurements. The implementation and
+self-contained Colab notebook are ready; full experiment results are pending.
+
+See [`value_evaluator_repair_colab_plan.md`](value_evaluator_repair_colab_plan.md)
+and its [progress record](../_progress/value_evaluator_repair_colab_progress.md).
+
+**Step 1 (2026-09-29).** Frozen-policy evaluator repair on Colab — protocol, decision
+rule and run instructions in
+[`value_evaluator_repair_colab_plan.md`](value_evaluator_repair_colab_plan.md) §Revision 2.
+**Step 1 outcome (2026-09-30).** Partial pass on TSP-50: the value head is repairable
+(information, not capacity) but still ~4× the rollout's sibling regret and +0.005 tour
+cost at ~75% of its time.
+**Post-hoc check (2026-10-03).** The geometry gain is confined to ≤10 cities left; at
+21+ the head is still 2–3× the prior's regret against the rollout's pick, and the
+train/val gap is graph memorisation common to all heads. Next, in order: Step 2 first
+(critical path; runs as a diagnostic under the current proposal, and the claim
+decision arises only if it passes); an evaluator iteration only if
+a local offline feature check (heuristic-completion features at 21+ cities left)
+passes; the calibration-cap-8× rerun is optional and config-only.
+**Step 2 (2026-10-03).** Approved by Lejun (staged, Colab). One round of distillation
+from a fixed rollout-MCTS teacher on TSP-50, three targets on identical data, versus
+continued REINFORCE at matched wall time. Protocol and decision rule in
+[`student_isolation_colab_plan.md`](student_isolation_colab_plan.md); notebook
+`notebooks/colab_student_isolation.ipynb` validated locally, awaiting the `main` run.
+**Step 2 outcome (2026-10-06): STOP.** All three targets beat continued REINFORCE at matched
+wall time. None kept 25% of the teacher's gain: best `gumbel_q` 0.207 [0.169, 0.242].
+Confirm is not run. Per the pre-registered rule, the TSP claim ends for both framings.
+The next direction (recommended: stochastic PCTSP, the problem already agreed) needs
+Lejun's approval of a proposal revision.

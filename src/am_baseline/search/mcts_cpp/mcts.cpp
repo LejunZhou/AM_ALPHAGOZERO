@@ -67,6 +67,26 @@ std::vector<unsigned char> sequence_to_bools(py::handle handle) {
   return values;
 }
 
+// Stage 5 §I Step 2 — root Q snapshot shared by both solver paths. Records
+// (action, Q) for visited root children and the root's own estimate in Q units.
+void snapshot_root_q(const Node& root,
+                     double bl_val,
+                     std::vector<std::vector<std::pair<int, double>>>& q_per_step,
+                     std::vector<double>& value_per_step) {
+  std::vector<std::pair<int, double>> step_q;
+  for (int a = 0; a < root.state.n; ++a) {
+    const std::size_t idx = static_cast<std::size_t>(a);
+    if (root.n_visits[idx] > 0) {
+      step_q.emplace_back(a, root.q_value[idx]);
+    }
+  }
+  q_per_step.push_back(std::move(step_q));
+  const double safe_bl = bl_val > 1e-6 ? bl_val : 1e-6;
+  value_per_step.push_back(std::isfinite(root.v_estimate)
+                               ? -(root.state.length / safe_bl + root.v_estimate)
+                               : std::numeric_limits<double>::quiet_NaN());
+}
+
 }  // namespace
 
 Config Config::from_python(py::dict cfg) {
@@ -109,6 +129,7 @@ Config Config::from_python(py::dict cfg) {
   out.root_select = get_or<std::string>(cfg, "root_select", out.root_select);
   out.tree_reuse = get_or<bool>(cfg, "tree_reuse", out.tree_reuse);
   out.return_root_visits = get_or<bool>(cfg, "return_root_visits", out.return_root_visits);
+  out.return_root_q = get_or<bool>(cfg, "return_root_q", out.return_root_q);
   out.seed = get_or<std::uint64_t>(cfg, "seed", out.seed);
   if (out.simulation_batch_size < 1) {
     throw std::runtime_error("simulation_batch_size must be >= 1");
@@ -265,6 +286,8 @@ py::dict Solver::solve_instance(std::shared_ptr<const std::vector<double>> coord
   if (cfg_.return_root_visits) {
     root_visits_per_step.reserve(static_cast<std::size_t>(n));
   }
+  std::vector<std::vector<std::pair<int, double>>> root_q_per_step;
+  std::vector<double> root_value_per_step;
 
   while (!state.all_finished()) {
     if (!root || !cfg_.tree_reuse) {
@@ -313,6 +336,9 @@ py::dict Solver::solve_instance(std::shared_ptr<const std::vector<double>> coord
       }
       root_visits_per_step.push_back(std::move(step_visits));
     }
+    if (cfg_.return_root_q) {
+      snapshot_root_q(*root, bl_val, root_q_per_step, root_value_per_step);
+    }
 
     state.update_in_place(action);
 
@@ -356,6 +382,20 @@ py::dict Solver::solve_instance(std::shared_ptr<const std::vector<double>> coord
       py_steps.append(py_pairs);
     }
     out["root_visit_dists"] = py_steps;
+  }
+  if (cfg_.return_root_q) {
+    py::list py_q_steps;
+    py::list py_values;
+    for (std::size_t t = 0; t < root_q_per_step.size(); ++t) {
+      py::list py_pairs;
+      for (const auto& kv : root_q_per_step[t]) {
+        py_pairs.append(py::make_tuple(kv.first, kv.second));
+      }
+      py_q_steps.append(py_pairs);
+      py_values.append(root_value_per_step[t]);
+    }
+    out["root_q_dists"] = py_q_steps;
+    out["root_values"] = py_values;
   }
   return out;
 }
@@ -1362,6 +1402,9 @@ struct BatchInstance {
         }
         root_visits_per_step.push_back(std::move(step_visits));
       }
+      if (cfg.return_root_q) {
+        snapshot_root_q(*root, bl_val, root_q_per_step, root_value_per_step);
+      }
 
       state.update_in_place(action);
 
@@ -1467,6 +1510,10 @@ struct BatchInstance {
   // Stage 4 Phase A — per-tour-step root visit dumps for this instance.
   // Empty unless cfg.return_root_visits.
   std::vector<std::vector<std::pair<int, int>>> root_visits_per_step;
+  // Stage 5 §I Step 2 — per-tour-step root Q snapshots. Empty unless
+  // cfg.return_root_q.
+  std::vector<std::vector<std::pair<int, double>>> root_q_per_step;
+  std::vector<double> root_value_per_step;
   // Stage 4 Phase E — per-tour-step temperature schedule for this instance.
   // Filled at solve start by Solver::compute_tau_per_step.
   std::vector<double> tau_per_step;
@@ -1570,6 +1617,10 @@ py::dict BatchSearch::results() const {
   const bool emit_visits =
       !impl_->instances.empty() && impl_->instances.front().cfg.return_root_visits;
   py::list root_visits_per_instance;
+  const bool emit_q =
+      !impl_->instances.empty() && impl_->instances.front().cfg.return_root_q;
+  py::list root_q_per_instance;
+  py::list root_values_per_instance;
 
   for (const BatchInstance& instance : impl_->instances) {
     if (!instance.state.all_finished()) {
@@ -1597,6 +1648,20 @@ py::dict BatchSearch::results() const {
       }
       root_visits_per_instance.append(py_steps);
     }
+    if (emit_q) {
+      py::list py_q_steps;
+      py::list py_values;
+      for (std::size_t t = 0; t < instance.root_q_per_step.size(); ++t) {
+        py::list py_pairs;
+        for (const auto& kv : instance.root_q_per_step[t]) {
+          py_pairs.append(py::make_tuple(kv.first, kv.second));
+        }
+        py_q_steps.append(py_pairs);
+        py_values.append(instance.root_value_per_step[t]);
+      }
+      root_q_per_instance.append(py_q_steps);
+      root_values_per_instance.append(py_values);
+    }
   }
 
   py::dict out;
@@ -1607,6 +1672,10 @@ py::dict BatchSearch::results() const {
   out["value_calls"] = value_calls;
   if (emit_visits) {
     out["root_visit_dists_per_instance"] = root_visits_per_instance;
+  }
+  if (emit_q) {
+    out["root_q_dists_per_instance"] = root_q_per_instance;
+    out["root_values_per_instance"] = root_values_per_instance;
   }
   return out;
 }

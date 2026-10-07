@@ -178,6 +178,20 @@ Partial-root MCTS from 100 buffer states × 20 fresh completions, K=40 step10 ε
 
 ### C.3 Leaf-eval bypass sweep ([val_stage4_mcts.py](../src/scripts/val_stage4_mcts.py))
 
+> **CORRECTION 2026-09-26.** The `value_head` rows below are invalid. `val_stage4_mcts.py`
+> did not forward `value_target_norm`, so this F.6.1.6 head (trained on raw cost-to-go,
+> `none`) was read as if already `bl`-normalized: leaf values ~bl_val× too large relative
+> to the path term. Re-run with the fixed script (`--value_target_norm none`, C++ backend,
+> same 1000 instances seed 20260430, K=40): greedy 3.86336, **vh corrected 3.83867
+> (−0.0247)**, vh with the old bug 3.86903 (+0.0057), rollout 3.83402 (−0.0293). The
+> corrected head captures 84% of the rollout gain. Training-time MCTS (coach) and the
+> §H.3 λ-sweep script forwarded the setting correctly, so training runs are unaffected;
+> only val-time conclusions drawn from this script (here and the Stage 4 F.6.1 lock-in
+> diagnostic) are. Found by the external audit
+> [`research_diagnosis_20260925_progress.md`](research_diagnosis_20260925_progress.md);
+> verified and fixed in commit-pending changes to `val_stage4_mcts.py` (new
+> `--value_target_norm {auto,bl,none,sqrt_n}` flag, `auto` reads args.json).
+
 Re-evaluate iter-399 best_model at val time under MCTS × leaf_eval × K (val_seed=42, 2000 instances, ε=0, τ=0):
 
 | variant | leaf_eval | K | val_avg_cost | Δ vs greedy |
@@ -662,3 +676,264 @@ Quality unaffected (val trajectories within ±0.05 RNG noise). **Action: default
 - Stage 0 Gurobi reference TSP-20: 3.8279 mean (1000 instances, seed=1234); TSP-50: 5.6987.
 - Stage 1 reference val_avg_cost: TSP-20 canonical bs=512 = 3.83943; TSP-50 = 5.7999.
 - Stage 3 reference test-time MCTS K=400 rollout (TSP-20): 3.8312 (gap 0.087% vs Gurobi).
+
+---
+
+## §I — Sibling-ranking diagnostic — **COMPLETE 2026-09-25**
+
+Plan: [`stage5_plan.md` §I](../_plans/stage5_plan.md). Script:
+[`src/scripts/probe_sibling_ranking.py`](../src/scripts/probe_sibling_ranking.py)
+(+ [`aggregate_sibling_ranking.py`](../src/scripts/aggregate_sibling_ranking.py)).
+Per-state CSVs: `_progress/eval_logs/sibling_ranking/`. CPU only, ~1 min per TSP-20 run.
+
+**Question.** At a partial tour s, how well does each leaf evaluator rank the legal
+children s' = s + a against the exact optimal completion? This is the quantity PUCT
+consumes; R² on cost-to-go is not. Scorers: policy prior (`pol`, argmax = greedy
+action), value head (`vh`), greedy rollout (`ro`), exact optimum (`opt`; Held-Karp DP
+for ≤ 20 children, LKH otherwise). Regret = optimal-completion cost of the chosen child
+minus that of the best child. Per-step regrets telescope to the tour gap, and they do:
+TSP-20 Stage 1 mean regret 0.0006 × 18 decisions = 0.011 vs the measured greedy gap
+0.0115.
+
+### I.1 Headline table (all children of every probed state)
+
+| run | states / children | P(pick optimal) pol / ro / **vh** | regret per decision pol / ro / **vh** | fix rate when greedy is wrong ro / **vh** | vh pick worse than greedy |
+|---|---|---|---|---|---|
+| TSP-20, Stage 1 head (`bl`, R²=0.9965), greedy states | 1,800 / 18,900 | 0.958 / 0.988 / **0.628** | 0.0006 / 0.0002 / **0.080** | 0.87 / **0.18** | **35%** |
+| TSP-20, Stage 1 head, τ=3 sampled prefix | 1,800 / 18,900 | 0.934 / 0.967 / **0.616** | 0.0064 / 0.0052 / **0.085** | 0.66 / **0.21** | **36%** |
+| TSP-20, F.6.1.6 iter-361 head (raw target, Stage 4-trained), greedy | 1,800 / 18,900 | 0.930 / 0.970 / **0.800** | 0.0017 / 0.0015 / **0.020** | 0.87 / **0.34** | **16%** |
+| TSP-20, F.6.1.6 head, τ=3 sampled prefix | 1,800 / 18,900 | 0.825 / 0.847 / **0.668** | 0.0174 / 0.0201 / **0.047** | 0.70 / **0.33** | **25%** |
+| TSP-50, Stage 1 head (`bl`, R²=0.9957), greedy, every 3rd step | 320 / 8,480 | 0.884 / 0.922 / **0.394** | 0.0037 / 0.0033 / **0.228** | 0.70 / **0.11** | **58%** |
+
+Restricted to the top-3 children by prior (the set PUCT actually visits at c_puct=0.05):
+P(opt) vh = 0.75 / 0.75 / 0.81 / 0.74 / 0.62 vs ro = 0.99 / 0.98 / 0.97 / 0.88 / 0.93 and
+pol = 0.96 / 0.94 / 0.93 / 0.85 / 0.89 (same row order). TSP-50 `opt` uses LKH with
+2 runs for m > 20 children (95 of 7,100 solves came out above the rollout and were
+clamped to it). TSP-50 `opt` labels are therefore heuristic upper bounds and the
+TSP-50 regrets are *estimated-reference* regrets, not certified ones (a difference of two
+upper bounds is not itself a bound); the TSP-20 rows are exact.
+
+### I.2 By tour step (greedy states)
+
+| | TSP-20 Stage 1: early / mid / late | TSP-20 F.6.1.6: early / mid / late | TSP-50 Stage 1: early / mid / late |
+|---|---|---|---|
+| P(opt) pol | 0.94 / 0.96 / 0.96 | 0.94 / 0.92 / 0.95 | 0.86 / 0.87 / 0.95 |
+| P(opt) ro | 0.96 / 0.99 / 1.00 | 0.95 / 0.97 / 1.00 | 0.80 / 0.95 / 1.00 |
+| P(opt) **vh** | **0.44** / 0.67 / 0.73 | **0.86** / 0.79 / 0.78 | **0.11** / 0.42 / 0.68 |
+| regret vh | 0.151 / 0.070 / 0.034 | 0.014 / 0.019 / 0.028 | 0.508 / 0.155 / 0.075 |
+| calibration slope vh (median, 1 = resolves sibling differences) | 1.16 / 0.81 / 0.61 | 0.96 / 1.01 / 0.82 | **0.13** / 0.79 / 0.44 |
+| calibration slope ro | 1.93 / 1.29 / 1.03 | 1.22 / 1.20 / 1.00 | 1.69 / 1.18 / 1.08 |
+
+Median decision margin (best vs second-best child, optimal completion): 0.12 (TSP-20),
+0.07 (TSP-50). Median spread of the value head's error across siblings: 0.19 (Stage 1),
+0.11 (F.6.1.6), 0.26 (TSP-50) — the same size as or larger than the margin it must
+resolve. The rollout's error spread is similar (0.14 / 0.10 / 0.15) but its slope is
+> 1: greedy completions from bad children are *worse* than the optimal completion by
+more than from good children, so the rollout exaggerates the true ordering instead of
+scrambling it. The value head's mean bias is negative on off-policy children (it
+under-predicts the cost of moves the policy would not make: TSP-50 early −0.24), which
+is exactly the failure mode that makes PUCT wander into bad subtrees.
+
+### I.3 Verdict (revised 2026-09-26; see I.4)
+
+1. **The value head ranks siblings worse than the policy prior itself, in every
+   setting tested.** P(pick optimal) vh < pol by 13 to 49 points; per-decision regret
+   12× (F.6.1.6) to 130× (Stage 1) the prior's. ~~An evaluator that is worse than the
+   prior can only degrade a search seeded by that prior~~ — **retracted**: I.4 shows a
+   correctly scaled vh-MCTS beats greedy by 0.025 at K=40. Single-step sibling ranking
+   by the head alone is not what PUCT consumes; backups mix 1–3 steps of exact edge
+   cost with the head's estimate at deeper leaves, and the prior steers visits. §D
+   (λᵥ=0 wins) and §H (mix loses) were measured with correct scaling and stand; §C.3's
+   vh rows do not (evaluation bug, see the correction banner there).
+2. **Stage 4 training helps but does not close the gap.** The F.6.1.6 head is the best
+   available (0.80 on its own greedy states) and still fixes only a third of the
+   prior's mistakes while introducing new ones in 16% of states; off-policy it drops to
+   0.67. Rollout fixes 66–87% and introduces almost none.
+3. **It gets worse with problem size.** At TSP-50 the Stage 1 head is near-random at
+   early steps (0.11 with 44 children; slope 0.13 = essentially flat across siblings)
+   and prefers a worse-than-greedy child in 58% of states. The regime where a value head
+   would pay off most (large N, expensive rollouts) is where it is least usable.
+4. **R² was the wrong metric.** Both heads have R² ≥ 0.996 on cost-to-go; the decisive
+   sibling differences (~0.07–0.12) are far below the head's error spread. Any future
+   value head must be judged by P(opt) / regret on siblings, not R².
+5. **Decision.** No further K, λ, lr or mixing sweeps on TSP. Options that remain:
+   (a) rollout-only search-as-teacher on TSP (batched, no value head) — capped at
+   policy-prior quality per §D.5; (b) move the AGZ value+search thesis to a problem
+   where a single rollout is a poor or expensive state-value estimate (stochastic
+   PCTSP / stochastic-demand CVRP, JSSP, branch-and-bound), which is what §I would
+   need to show P(opt)_vh > P(opt)_pol before a training loop is worth building.
+
+### I.4 Addendum 2026-09-26 — corrected-scale search and the glimpse counterexample
+
+Triggered by the external audit
+([`research_diagnosis_20260925_progress.md`](research_diagnosis_20260925_progress.md)).
+Both of its factual findings were re-verified independently here:
+
+**(a) Evaluation-scale bug, reproduced with the C++ batched backend** (built on this Mac
+via `uv sync`), F.6.1.6 iter-361 best_model, 1000 instances seed 20260430, K=40, ε=0, τ=0,
+`mcts_batch_size=250`, CPU:
+
+| evaluator | mean | Δ vs greedy (paired SE) | better / worse / equal | wall per instance |
+|---|---:|---:|---|---:|
+| greedy θ★ | 3.86336 | — | — | — |
+| value head, old script (`bl` misread) | 3.86903 | **+0.0057** (0.0020) | 306 / 370 / 324 | 1.8 ms |
+| **value head, corrected (`none`)** | **3.83867** | **−0.0247** (0.0017) | 546 / 136 / 318 | 4.2 ms |
+| greedy rollout | 3.83402 | −0.0293 (0.0018) | 583 / 108 / 309 | 6.9 ms |
+
+The corrected head captures 84% of the rollout improvement at 0.6× the wall on CPU at
+TSP-20 (the audit's 3.4× figure was the Python reference loop). The rollout/value cost
+ratio grows with N (Stage 2 measured 2.25× at TSP-50), so the speed case for a usable
+head is real but only moderate at these sizes.
+
+**(b) The value head's input is provably endpoint-blind at the last step.** With one
+unvisited city j the decoder's masked softmax puts weight 1 on j, so the glimpse (the
+head's only input) equals project_out(V_j) regardless of the current or start city.
+Verified on one TSP-20 instance over all 6,840 (j, first, current) states: max glimpse
+difference within fixed j = 0.0 for both heads; predictions are constant given j
+(F.6.1.6 range 0.22–1.08 across j) while the true remaining cost d(c,j)+d(j,first)
+spans 0.09–2.28. More generally the glimpse is a convex combination of unvisited-node
+value vectors, so endpoint information enters only through attention weights. This
+matches the late-step collapse in I.2 (slope 0.61 / 0.82 / 0.44) and is a cheap,
+concrete fix to test: feed first/current embeddings, an unvisited-set summary and the
+remaining count to the head (the audit is preparing a frozen-policy Colab experiment,
+[`value_evaluator_repair_colab_plan.md`](../_plans/value_evaluator_repair_colab_plan.md)).
+
+**Step 1 deliverable (2026-09-29).** The frozen-policy evaluator-repair notebook is
+ready to run (`notebooks/colab_value_evaluator_repair.ipynb`, revision 2: adds a
+geometry-residual head and a TSP-20/TSP-50 experiment switch; validated locally, see
+[`value_evaluator_repair_colab_progress.md`](value_evaluator_repair_colab_progress.md)).
+The TSP-50 `main` run is the decision.
+
+**Step 1 result (2026-09-30).** Both Colab `main` runs done (bundles in
+`_progress/eval_logs/value_repair/`; full tables in
+[`value_evaluator_repair_colab_progress.md` §Results](value_evaluator_repair_colab_progress.md)).
+TSP-50: capacity is not the bottleneck (wide ≈ original), endpoint inputs halve the
+sibling regret and explicit geometry cuts it 3× more (`repaired_geo` 0.0040 vs
+rollout 0.0009, prior 0.0015; P(opt) 0.90 vs 0.975 / 0.94). In search the geometry
+head recovers 70% of the rollout's gain at equal K for a quarter of the time and 91%
+at ~75% of the time (+0.005 ± 0.003 vs rollout), and is significantly better than
+`prior_only` and `mst`. Decision rule: partial — repairable, not yet rollout-level.
+TSP-20 search cannot discriminate evaluators at all.
+
+**Step 1 post-hoc check (2026-10-03).** Per-horizon re-analysis against the rollout's
+own pick (script `src/scripts/value_repair_horizon_analysis.py`, CSVs in
+`_progress/eval_logs/value_repair/`): the geometry gain is confined to ≤10 cities left
+(−48% within-parent error at ≤5, −6% at 21+). At 21+ cities left the head is still 2–3×
+the prior's regret on on-policy states (e.g. 41–49 left: prior 0.010, geo 0.027,
+repaired 0.041) and equal to the prior off-policy. The train/val gap is graph
+memorisation common to all heads, not evidence of data limitation. The checkpoint head,
+a near-random ranker at long horizons, still beats `prior_only` in search by ~0.01, so
+matched-time search cost stays the only decision metric for a head. Corrected order:
+Step 2 first (critical path; a diagnostic under the current proposal, as warm-start
+runs have been since 2026-05-02; the claim decision arises only if it passes); another evaluator
+iteration only if a local offline feature check (NN / 2-opt / 1-tree features at 21+
+cities left) passes; the K-cap-8× rerun is optional and config-only. Details in
+[`value_evaluator_repair_colab_progress.md` §Post-hoc check](value_evaluator_repair_colab_progress.md).
+
+**Step 2 deliverable (2026-10-03).** Lejun approved the staged Step 2 on Colab.
+`notebooks/colab_student_isolation.ipynb` (runner `experiments/student_isolation.py`)
+is validated locally and ready: a fixed teacher (frozen Stage 1 + batched C++ rollout
+MCTS, K=40) labels 32,768 TSP-50 graphs once; students learn from visit counts, a
+completed-Q improved policy, or the best tour; continued REINFORCE gets the same wall
+time. Two findings while building: the faithful Gumbel completed-Q target is
+degenerate under PUCT at c_puct 0.05 (one child visited at 78% of steps; adapted and
+documented), and `train.py --resume` silently falls back to the exponential baseline
+after warm-up (avoided in the control, not patched). Details in
+[`student_isolation_colab_progress.md`](student_isolation_colab_progress.md).
+
+**Step 2 result (2026-10-06): STOP.** Lejun's `main` run used one L4 runtime, and every
+integrity check passed. On 2,048 test graphs the teacher gains 0.0635 over Stage 1
+greedy.
+- **All three students beat the control.** They beat continued REINFORCE at matched wall
+  time: `visits` −0.0060, `gumbel_q` −0.0097, `best_tour` −0.0074 vs the control, all
+  95% CIs below zero. The control itself gains only 0.0034 (n.s.) in ~66 min.
+- **None keeps 25% of the teacher's gain.** Retention is 0.147 / 0.207 / 0.170; the best
+  upper bound is 0.242.
+- **Which rule triggered.** STOP came from the pre-registered floor, not from the control.
+  Search distillation is the better use of GPU time at the plateau, but one round keeps
+  only about a fifth of what search finds.
+- **Target and training.** `gumbel_q` beats `visits` by 0.0038 (significant, one seed).
+  Students plateaued by mid-training.
+- **Consequence.** Per the rule, there is no Confirm run and the TSP claim ends.
+- **Corrections made in the review.** A mislabelled key in `decision.json`
+  (`teacher_minus_stage1` held the gain) and a misleading STOP sentence in the
+  generated report were fixed in the runner. The canonical seed-42 set is the
+  self-play loop's validation draw, not Stage 1's 5.7999 set; Stage 1 scores 5.8013
+  on it, within noise.
+
+Full record: [`student_isolation_colab_progress.md` §Results](student_isolation_colab_progress.md).
+
+**Repository note (2026-10-06, at push time).** This Mac's checkout was 3 commits behind
+`origin/main`: Stage 5 §H.7 / §V0 / §V1 (2026-07-04, made on another machine), recorded in
+[`stage5_offpolicy_value_progress.md`](stage5_offpolicy_value_progress.md) and
+[`stage5_mix_leafeval_progress.md`](stage5_mix_leafeval_progress.md). §V0 found the value
+head fails off-policy and reached rollout-level sibling ranking on TSP-20 by distilling
+rollouts on counterfactual children. The September audit, Step 1 and Step 2 were done
+without that work. The Step 2 result does not depend on it (rollout teacher, no value head),
+but the evaluator-side narrative (§I, Step 1) should be reconciled with §V0/§V1 before the
+proposal revision.
+
+**What stands, what changed.** Stands: the head is a poor single-step ranker (I.1), the
+training-side gap to REINFORCE (greedy 3.859–3.867 vs 3.842 on the matched set), and
+the λᵥ=0 / mix results. Changed: "value-head MCTS cannot beat greedy" was an artifact of
+the evaluation bug; the question "can a learned evaluator replace rollouts at rollout-level
+decision quality" is open again and cheap to answer on TSP-20/50 with the sibling probe
+plus the enriched-input head.
+
+**Environment note (2026-09-25).** Runs executed on a Mac without conda or GPU:
+`uv sync --no-install-project` created `.venv` (torch 2.10 CPU) from the committed
+`uv.lock`; `elkai`, `numba`, `pandas` added via `uv pip install`. The pybind11 C++ MCTS
+extension is not built on this machine; the probe uses only the Python model + state
+code (`PYTHONPATH=src .venv/bin/python src/scripts/probe_sibling_ranking.py ...`).
+
+## §J — Research audit and interpretation corrections — **COMPLETE 2026-09-25**
+
+See [the audit report](research_diagnosis_20260925_progress.md) and its linked
+raw results for the following corrections to earlier interpretations:
+
+- `val_stage4_mcts.py::_build_mcts_config` omits `value_target_norm`, so raw-value
+  F.6.1-family checkpoints are interpreted as already normalized. A fresh matched
+  1,000-instance CPU check (F.6.1.6, K=40) gives greedy 3.863356, incorrectly
+  scaled value search 3.869028, correctly scaled value search 3.838671, and
+  rollout search 3.834016. C.3 does not establish that the properly scaled head
+  cannot help search. Training already forwards the correct normalization.
+- The head's glimpse input provably loses first/current endpoint information
+  when only one city remains. On one fixed graph, 342 valid endpoint pairs give
+  identical inputs and predictions despite exact remaining costs spanning
+  0.458365 to 1.506348. A larger MLP on those same inputs cannot fix this.
+- Poor standalone sibling rankings do not imply that a head can only degrade
+  MCTS. Priors and deeper evaluations can still make the combination useful.
+- TSP-50 LKH-based sibling regrets are estimated-reference regrets. Differences
+  of heuristic upper bounds are not certified upper bounds on true regret.
+- Canonical Stage 1 uses 1.28M instances per epoch for 100 epochs (128M total),
+  not 1.28M total. Earlier sample-efficiency ratios and unmatched searched-versus-
+  greedy comparisons should not be used as established training advantages.
+
+The from-scratch greedy gap remains present on matched tests. Next work should
+isolate value representation and teacher-to-policy distillation before another
+broad parameter sweep or a problem pivot. Production code fixes are pending;
+the audit used an explicit corrected configuration in its diagnostic only.
+
+## §K — Frozen-policy value repair Colab experiment — SETUP COMPLETE 2026-09-26
+
+The user authorized an isolated evaluator repair before another full training
+run. The [self-contained notebook](../notebooks/colab_value_evaluator_repair.ipynb)
+compares matched original, parameter-matched wider original, and enriched-state
+heads while freezing the policy and all shared parameters/buffers. It caches
+frozen greedy-completion targets, evaluates exact sibling decisions, and tests
+search against prior-only, geometric, and rollout controls. Three head seeds are
+included in the main preset. Separate graphs calibrate approximate time budgets.
+
+Six CPU tests passed, including interrupted-training resume and reference-search
+parity. All 12 notebook code cells ran from the embedded source with the actual
+F.6.1.6 checkpoint on a tiny TSP-20 smoke configuration. This verifies execution,
+not evaluator improvement. Full Colab/GPU results remain pending. The notebook
+requires only the user's checkpoint on Drive and embeds the code, so local
+uncommitted sources need not be pushed to GitHub before running it.
+
+See the [dedicated plan](../_plans/value_evaluator_repair_colab_plan.md) and
+[progress/validation record](value_evaluator_repair_colab_progress.md) for the
+precise protocol, output interpretation, and launch instructions. The continuation
+criterion is held-out decision improvement plus a useful measured search
+quality/time tradeoff; standalone superiority over the prior is not treated as
+a mathematical prerequisite for useful search.

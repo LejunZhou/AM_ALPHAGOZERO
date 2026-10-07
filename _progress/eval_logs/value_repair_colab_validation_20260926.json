@@ -1,0 +1,25 @@
+{
+  "workspace": "/var/folders/xj/8xj1494138v8cmt966fkb4p00000gn/T/value_repair_notebook__0i17n0i",
+  "cells_executed": 12,
+  "errors": 0,
+  "mode": "real F616 checkpoint; CPU; TSP20; 4 train/2 val/2 probe/2 search; 2 epochs; 1 head seed",
+  "notebook_source_sha256": "0eb9ac1fc941f912432975a6d3dbfa73b84c8a5fe3bc6c5543eb303446b5d7d3",
+  "unit_tests": 6,
+  "telescoping_max_abs_error": 4.905467276827835e-07,
+  "invariants": {
+    "alias_glimpse_max_difference": 0.0,
+    "repaired_features_max_difference": 2.651263475418091,
+    "true_cost_range": [
+      0.6079680919647217,
+      1.5216816663742065
+    ],
+    "exact_oracle_matches_brute_force": true,
+    "closing_edge_accounting": true,
+    "reference_search_parity": {
+      "value_head": true,
+      "rollout": true
+    }
+  },
+  "smoke_is_not_performance_evidence": true,
+  "plot_cells_reexecuted_after_layout_fix": true
+}

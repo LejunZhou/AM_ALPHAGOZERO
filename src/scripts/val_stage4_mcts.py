@@ -91,6 +91,13 @@ def parse():
                    help='Per-tour-step τ schedule. Default const (eval = greedy '
                         'argmax over visit counts; see c_puct discussion in spec).')
     p.add_argument('--c_puct', type=float, default=0.05)
+    p.add_argument('--value_target_norm', choices=['auto', 'bl', 'none', 'sqrt_n'], default='auto',
+                   help="How the checkpoint's value head was TRAINED (bl | none | sqrt_n). "
+                        "MCTS converts head outputs to normalized cost-to-go accordingly. "
+                        "'auto' reads value_target_norm from the sibling args.json and falls "
+                        "back to 'bl' with a warning. BUG FIX 2026-09-26: this used to be "
+                        "silently omitted, so F.6.1-family checkpoints (trained with 'none') "
+                        "were evaluated at a ~bl_val-times-too-large leaf scale.")
     p.add_argument('--mcts_batch_size', type=int, default=64)
     p.add_argument('--match_train', action='store_true',
                    help='Override --K / --leaf_eval / --eps / --alpha_factor / '
@@ -354,11 +361,22 @@ def _build_mcts_config(opts, graph_size, train_args):
     # is set; same here.
     temperature = 1.0 if tsched_arg is not None else 0.0
 
+    vnorm = opts.value_target_norm
+    if vnorm == 'auto':
+        if train_args is not None and 'value_target_norm' in train_args:
+            vnorm = str(train_args['value_target_norm'])
+        else:
+            vnorm = 'bl'
+            if leaf_eval in ('value_head', 'mix'):
+                print("  [warn] --value_target_norm auto: no args.json value_target_norm found; "
+                      "assuming 'bl'. Pass --value_target_norm none for F.6.1-family checkpoints.")
+
     cfg = MCTSConfig(
         n_simulations=K,
         leaf_eval=leaf_eval,
         mix_lambda=mix_lambda,
         value_norm='bl',
+        value_target_norm=vnorm,
         c_puct=opts.c_puct,
         temperature=temperature,
         temperature_schedule=tsched_arg,
@@ -372,7 +390,7 @@ def _build_mcts_config(opts, graph_size, train_args):
         seed=opts.seed,
     )
     return cfg, dict(K=K, leaf_eval=leaf_eval, mix_lambda=mix_lambda, eps=eps,
-                     alpha_factor=alpha_factor, tsched=tsched)
+                     alpha_factor=alpha_factor, tsched=tsched, value_target_norm=vnorm)
 
 
 # ---------------------------------------------------------------------------

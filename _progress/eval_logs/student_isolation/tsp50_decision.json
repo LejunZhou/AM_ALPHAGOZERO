@@ -1,0 +1,67 @@
+{
+  "teacher_minus_stage1": 0.06345538585446775,
+  "teacher_minus_stage1_se": 0.0015389284974710417,
+  "min_retention": 0.25,
+  "screen_outcome": "STOP",
+  "continue_with": null,
+  "students": [
+    {
+      "policy": "visits_s0",
+      "seed": 0,
+      "target": "visits",
+      "lr": 3e-05,
+      "val_cost": 5.78655275888741,
+      "student_minus_stage1": -0.009342499310150743,
+      "student_minus_stage1_se": 0.0011301210552227092,
+      "student_minus_control": -0.005962811876088381,
+      "student_minus_control_lo": -0.00984106684588666,
+      "student_minus_control_hi": -0.0020845569062901016,
+      "retention": 0.14722941456186825,
+      "retention_lo": 0.11441357518779434,
+      "retention_hi": 0.18073311806148926,
+      "beats_control": true,
+      "passes": false
+    },
+    {
+      "policy": "gumbel_q_s0",
+      "seed": 0,
+      "target": "gumbel_q",
+      "lr": 3e-05,
+      "val_cost": 5.78169738361612,
+      "student_minus_stage1": -0.01312896073795855,
+      "student_minus_stage1_se": 0.0013532574682942513,
+      "student_minus_control": -0.009749273303896189,
+      "student_minus_control_lo": -0.013723467734171348,
+      "student_minus_control_hi": -0.005775078873621029,
+      "retention": 0.20690065250047124,
+      "retention_lo": 0.16927064486673582,
+      "retention_hi": 0.2420065416400222,
+      "beats_control": true,
+      "passes": false
+    },
+    {
+      "policy": "best_tour_s0",
+      "seed": 0,
+      "target": "best_tour",
+      "lr": 3e-05,
+      "val_cost": 5.785739246290177,
+      "student_minus_stage1": -0.010791651671752334,
+      "student_minus_stage1_se": 0.0012681116505731153,
+      "student_minus_control": -0.007411964237689972,
+      "student_minus_control_lo": -0.011332850130376299,
+      "student_minus_control_hi": -0.003491078345003646,
+      "retention": 0.1700667567683306,
+      "retention_lo": 0.13243778772783538,
+      "retention_hi": 0.20520543926862833,
+      "beats_control": true,
+      "passes": false
+    }
+  ],
+  "controls": {
+    "control_s0": {
+      "control_minus_stage1": -0.0033796874340623617,
+      "se": 0.0020764726733558995
+    }
+  },
+  "confirm": {}
+}
