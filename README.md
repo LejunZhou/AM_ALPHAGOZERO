@@ -9,7 +9,18 @@ around those proposals to find lower-cost tours than greedy decoding. The same
 search is then recycled into training data: the model learns from its own
 search statistics, the way AlphaGo Zero learned from MCTS-guided self-play.
 
-Current experimental status (2026-09-25): from-scratch search-supervised greedy
+**Direction (2026-10-07).** The TSP chapter is closed.
+- On deterministic TSP, the AlphaGo Zero–style loop did not beat REINFORCE.
+- One round of search distillation beat continued REINFORCE at equal GPU time, but
+  kept only about a fifth of the search's gain.
+
+The project now tests the thesis on the **stochastic Prize-Collecting TSP**. There,
+a single rollout is a noisy value estimate, so a learned value function can add
+information rather than only save compute. See the revised
+[proposal](proposal.md) (TSP chapter outcome and Stage 6) and the
+[Stage 6 plan](_plans/stage6_spctsp_plan.md).
+
+Earlier status (2026-09-25): from-scratch search-supervised greedy
 policies still trail the REINFORCE baselines on the matched TSP-20/50 checks.
 The latest [research audit](_progress/research_diagnosis_20260925_progress.md)
 identifies an evaluation-normalization omission and a value-input limitation.

@@ -102,6 +102,8 @@ scores 5.7389 against Stage 1 greedy 5.8023, a gain of 0.0635 (SE 0.0015).
   - Earlier TSP-50 comparisons of the loop against Stage 1 mixed the two sets.
     Their gaps were ≥ 0.13, so no conclusion changes.
 
+**Decided 2026-10-07:** Lejun approved closing TSP and moving to stochastic PCTSP (proposal revised; see `_plans/stage6_spctsp_plan.md`).
+
 **Next step: Lejun's decision (asked 2026-10-06).**
 - Per the rule, no Confirm run. The TSP claim ends for both the from-scratch and
   the warm-start framing.

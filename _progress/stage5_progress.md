@@ -863,6 +863,12 @@ greedy.
 
 Full record: [`student_isolation_colab_progress.md` §Results](student_isolation_colab_progress.md).
 
+**Stage 5 / TSP chapter CLOSED (2026-10-07).** Lejun approved closing TSP and moving to
+stochastic PCTSP. The proposal is revised with a TSP chapter outcome and a new Stage 6.
+§V1, the Step 1 evaluator iteration and the K-cap-8× rerun are dropped. §V0's lessons
+carry into Stage 6 P1: train value heads on off-policy children, and judge them by
+sibling regret. Continues in [`stage6_spctsp_progress.md`](stage6_spctsp_progress.md).
+
 **Repository note (2026-10-06, at push time).** This Mac's checkout was 3 commits behind
 `origin/main`: Stage 5 §H.7 / §V0 / §V1 (2026-07-04, made on another machine), recorded in
 [`stage5_offpolicy_value_progress.md`](stage5_offpolicy_value_progress.md) and

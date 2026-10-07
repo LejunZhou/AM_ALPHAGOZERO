@@ -258,3 +258,7 @@ wall time. None kept 25% of the teacher's gain: best `gumbel_q` 0.207 [0.169, 0.
 Confirm is not run. Per the pre-registered rule, the TSP claim ends for both framings.
 The next direction (recommended: stochastic PCTSP, the problem already agreed) needs
 Lejun's approval of a proposal revision.
+**Stage 5 / TSP chapter CLOSED (2026-10-07).** Lejun approved closing TSP and moving to
+stochastic PCTSP. proposal.md has been revised (TSP chapter outcome; new Stage 6). Open TSP
+items are dropped: §V1 matched-wall vh search, the Step 1 evaluator iteration, and the
+K-cap-8× rerun. Next: [`stage6_spctsp_plan.md`](stage6_spctsp_plan.md).

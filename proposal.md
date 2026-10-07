@@ -1,5 +1,12 @@
 # AM + AlphaGo Zero: MCTS-Guided Policy Improvement for Combinatorial Optimization
 
+> **Revision 2026-10-07 (approved by Lejun).** The TSP chapter (Stages 0–5) is closed.
+> Its outcome is in [TSP chapter outcome](#tsp-chapter-outcome-stages-05-closed-2026-10-07).
+> The project now tests the thesis on the **stochastic Prize-Collecting TSP (SPCTSP)**.
+> That is the new [Stage 6](#stage-6-stochastic-prize-collecting-tsp-revised-2026-10-07),
+> which replaces the CVRP stretch goal. The original text of Stages 0–5 is kept below
+> as the plan that was executed.
+
 ## Overview
 
 This project combines two systems that are structurally more compatible than they first appear:
@@ -30,6 +37,36 @@ The proposed approach:
 - Train with the combined loss: value prediction (MSE) + policy distillation (cross-entropy) + regularization
 
 The central research question is whether the sample efficiency gains from MCTS-based training outweigh the per-sample computational cost — and under what problem scales and budgets the tradeoff favors this approach over standard REINFORCE.
+
+### Revised thesis (2026-10-07)
+
+On deterministic TSP the answer was no, and the reason is structural. The greedy
+rollout of a strong policy is already a cheap and almost exact value estimate, so:
+- a value head can at best reproduce it, which saves compute but adds no information;
+- the search's gains are short lookahead corrections that the network absorbs only in
+  small part.
+
+The thesis is therefore narrowed to problems where **a single rollout is a poor
+estimate of a state's value**. The test case is stochastic transitions, where a
+rollout sees one random future. The thesis becomes:
+
+**Where outcomes are stochastic, a learned value function carries information that
+single rollouts provide only by averaging many of them. MCTS guided by that value,
+and training that distils the search, should then beat REINFORCE at matched compute.**
+
+SPCTSP is the first test case. It is already supported by the AM reference code,
+pretrained AM models exist for 20/50/100 nodes, and it changes only the
+masking/state machinery. A node's real prize is revealed only on arrival, and the
+tour may end only once the collected prize reaches 1. Measured on 2,000 random
+instances (CPU, 2026-10-07), the pretrained AM greedy policy shows:
+
+| size | mean cost | SD across instances | SD across prize realisations, same instance |
+|---|---:|---:|---:|
+| SPCTSP-20 | 3.254 | 0.39 | 0.23 |
+| SPCTSP-50 | 4.645 | 0.31 | 0.18 |
+
+The noise from the prize realisation alone is comparable to the spread across
+instances. On TSP that noise is zero.
 
 ---
 
@@ -167,17 +204,102 @@ The central research question is whether the sample efficiency gains from MCTS-b
 
 ---
 
-### Stage 6: Extension to CVRP (Stretch Goal)
-**Goal:** Demonstrate generality beyond TSP by applying the full pipeline to Capacitated Vehicle Routing.
+### TSP chapter outcome (Stages 0–5, closed 2026-10-07)
 
-**Tasks:**
-- Adapt masking and state representation for CVRP (capacity constraints, depot returns)
-- Adapt value head target (CVRP tour length normalization)
-- Train and evaluate on CVRP-20/50/100
+**Reproduction and value head (Stages 0–2).** These held.
+- AM was reproduced. Stage 1 (AM + value head) reached TSP-20 3.8394 and TSP-50 5.7999
+  greedy without degrading the policy.
+- The value head's R² was ≥ 0.996. R² proved to be the wrong metric, though: what
+  matters is how well the head ranks sibling moves.
 
-**Expected Outcome:**
-- Competitive with AM's CVRP results
-- Evidence that MCTS-based training is problem-agnostic (only masking changes)
+**Search at test time (Stage 3).** Search works.
+- Rollout-leaf MCTS beats greedy decoding: TSP-20 K=100 −0.022; TSP-50 K=40 −0.063.
+
+**The from-scratch training loop (Stage 4) never reached REINFORCE.**
+- TSP-20: best 3.8486 vs 3.8394.
+- TSP-50: best 5.93 vs 5.80, on different validation draws, but the gap is far
+  larger than set-to-set noise.
+
+**Why the value head looked broken (Stage 5).**
+- On the training distribution, the head is well calibrated.
+- On moves the policy did not take it is badly optimistic, so it ranks siblings
+  worse than the policy prior does.
+- Two remedies worked:
+  - Distilling rollouts on those counterfactual moves (§V0) gave rollout-level
+    ranking on TSP-20.
+  - Adding endpoint and geometry inputs (§I Step 1) let search recover 70–91% of
+    the rollout's gain on TSP-50.
+- On TSP, a repaired head can therefore only replace a rollout that is already
+  cheap and nearly exact.
+
+**Student isolation (§I Step 2): the decisive test.**
+- One round of distilling a rollout-MCTS teacher into Stage 1 TSP-50 beat
+  continued REINFORCE at matched wall time. The best target gained 0.0131 over
+  Stage 1; REINFORCE gained 0.0034, which was not significant.
+- But the student kept only about 21% of the teacher's 0.0635 gain (95% CI
+  17–24%), below the pre-registered 25% floor. Outcome: STOP.
+
+**Conclusion.** On deterministic TSP, AlphaGo-Zero-style training does not
+deliver the claimed advantage over REINFORCE. This is the "publishable negative
+result about the computational tradeoff" anticipated in the summary below.
+
+Records:
+- [`_progress/stage5_progress.md`](_progress/stage5_progress.md)
+- [`_progress/stage5_offpolicy_value_progress.md`](_progress/stage5_offpolicy_value_progress.md)
+- [`_progress/value_evaluator_repair_colab_progress.md`](_progress/value_evaluator_repair_colab_progress.md)
+- [`_progress/student_isolation_colab_progress.md`](_progress/student_isolation_colab_progress.md)
+
+**Lessons that carry forward:**
+1. Judge evaluators by sibling ranking (decision regret against a ground truth),
+   split by horizon, never by R².
+2. Train value heads on off-policy children, not only on states the policy visits.
+3. Compare every training method with continued REINFORCE at matched wall time.
+4. Fix decision rules before the run, and use ≥ 3 seeds for any claim (seed noise
+   on TSP-20 is ~0.01).
+
+---
+
+### Stage 6: Stochastic Prize-Collecting TSP (revised 2026-10-07)
+**Goal:** Test the revised thesis where single rollouts are noisy value estimates.
+
+Each step below has a gate that is fixed before its run. A failed gate stops the
+chapter early, at small cost. Detailed protocol:
+[`_plans/stage6_spctsp_plan.md`](_plans/stage6_spctsp_plan.md).
+
+**Tasks (in order, each gated):**
+1. **Environment and baselines.**
+   - Port SPCTSP (and the deterministic PCTSP as a control) into the codebase:
+     problem, state, decoder context and value target.
+   - Load and reproduce the pretrained AM SPCTSP-20/50 models, and train a Stage-1
+     style AM + value head.
+   - Evaluate with common random numbers: one fixed prize realisation per test
+     instance, shared by every policy, plus expected cost over many realisations.
+2. **Value-signal probe.** At on- and off-policy states, rank sibling moves against
+   ground truth (the mean of many rollouts). Compare:
+   - the policy prior;
+   - a single rollout;
+   - an average of a few rollouts;
+   - the value head, trained the §V0 way.
+
+   Gate: the head clearly out-ranks a single rollout. If one rollout already
+   ranks as well as the head, the thesis fails here too and the chapter stops.
+3. **Search at test time.** Online stochastic MCTS. Real prizes are known for
+   visited nodes, and unrevealed prizes are sampled per simulation. Leaf
+   evaluation is one rollout, a rollout average or the value head, compared at
+   matched wall time. Gate: search beats greedy, and value-guided search is at
+   least as good as rollout-guided search at equal time.
+4. **Student isolation.** The Step 2 design, unchanged: one round of distillation
+   vs. continued REINFORCE at matched wall time. Gate: it beats the control (95% CI
+   below 0) and keeps ≥ 25% of the teacher's gain.
+5. **Full loop.** Only if 2–4 pass. Run with ≥ 3 seeds, compare in GPU-hours with
+   REINFORCE and with the pretrained AM, at SPCTSP-20 then -50.
+
+**Expected Outcome:** One of two clean answers.
+- (a) The thesis holds where rollouts are noisy, with measured conditions (noise
+  level, problem size) under which it pays off.
+- (b) It fails here too, extending the negative result beyond deterministic routing.
+
+**Stretch (not planned):** stochastic-demand CVRP, if Stage 6 passes.
 
 ---
 
@@ -190,5 +312,9 @@ The central research question is whether the sample efficiency gains from MCTS-b
 | 3 | + MCTS test time | ~0.1% | ~2.0% (beat sampling-1280) |
 | 4 | + MCTS training | ~0.05% | ~1.5% (fewer samples needed) |
 | 5 | + Tuning/ablations | best achievable | best achievable |
+| 6 | SPCTSP (revised 2026-10-07) | gated; see Stage 6 | — |
+
+*Outcome of rows 0–5 (2026-10-07): Stages 0–3 met their goals. The Stage 4/5
+training loop did not beat REINFORCE on TSP. See the TSP chapter outcome above.*
 
 Each stage builds on the previous one, with a clear checkpoint and fallback. If Stage 3 (MCTS at test time) doesn't show improvement, we diagnose before proceeding. If Stage 4 (full loop) shows improvement but not sample efficiency, that's still a publishable negative result about the computational tradeoff.

@@ -8,7 +8,7 @@ Mirror of [`_plans/stage5_offpolicy_value_plan.md`](../_plans/stage5_offpolicy_v
 |---|---|---|---|
 | V0 scaffold (labeler + trainer + probes + Colab notebook + smokes) | **COMPLETE 2026-07-04** | 2026-07-04 | batched labeler fp32-parity 2.4e-7 with sequential probe; tiny 219-pair distill already moves held-out Spearman(v,g) 0.081→0.489 |
 | V0 Colab T4 run (~200k pairs, gates G1/G2) | **COMPLETE 2026-07-04 — PASS (both gates)** | 2026-07-04 | **distilled head reaches ROLLOUT PARITY at depth-1 (regret 0.0554 vs anchor 0.0563); Spearman(v,g) 0.081→0.788; depth-2 0.161 ≤ 2× anchor 0.082** |
-| V1 matched-wall vh-only val (TSP-20) | **OPEN — scaffold ready** | 2026-07-04 | `notebooks/colab_V1_matched_wall_vh.ipynb` (4 arms, paired, ~15 min T4) |
+| V1 matched-wall vh-only val (TSP-20) | **DROPPED 2026-10-07 (TSP chapter closed; lessons carried into Stage 6 P1)** — scaffold ready | 2026-07-04 | `notebooks/colab_V1_matched_wall_vh.ipynb` (4 arms, paired, ~15 min T4) |
 | V2 TSP-50 deployment | BLOCKED on V1 PASS | — | — |
 
 Reference anchors (held-out instance split, 50 nodes, sampled-E[z|s'] gt —
